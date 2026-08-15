@@ -85,39 +85,55 @@ Simply double-click **`Notion_Sync.bat`** to start the background server and dis
 
 ```text
 ====================================================================
-        📁 NOTION GOOGLE DRIVE AUTO-SYNC & WEB GUI ENGINE
+        ☁️ NOTION UNLIMITED CLOUD & WEB DRIVE DASHBOARD
 ====================================================================
-  [1] 🚀 Start Live Auto-Upload Watcher (Syncs changes to Notion)
-  [2] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)
-  [3] ⚡ Run Incremental Sync Now (Push pending changes)
-  [4] 📊 Check Status & Storage Usage (Git-style inspect)
-  [5] 📝 Open Notion Database in Browser
-  [6] ❌ Exit
+  [1] ⚡ Upload Only Changed & New Files (Smart Incremental Sync)
+  [2] 🚀 Upload All Files (Force Full Cloud Sync)
+  [3] 👀 Start Real-Time Auto-Sync Watcher (Live Background Monitor)
+  [4] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)
+  [5] 📊 Check Storage Status & File Integrity (Git-Style Inspect)
+  [6] 🔄 Rebuild & Refresh Local Cloud Index (Sync state from Notion)
+  [7] 📝 Open Notion Database in Browser
+  [8] ❌ Exit
 ====================================================================
-Select an option [1-6]:
+Select an option [1-8]:
 ```
 
 ### ⌨️ Method B: Command Line (CLI)
 
-#### 1. Launch the Web Drive GUI Server:
-```bash
-python notion_server.py
-```
-Open **`http://127.0.0.1:8765`** in your web browser.
-
-#### 2. Start Live Auto-Sync Watcher:
-```bash
-python notion_git_sync.py watch --path "C:\Users" --interval 4
-```
-
-#### 3. Run Incremental Sync:
+#### 1. Smart Incremental Sync (Changed & New Files Only):
 ```bash
 python notion_git_sync.py sync --path "C:\Users"
 ```
 
-#### 4. Inspect Sync Status:
+#### 2. Full Force Cloud Sync (Upload All Files):
+```bash
+python notion_git_sync.py sync-all --path "C:\Users"
+```
+
+#### 3. Real-Time Auto-Sync Watcher:
+```bash
+python notion_git_sync.py watch --path "C:\Users" --interval 4
+```
+
+#### 4. Launch Web Drive GUI Server:
+```bash
+python notion_git_sync.py gui
+```
+Or run directly:
+```bash
+python notion_server.py
+```
+Open **`http://127.0.0.1:8765`** in your browser.
+
+#### 5. Inspect Cloud Storage Status:
 ```bash
 python notion_git_sync.py status --path "C:\Users"
+```
+
+#### 6. Rebuild Local Index from Notion:
+```bash
+python notion_git_sync.py rebuild
 ```
 
 ---

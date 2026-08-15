@@ -82,7 +82,7 @@ SYSTEM_CRITICAL_IGNORE = {
     "saved games", "searches", "contacts", "links", "favorites", ".bun", ".cline", ".config",
     ".copilot", ".dotnet", ".expo", ".installer", ".ipython", ".lmstudio", ".local",
     ".sbx-denybin", ".semantic_search", ".ssh", ".virtualbox", ".vscode-shared", "onedrive",
-    ".notion drive"
+    ".notion drive", "agent-plugins"
 }
 
 IGNORED_FILE_PREFIXES = ("ntuser.dat", "ntuser.rhk", "desktop.ini", "~$", "sti_trace.log", "2026-", "_viminfo", ".notion_")
@@ -436,28 +436,76 @@ class NotionGitSyncEngine:
                     return None
         return current_parent_id
 
-    def sync(self):
-        print(f"\n🚀 Running Notion Git-Sync for: {self.root_dir}")
+    def rebuild_index(self):
+        """Pulls all pages from Notion and rebuilds local sync state & drive cache."""
+        print(f"\n🔄 Connecting to Notion and rebuilding index for DB: {self.db_id} ...")
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Notion-Version": NOTION_VERSION
+        }
+        items = []
+        has_more = True
+        start_cursor = None
+        while has_more:
+            payload = {"page_size": 100}
+            if start_cursor:
+                payload["start_cursor"] = start_cursor
+            res = self.requests.post(f"https://api.notion.com/v1/databases/{self.db_id}/query", headers=headers, json=payload).json()
+            items.extend(res.get("results", []))
+            has_more = res.get("has_more", False)
+            start_cursor = res.get("next_cursor")
+
+        state_files = {}
+        for it in items:
+            notion_id = it["id"].replace("-", "")
+            props = it.get("properties", {})
+            desc_list = props.get("Description", {}).get("rich_text", [])
+            desc = desc_list[0].get("plain_text", "") if desc_list else ""
+            local_p = desc.replace("Path: ", "").replace("Local: ", "").replace(" (Updated)", "").replace(" (Modified)", "").strip()
+            
+            if local_p and Path(local_p).exists() and Path(local_p).is_file():
+                try:
+                    stat = Path(local_p).stat()
+                    state_files[local_p] = {
+                        "notion_id": notion_id,
+                        "mtime": stat.st_mtime,
+                        "size": stat.st_size
+                    }
+                except Exception:
+                    pass
+
+        self.state["files"] = state_files
+        self.state["last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.save_state()
+        print(f"✅ Rebuilt local cloud index! {len(state_files)} local files mapped to Notion.")
+
+    def sync(self, force_all: bool = False):
+        sync_mode = "FORCE ALL FILES" if force_all else "INCREMENTAL (CHANGED & NEW ONLY)"
+        print(f"\n🚀 Running Notion Git-Sync [{sync_mode}] for: {self.root_dir}")
         self.load_notion_folders()
         local_files = self.get_local_snapshot()
         tracked = self.state.setdefault("files", {})
 
-        added_or_modified = []
+        tasks = []
         for p, meta in local_files.items():
-            if p not in tracked:
-                added_or_modified.append((p, meta, "NEW"))
-            elif (abs(tracked[p].get("mtime", 0) - meta["mtime"]) > 1.0 or 
-                  tracked[p].get("size", 0) != meta["size"]):
-                added_or_modified.append((p, meta, "MODIFIED"))
+            if force_all:
+                tasks.append((p, meta, "NEW" if p not in tracked else "MODIFIED"))
+            else:
+                if p not in tracked:
+                    tasks.append((p, meta, "NEW"))
+                elif (abs(tracked[p].get("mtime", 0) - meta["mtime"]) > 1.0 or 
+                      tracked[p].get("size", 0) != meta["size"]):
+                    tasks.append((p, meta, "MODIFIED"))
 
-        total_tasks = len(added_or_modified)
+        total_tasks = len(tasks)
         if total_tasks == 0:
             print("✨ Everything is already up to date! Nothing to sync.")
             return
 
         print(f"[+] Total items to sync: {total_tasks}\n")
 
-        for idx, (file_path_str, meta, change_type) in enumerate(added_or_modified, 1):
+        for idx, (file_path_str, meta, change_type) in enumerate(tasks, 1):
             file_path = Path(file_path_str)
             render_progress_bar(idx - 1, total_tasks, prefix="Uploading", current_file=file_path.name)
 
@@ -469,7 +517,7 @@ class NotionGitSyncEngine:
             emoji = EMOJI_MAP.get(file_type, "📄")
             size_mb = round(meta["size"] / (1024 * 1024), 2)
             
-            # Browser View URL for Microsoft Edge
+            # Browser View URL for Microsoft Edge & Google Drive Web GUI
             encoded_path = urllib.parse.quote(file_path_str)
             edge_view_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/view?path={encoded_path}"
 
@@ -501,7 +549,7 @@ class NotionGitSyncEngine:
                     }
 
             elif change_type == "MODIFIED":
-                notion_id = tracked[file_path_str].get("notion_id")
+                notion_id = tracked.get(file_path_str, {}).get("notion_id")
                 if notion_id:
                     update_payload = {
                         "properties": {
@@ -551,7 +599,7 @@ class NotionGitSyncEngine:
                     if len(changed_files) > 5:
                         print(f"   ... and {len(changed_files) - 5} more")
 
-                    self.sync()
+                    self.sync(force_all=False)
 
                 time.sleep(interval)
             except KeyboardInterrupt:
@@ -567,36 +615,47 @@ def run_interactive_menu():
     while True:
         try:
             print("\n" + "="*68)
-            print("        📁 NOTION GOOGLE DRIVE AUTO-SYNC & WEB GUI ENGINE")
+            print("        ☁️ NOTION UNLIMITED CLOUD & WEB DRIVE DASHBOARD")
             print("="*68)
-            print("  [1] 🚀 Start Live Auto-Upload Watcher (Syncs changes to Notion)")
-            print("  [2] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)")
-            print("  [3] ⚡ Run Incremental Sync Now (Push pending changes)")
-            print("  [4] 📊 Check Status & Storage Usage (Git-style inspect)")
-            print("  [5] 📝 Open Notion Database in Browser")
-            print("  [6] ❌ Exit")
+            print("  [1] ⚡ Upload Only Changed & New Files (Smart Incremental Sync)")
+            print("  [2] 🚀 Upload All Files (Force Full Cloud Sync)")
+            print("  [3] 👀 Start Real-Time Auto-Sync Watcher (Live Background Monitor)")
+            print("  [4] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)")
+            print("  [5] 📊 Check Storage Status & File Integrity (Git-Style Inspect)")
+            print("  [6] 🔄 Rebuild & Refresh Local Cloud Index (Sync state from Notion)")
+            print("  [7] 📝 Open Notion Database in Browser")
+            print("  [8] ❌ Exit")
             print("="*68)
             
-            choice = input("Select an option [1-6]: ").strip()
+            choice = input("Select an option [1-8]: ").strip()
             if choice == "1":
-                engine.watch()
+                engine.sync(force_all=False)
             elif choice == "2":
-                print("🌐 Opening Google Drive GUI on http://127.0.0.1:8765 ...")
-                webbrowser.open("http://127.0.0.1:8765")
+                confirm = input("⚠️  Upload ALL files in directory tree to Notion? [y/N]: ").strip().lower()
+                if confirm in ("y", "yes"):
+                    engine.sync(force_all=True)
+                else:
+                    print("Canceled.")
             elif choice == "3":
-                engine.sync()
+                engine.watch()
             elif choice == "4":
-                engine.status()
+                print("🌐 Opening Google Drive GUI on http://127.0.0.1:8765 ...")
+                start_background_file_server(LOCAL_SERVER_PORT)
+                webbrowser.open("http://127.0.0.1:8765")
             elif choice == "5":
+                engine.status()
+            elif choice == "6":
+                engine.rebuild_index()
+            elif choice == "7":
                 print("🌐 Opening Notion in your default browser...")
-                webbrowser.open("https://app.notion.com/p/3bd3d81b2f368055902aeee41736ae89")
-            elif choice in ("6", "exit", "q", "quit"):
-                print("👋 Exiting Notion Sync Engine. Goodbye!")
+                webbrowser.open(f"https://app.notion.com/p/{DEFAULT_DB_ID}")
+            elif choice in ("8", "exit", "q", "quit"):
+                print("👋 Exiting Notion Cloud Sync Engine. Goodbye!")
                 sys.exit(0)
             else:
-                print("❌ Invalid selection. Please enter 1, 2, 3, 4, 5, or 6.")
+                print("❌ Invalid selection. Please enter a number between 1 and 8.")
         except (EOFError, KeyboardInterrupt):
-            print("\n👋 Exiting Notion Sync Engine. Goodbye!")
+            print("\n👋 Exiting Notion Cloud Sync Engine. Goodbye!")
             sys.exit(0)
 
 
@@ -605,8 +664,10 @@ def main():
         run_interactive_menu()
         return
 
-    parser = argparse.ArgumentParser(description="Notion Drive Git-Style Sync Engine")
-    parser.add_argument("command", nargs="?", default="menu", choices=["menu", "status", "sync", "watch"], help="Command to run")
+    parser = argparse.ArgumentParser(description="Notion Unlimited Cloud & Web Drive Engine")
+    parser.add_argument("command", nargs="?", default="menu", 
+                        choices=["menu", "status", "sync", "sync-all", "watch", "rebuild", "gui"], 
+                        help="Command to run")
     parser.add_argument("--path", type=str, default=r"C:\Users", help="Root directory to sync")
     parser.add_argument("--hidden", action="store_true", default=True, help="Include hidden folders & files")
     parser.add_argument("--no-hidden", action="store_false", dest="hidden", help="Exclude hidden folders")
@@ -625,9 +686,16 @@ def main():
     if args.command == "status":
         engine.status()
     elif args.command == "sync":
-        engine.sync()
+        engine.sync(force_all=False)
+    elif args.command == "sync-all":
+        engine.sync(force_all=True)
     elif args.command == "watch":
         engine.watch(interval=args.interval)
+    elif args.command == "rebuild":
+        engine.rebuild_index()
+    elif args.command == "gui":
+        start_background_file_server(LOCAL_SERVER_PORT)
+        webbrowser.open(f"http://127.0.0.1:{LOCAL_SERVER_PORT}")
 
 
 if __name__ == "__main__":
