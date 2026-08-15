@@ -261,7 +261,7 @@ def _discover_android() -> List[StorageDevice]:
 
         # Internal storage is always present on a connected, authorized device
         devices.append(StorageDevice(
-            label=f"{model} — Internal Storage",
+            label=f"{model} — Internal shared storage",
             device_type="android_internal",
             path=None,
             emoji="📱",
@@ -274,7 +274,7 @@ def _discover_android() -> List[StorageDevice]:
         sd_path = _find_sdcard_path(device_id)
         if sd_path:
             devices.append(StorageDevice(
-                label=f"{model} — SD Card",
+                label=f"{model} — SD card",
                 device_type="android_sdcard",
                 path=None,
                 emoji="💾",

@@ -223,7 +223,7 @@ def sync_android(device: StorageDevice):
         on_progress=_progress,
         server_port=cfg.LOCAL_SERVER_PORT,
         adb_root=device.adb_path,
-        container_name=device.label.split(" — ")[-1],  # "Internal Storage" or "SD Card"
+        container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
         container_emoji=container_emoji,
     )
 
