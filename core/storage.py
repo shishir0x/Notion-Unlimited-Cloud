@@ -84,6 +84,8 @@ def _discover_local_windows() -> List[StorageDevice]:
                 dtype = "local"
                 emoji = "💽"
                 label = f"Local Disk ({drive_letter})"
+                if drive_letter.upper().startswith("C") and Path("C:\\Users").exists():
+                    path = "C:\\Users"
 
             devices.append(StorageDevice(
                 label=label,
@@ -109,10 +111,11 @@ def _discover_local_windows() -> List[StorageDevice]:
                     total, used, free = _win_disk_usage(drive)
                 except Exception:
                     total = used = free = 0.0
+                target_path = "C:\\Users" if drive.upper().startswith("C:") and Path("C:\\Users").exists() else drive
                 devices.append(StorageDevice(
                     label=f"Local Disk ({drive.rstrip(chr(92))})",
                     device_type="local",
-                    path=drive,
+                    path=target_path,
                     emoji="💽",
                     total_gb=round(total, 1),
                     used_gb=round(used, 1),
@@ -127,10 +130,11 @@ def _discover_local_windows() -> List[StorageDevice]:
                     total, used, free = _win_disk_usage(str(p))
                 except Exception:
                     total = used = free = 0.0
+                target_path = "C:\\Users" if letter.upper() == "C" and Path("C:\\Users").exists() else str(p)
                 devices.append(StorageDevice(
                     label=f"Local Disk ({letter}:)",
                     device_type="local",
-                    path=str(p),
+                    path=target_path,
                     emoji="💽",
                     total_gb=round(total, 1),
                     used_gb=round(used, 1),

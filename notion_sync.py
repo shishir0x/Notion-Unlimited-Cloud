@@ -216,6 +216,44 @@ def sync_local(path: str, force: bool = False):
     print(f"  🔗 Preloading Notion folder cache…")
     api.preload_folders()
 
+    # ── Step 1: Scan and sync folders first ──────────────────────────────────
+    print(f"  📁 Scanning folders…")
+    all_folders = list(ENGINE.scan_folders(path))
+    print(f"  📂 Found {len(all_folders):,} folders")
+
+    if force:
+        # Mark everything as new for force-upload
+        for folder in all_folders:
+            folder.status_tag = "NEW"
+        folders_to_sync = all_folders
+        folders_skipped = 0
+    else:
+        folders_to_sync, folders_skipped = ENGINE.compute_folder_diff(all_folders, state)
+
+    folders_new = sum(1 for f in folders_to_sync if f.status_tag == "NEW")
+    folders_mod = sum(1 for f in folders_to_sync if f.status_tag == "MODIFIED")
+
+    print()
+    print(f"  ✅ {folders_skipped:,} folders up-to-date (skipped)")
+    print(f"  🟢 {folders_new:,} new folders to create")
+    print(f"  🟡 {folders_mod:,} modified folders to update")
+    print()
+
+    # Sync folders first (so hierarchy exists before files are uploaded)
+    if folders_to_sync:
+        print(f"  ⚡ Syncing {len(folders_to_sync):,} folders…\n")
+        folder_result = ENGINE.run_folder_sync(
+            api, state, folders_to_sync,
+            on_progress=_progress,
+        )
+        print(f"\n  ✅ Folder sync complete!")
+        print(f"     Created : {folder_result.uploaded:,}")
+        print(f"     Updated : {folder_result.updated:,}")
+        if folder_result.failed:
+            print(f"     ❌ Failed : {folder_result.failed:,}")
+        print()
+
+    # ── Step 2: Scan and sync files ──────────────────────────────────────────
     all_items = list(ENGINE.scan_local(path))
     print(f"  📂 Found {len(all_items):,} files")
 
@@ -256,7 +294,14 @@ def sync_local(path: str, force: bool = False):
     print(f"  🟡 {mod_c:,} modified files to update")
     print()
 
-    if not to_sync:
+    all_scanned_paths = {it.path for it in all_items}
+    norm_path = path.replace("\\", "/").lower().rstrip("/")
+    missing_count = sum(
+        1 for p in state.get("files", {})
+        if p.replace("\\", "/").lower().startswith(norm_path) and p not in all_scanned_paths and not Path(p).exists()
+    )
+
+    if not to_sync and not folders_to_sync and missing_count == 0:
         print("  ✨ Everything is already in sync! Nothing to upload.")
         notify_server({
             "is_running": False,
@@ -269,30 +314,42 @@ def sync_local(path: str, force: bool = False):
     global _SYNC_START_TIME
     _SYNC_START_TIME = time.time()
 
-    print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
-    result = ENGINE.run_sync(
-        api, state, to_sync,
-        on_progress=_progress,
-        server_port=cfg.LOCAL_SERVER_PORT,
-    )
+    if to_sync or missing_count > 0:
+        if to_sync:
+            print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
+        elif missing_count > 0:
+            print(f"  🗑️  Removing {missing_count:,} deleted files from Notion…\n")
 
-    notify_server({
-        "is_running": False,
-        "percent": 100,
-        "synced_files": len(to_sync),
-        "remaining_files": 0,
-        "current_file": "Sync Complete",
-        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
-        "log_message": f"Sync completed for {path}: {result.uploaded} uploaded, {result.updated} updated."
-    })
-    refresh_server_cache_once()
+        result = ENGINE.run_sync(
+            api, state, to_sync,
+            on_progress=_progress,
+            server_port=cfg.LOCAL_SERVER_PORT,
+            delete_missing=True,
+            all_scanned_paths=all_scanned_paths,
+            root_path=path,
+        )
 
-    print(f"\n  ✅ Sync complete!")
-    print(f"     Uploaded : {result.uploaded:,}")
-    print(f"     Updated  : {result.updated:,}")
-    print(f"     Skipped  : {skipped:,}")
-    if result.failed:
-        print(f"     ❌ Failed : {result.failed:,}")
+        notify_server({
+            "is_running": False,
+            "percent": 100,
+            "synced_files": len(to_sync),
+            "remaining_files": 0,
+            "current_file": "Sync Complete",
+            "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted.",
+            "log_message": f"Sync completed for {path}: {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted."
+        })
+        refresh_server_cache_once()
+
+        print(f"\n  ✅ Sync complete!")
+        print(f"     Uploaded : {result.uploaded:,}")
+        print(f"     Updated  : {result.updated:,}")
+        print(f"     Skipped  : {skipped:,}")
+        if result.deleted:
+            print(f"     🗑️  Deleted : {result.deleted:,}")
+        if result.failed:
+            print(f"     ❌ Failed : {result.failed:,}")
+    else:
+        print("  ✨ No file changes to sync.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,6 +384,39 @@ def sync_android(device: StorageDevice):
     print(f"  🔗 Preloading Notion folder cache…")
     api.preload_folders()
 
+    # ── Step 1: Scan and sync folders first (including empty ones) ───────────
+    print(f"  📁 Scanning folders on device…")
+    all_folders = list(ENGINE.scan_android_folders(
+        device.adb_device_id, device.adb_path, win_label
+    ))
+    print(f"  📂 Found {len(all_folders):,} folders on device")
+
+    folders_to_sync, folders_skipped = ENGINE.compute_folder_diff(all_folders, state)
+    folders_new = sum(1 for f in folders_to_sync if f.status_tag == "NEW")
+    folders_mod = sum(1 for f in folders_to_sync if f.status_tag == "MODIFIED")
+
+    if folders_to_sync:
+        print()
+        print(f"  ✅ {folders_skipped:,} folders up-to-date (skipped)")
+        print(f"  🟢 {folders_new:,} new folders to create")
+        print(f"  🟡 {folders_mod:,} modified folders to update")
+        print()
+        print(f"  ⚡ Syncing {len(folders_to_sync):,} folders…\n")
+        folder_result = ENGINE.run_folder_sync(
+            api, state, folders_to_sync,
+            on_progress=_progress,
+            adb_root=device.adb_path,
+            container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
+            container_emoji=container_emoji,
+        )
+        print(f"\n  ✅ Folder sync complete!")
+        print(f"     Created : {folder_result.uploaded:,}")
+        print(f"     Updated : {folder_result.updated:,}")
+        if folder_result.failed:
+            print(f"     ❌ Failed : {folder_result.failed:,}")
+        print()
+
+    # ── Step 2: Scan and sync files ──────────────────────────────────────────
     print(f"  🔍 Reading file list from device…")
     all_items = list(ENGINE.scan_android(
         device.adb_device_id, device.adb_path, win_label
@@ -362,7 +452,14 @@ def sync_android(device: StorageDevice):
     print(f"  🟡 {mod_c:,} modified files to update")
     print()
 
-    if not to_sync:
+    all_scanned_paths = {it.path for it in all_items}
+    norm_root = device.adb_path.replace("\\", "/").lower().rstrip("/")
+    missing_count = sum(
+        1 for p in state.get("android_files", {})
+        if p.replace("\\", "/").lower().startswith(norm_root) and p not in all_scanned_paths
+    )
+
+    if not to_sync and not folders_to_sync and missing_count == 0:
         print("  ✨ Everything is already in sync! Nothing to upload.")
         notify_server({
             "is_running": False,
@@ -375,7 +472,11 @@ def sync_android(device: StorageDevice):
     global _SYNC_START_TIME
     _SYNC_START_TIME = time.time()
 
-    print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
+    if to_sync:
+        print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
+    elif missing_count > 0:
+        print(f"  🗑️  Removing {missing_count:,} deleted files from Notion…\n")
+
     result = ENGINE.run_sync(
         api, state, to_sync,
         on_progress=_progress,
@@ -383,6 +484,9 @@ def sync_android(device: StorageDevice):
         adb_root=device.adb_path,
         container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
         container_emoji=container_emoji,
+        delete_missing=True,
+        all_scanned_paths=all_scanned_paths,
+        root_path=device.adb_path,
     )
 
     notify_server({
@@ -391,8 +495,8 @@ def sync_android(device: StorageDevice):
         "synced_files": len(to_sync),
         "remaining_files": 0,
         "current_file": "Sync Complete",
-        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
-        "log_message": f"Sync completed for {device.label}: {result.uploaded} uploaded, {result.updated} updated."
+        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted.",
+        "log_message": f"Sync completed for {device.label}: {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted."
     })
     refresh_server_cache_once()
 
@@ -400,6 +504,8 @@ def sync_android(device: StorageDevice):
     print(f"     Uploaded : {result.uploaded:,}")
     print(f"     Updated  : {result.updated:,}")
     print(f"     Skipped  : {skipped:,}")
+    if result.deleted:
+        print(f"     🗑️  Deleted : {result.deleted:,}")
     if result.failed:
         print(f"     ❌ Failed : {result.failed:,}")
 
@@ -647,12 +753,15 @@ def interactive_menu():
                 if confirm not in ("n", "no"):
                     sync_android(device)
             else:
-                # Show sub-folder selection
-                selected_path = _menu_subfolders(device)
-                if selected_path:
-                    print(f"\n  📂 Selected: {selected_path}")
-                    force = input("  Force upload all files? (skips diff check) [y/N]: ").strip().lower()
-                    sync_local(selected_path, force=(force in ("y", "yes")))
+                # Direct sync without choosing subfolders
+                target_path = device.path
+                if device.path.upper().startswith("C:") and Path(r"C:\Users").exists():
+                    target_path = r"C:\Users"
+
+                print(f"\n  💽 Selected: {device.label} ({target_path})")
+                confirm = input("  Start syncing? [Y/n]: ").strip().lower()
+                if confirm not in ("n", "no"):
+                    sync_local(target_path)
 
         print()  # spacing before next menu iteration
 

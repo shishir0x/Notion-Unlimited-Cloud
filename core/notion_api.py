@@ -130,6 +130,25 @@ class NotionAPI:
         )
         return result is not None
 
+    def delete_page(self, notion_id: str) -> bool:
+        """Archive (delete) a page in Notion. Returns True on success."""
+        nid = notion_id.replace("-", "")
+        for attempt in range(3):
+            try:
+                r = requests.patch(
+                    f"https://api.notion.com/v1/pages/{nid}",
+                    headers=self.headers,
+                    json={"archived": True},
+                    timeout=25,
+                )
+                if r.status_code == 429:
+                    time.sleep(float(r.headers.get("Retry-After", 2)))
+                    continue
+                return r.status_code == 200
+            except requests.RequestException:
+                time.sleep(1.5 * (attempt + 1))
+        return False
+
     # ──────────────────────────────────────────────────────────────────────────
     # Folder hierarchy management
     # ──────────────────────────────────────────────────────────────────────────
@@ -168,6 +187,13 @@ class NotionAPI:
             if name:
                 self._folder_cache[(name, parent_id)] = nid
 
+    def append_block_children(self, block_id: str, children: List[Dict]) -> bool:
+        """Append child blocks (e.g. text/code content) to a Notion page."""
+        bid = block_id.replace("-", "")
+        url = f"https://api.notion.com/v1/blocks/{bid}/children"
+        res = self._patch(url, {"children": children})
+        return res is not None
+
     def ensure_folder(
         self,
         name: str,
@@ -200,6 +226,8 @@ class NotionAPI:
             notion_id = self.create_page(props_no_parent, icon_emoji=emoji)
 
         if notion_id:
+            cloud_url = f"https://www.notion.so/{notion_id}"
+            self.update_page(notion_id, {"Open in Browser": {"url": cloud_url}})
             self._folder_cache[cache_key] = notion_id
         return notion_id
 

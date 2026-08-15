@@ -660,9 +660,6 @@ class BackgroundSyncRunner:
 
             file_type = FILE_TYPE_MAP.get(it["ext"], "Other")
             emoji = EMOJI_MAP.get(file_type, "📄")
-            encoded_p = urllib.parse.quote(it["fpath"])
-            open_url = f"http://127.0.0.1:{PORT}/view?path={encoded_p}"
-
             payload = {
                 "parent": {"database_id": self.db_id},
                 "icon": {"type": "emoji", "emoji": emoji},
@@ -672,7 +669,6 @@ class BackgroundSyncRunner:
                     "File Type": {"select": {"name": file_type}},
                     "File Extension": {"rich_text": [{"text": {"content": it["ext"]}}]},
                     "File Size": {"number": mb},
-                    "Open in Browser": {"url": open_url},
                     "Description": {"rich_text": [{"text": {"content": f"Path: {it['display_path']}"}}]},
                     "Favorite": {"checkbox": False}
                 }
@@ -683,10 +679,11 @@ class BackgroundSyncRunner:
             new_page_id = None
             if it.get("existing_notion_id"):
                 # MODIFIED: update existing page in Notion
+                new_page_id = it["existing_notion_id"]
+                payload["properties"]["Open in Browser"] = {"url": f"https://www.notion.so/{new_page_id}"}
                 try:
-                    res = requests.patch(f"https://api.notion.com/v1/pages/{it['existing_notion_id']}", headers=self.headers, json={"properties": payload["properties"]}, timeout=30)
+                    res = requests.patch(f"https://api.notion.com/v1/pages/{new_page_id}", headers=self.headers, json={"properties": payload["properties"]}, timeout=30)
                     status_ok = res.status_code == 200
-                    new_page_id = it["existing_notion_id"]
                 except Exception:
                     status_ok = False
             else:
@@ -696,6 +693,8 @@ class BackgroundSyncRunner:
                     status_ok = res.status_code == 200
                     if status_ok:
                         new_page_id = res.json()["id"].replace("-", "")
+                        cloud_url = f"https://www.notion.so/{new_page_id}"
+                        requests.patch(f"https://api.notion.com/v1/pages/{new_page_id}", headers=self.headers, json={"properties": {"Open in Browser": {"url": cloud_url}}}, timeout=15)
                 except Exception:
                     status_ok = False
 
@@ -787,24 +786,85 @@ def enrich_cache_items():
 def save_disk_cache():
     with CACHE_LOCK:
         try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(DRIVE_CACHE, f)
+            cache_paths = [
+                CACHE_FILE,
+                Path(__file__).parent / ".notion_drive_cache.json"
+            ]
+            for cp in cache_paths:
+                try:
+                    with open(cp, "w", encoding="utf-8") as f:
+                        json.dump(DRIVE_CACHE, f)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[!] Error saving disk cache: {e}")
 
+def relink_local_disk_folders(cached_items, children_map, root_items):
+    """Re-link Local Disk (C:) child folders that have no parent_id."""
+    c_disk_id = None
+    users_id = None
+    for it_id, it in cached_items.items():
+        name = it.get("name")
+        if name == "Local Disk (C:)":
+            c_disk_id = it_id
+        elif name == "Users":
+            users_id = it_id
+
+    if c_disk_id and users_id:
+        if not cached_items[users_id].get("parent_id"):
+            cached_items[users_id]["parent_id"] = c_disk_id
+
+    if users_id:
+        for it_id, it in cached_items.items():
+            if (it.get("name") in ("Default", "nitro", "TEMP", "TEMP.SHISHIR0X")
+                and not it.get("parent_id")
+                and it_id not in (c_disk_id, users_id)):
+                it["parent_id"] = users_id
+    elif c_disk_id:
+        for it_id, it in cached_items.items():
+            if (it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X")
+                and not it.get("parent_id")
+                and it_id != c_disk_id):
+                it["parent_id"] = c_disk_id
+
+    # Rebuild children_map and root_items
+    children_map.clear()
+    root_items.clear()
+    for it_id, it in cached_items.items():
+        pid = it.get("parent_id")
+        if pid and pid in cached_items:
+            children_map.setdefault(pid, []).append(it_id)
+        else:
+            root_items.append(it_id)
+
+
 def load_disk_cache():
     global DRIVE_CACHE
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                with CACHE_LOCK:
-                    DRIVE_CACHE.update(data)
-            enrich_cache_items()
-            print(f"[+] Loaded {len(DRIVE_CACHE['items'])} items from disk cache!")
-            return True
-        except Exception as e:
-            print(f"[!] Error loading disk cache: {e}")
+    cache_paths = [
+        CACHE_FILE,
+        Path(__file__).parent / ".notion_drive_cache.json"
+    ]
+    for cp in cache_paths:
+        if cp.exists():
+            try:
+                with open(cp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data.get("items"):
+                        with CACHE_LOCK:
+                            DRIVE_CACHE.update(data)
+                        # Re-link Local Disk (C:) folders even when loaded from disk cache
+                        relink_local_disk_folders(
+                            DRIVE_CACHE["items"],
+                            DRIVE_CACHE["children"],
+                            DRIVE_CACHE["root_items"]
+                        )
+                        DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+                        enrich_cache_items()
+                        save_disk_cache()
+                        print(f"[+] Loaded {len(DRIVE_CACHE['items'])} items from disk cache!")
+                        return True
+            except Exception as e:
+                print(f"[!] Error loading disk cache: {e}")
     return False
 
 def populate_cache_from_notion():
@@ -814,125 +874,154 @@ def populate_cache_from_notion():
         "Content-Type": "application/json",
         "Notion-Version": NOTION_VERSION
     }
-    items = []
-    has_more = True
-    start_cursor = None
 
     state = load_sync_state()
     pc_tracked = state.setdefault("files", {})
     android_tracked = state.setdefault("android_files", {})
 
     try:
-        while has_more:
-            payload = {"page_size": 100}
-            if start_cursor:
-                payload["start_cursor"] = start_cursor
-            
-            # Retry on 429 or transient error
-            res = None
-            for attempt in range(5):
-                try:
-                    res = requests.post(f"https://api.notion.com/v1/databases/{DEFAULT_DB_ID}/query", headers=headers, json=payload, timeout=20)
-                    if res.status_code == 429:
-                        time.sleep(2 * (attempt + 1))
-                        continue
-                    elif res.status_code == 200:
-                        break
-                    else:
-                        time.sleep(1)
-                except Exception:
-                    time.sleep(1)
-
-            if not res or res.status_code != 200:
-                print(f"[!] Notion query returned status {res.status_code if res else 'None'}")
-                break
-
-            data = res.json()
-            batch = data.get("results", [])
-            items.extend(batch)
-            has_more = data.get("has_more", False)
-            start_cursor = data.get("next_cursor")
-
-        if not items:
-            print("[!] Notion query returned 0 items; retaining existing cache.")
-            return
-
         cached_items = {}
         children_map = {}
         root_items = []
 
-        for it in items:
-            it_id = it["id"].replace("-", "")
-            props = it.get("properties", {})
-            title_list = props.get("Name", {}).get("title", [])
-            name = title_list[0].get("plain_text", "") if title_list else ""
-            clean_name = name.replace("📁 ", "").replace("📄 ", "").strip()
-            item_type = props.get("Type", {}).get("select", {}).get("name", "File") if props.get("Type", {}).get("select") else "File"
-            
-            ext_list = props.get("File Extension", {}).get("rich_text", [])
-            ext = ext_list[0].get("plain_text", "") if ext_list else ""
-            
-            size_mb = props.get("File Size", {}).get("number", 0) or 0
-            parents = [p["id"].replace("-", "") for p in props.get("Parent Folder", {}).get("relation", [])]
-            parent_id = parents[0] if parents else None
+        # 1. Fetch ALL Folders first to guarantee 100% accurate hierarchy
+        folder_payload = {
+            "page_size": 100,
+            "filter": {"property": "Type", "select": {"equals": "Folder"}}
+        }
+        has_more_folders = True
+        folder_cursor = None
+        while has_more_folders:
+            p = dict(folder_payload)
+            if folder_cursor:
+                p["start_cursor"] = folder_cursor
+            res = requests.post(f"https://api.notion.com/v1/databases/{DEFAULT_DB_ID}/query", headers=headers, json=p, timeout=20)
+            if res.status_code == 200:
+                data = res.json()
+                for it in data.get("results", []):
+                    it_id = it["id"].replace("-", "")
+                    props = it.get("properties", {})
+                    title_list = props.get("Name", {}).get("title", [])
+                    name = title_list[0].get("plain_text", "") if title_list else ""
+                    clean_name = name.replace("📁 ", "").replace("📄 ", "").strip()
+                    parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
+                    parent_id = parents[0] if parents else None
 
-            desc_list = props.get("Description", {}).get("rich_text", [])
-            desc = desc_list[0].get("plain_text", "") if desc_list else ""
-            local_p = desc.replace("Path: ", "").replace("Local: ", "").replace(" (Updated)", "").replace(" (Modified)", "").strip()
-
-            created_iso = it.get("created_time", "")
-            edited_iso = it.get("last_edited_time", "")
-            mtime = 0
-            ctime = 0
-            size_bytes = int(size_mb * 1024 * 1024)
-
-            if local_p:
-                if "This PC\\OnePlus Nord CE4" in local_p or local_p.startswith("/storage") or local_p.startswith("/sdcard"):
-                    # Mobile file in state
-                    android_tracked.setdefault(local_p, {
-                        "notion_id": it_id,
+                    cached_items[it_id] = {
+                        "id": it_id,
+                        "name": clean_name,
+                        "type": "Folder",
+                        "extension": "",
+                        "size_mb": 0,
+                        "size_bytes": 0,
                         "mtime": 0,
-                        "size": size_bytes,
-                        "display_path": local_p
-                    })
-                elif Path(local_p).exists():
-                    try:
-                        stat = Path(local_p).stat()
-                        mtime = stat.st_mtime
-                        ctime = stat.st_ctime
-                        size_bytes = stat.st_size
-                        size_mb = round(size_bytes / (1024 * 1024), 2)
-                        pc_tracked[local_p] = {
+                        "ctime": 0,
+                        "created_time": it.get("created_time", ""),
+                        "last_edited_time": it.get("last_edited_time", ""),
+                        "parent_id": parent_id,
+                        "local_path": ""
+                    }
+                has_more_folders = data.get("has_more", False)
+                folder_cursor = data.get("next_cursor")
+            else:
+                break
+
+        # 2. Fetch File items
+        file_payload = {
+            "page_size": 100,
+            "filter": {"property": "Type", "select": {"equals": "File"}}
+        }
+        has_more_files = True
+        file_cursor = None
+        while has_more_files:
+            p = dict(file_payload)
+            if file_cursor:
+                p["start_cursor"] = file_cursor
+            res = None
+            for attempt in range(4):
+                try:
+                    r = requests.post(f"https://api.notion.com/v1/databases/{DEFAULT_DB_ID}/query", headers=headers, json=p, timeout=20)
+                    if r.status_code == 200:
+                        res = r.json()
+                        break
+                    elif r.status_code == 429:
+                        time.sleep(1 + attempt)
+                except Exception:
+                    time.sleep(1)
+            if not res:
+                break
+
+            for it in res.get("results", []):
+                it_id = it["id"].replace("-", "")
+                props = it.get("properties", {})
+                title_list = props.get("Name", {}).get("title", [])
+                name = title_list[0].get("plain_text", "") if title_list else ""
+                clean_name = name.replace("📁 ", "").replace("📄 ", "").strip()
+                ext_list = props.get("File Extension", {}).get("rich_text", [])
+                ext = ext_list[0].get("plain_text", "") if ext_list else ""
+                size_mb = props.get("File Size", {}).get("number", 0) or 0
+                parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
+                parent_id = parents[0] if parents else None
+
+                desc_list = props.get("Description", {}).get("rich_text", [])
+                desc = desc_list[0].get("plain_text", "") if desc_list else ""
+                local_p = desc.replace("Path: ", "").replace("Local: ", "").replace(" (Updated)", "").replace(" (Modified)", "").strip()
+
+                created_iso = it.get("created_time", "")
+                edited_iso = it.get("last_edited_time", "")
+                mtime = 0
+                ctime = 0
+                size_bytes = int(size_mb * 1024 * 1024)
+
+                if local_p:
+                    if "This PC\\OnePlus Nord CE4" in local_p or local_p.startswith("/storage") or local_p.startswith("/sdcard"):
+                        android_tracked.setdefault(local_p, {
                             "notion_id": it_id,
-                            "mtime": mtime,
+                            "mtime": 0,
                             "size": size_bytes,
                             "display_path": local_p
-                        }
-                    except Exception:
-                        pass
+                        })
+                    elif Path(local_p).exists():
+                        try:
+                            stat = Path(local_p).stat()
+                            mtime = stat.st_mtime
+                            ctime = stat.st_ctime
+                            size_bytes = stat.st_size
+                            size_mb = round(size_bytes / (1024 * 1024), 2)
+                            pc_tracked[local_p] = {
+                                "notion_id": it_id,
+                                "mtime": mtime,
+                                "size": size_bytes,
+                                "display_path": local_p
+                            }
+                        except Exception:
+                            pass
 
-            cached_items[it_id] = {
-                "id": it_id,
-                "name": clean_name,
-                "type": item_type,
-                "extension": ext,
-                "size_mb": size_mb,
-                "size_bytes": size_bytes,
-                "mtime": mtime,
-                "ctime": ctime,
-                "created_time": created_iso,
-                "last_edited_time": edited_iso,
-                "parent_id": parent_id,
-                "local_path": local_p
-            }
+                cached_items[it_id] = {
+                    "id": it_id,
+                    "name": clean_name,
+                    "type": "File",
+                    "extension": ext,
+                    "size_mb": size_mb,
+                    "size_bytes": size_bytes,
+                    "mtime": mtime,
+                    "ctime": ctime,
+                    "created_time": created_iso,
+                    "last_edited_time": edited_iso,
+                    "parent_id": parent_id,
+                    "local_path": local_p
+                }
 
-            if parent_id:
-                children_map.setdefault(parent_id, []).append(it_id)
-            else:
-                root_items.append(it_id)
+            has_more_files = res.get("has_more", False)
+            file_cursor = res.get("next_cursor")
+
+        if not cached_items:
+            print("[!] Notion query returned 0 items; retaining existing cache.")
+            return
 
         save_sync_state(state)
 
+        # Re-link Local Disk (C:) and Users if needed
         c_disk_id = None
         for it_id, it in cached_items.items():
             if it["name"] == "Local Disk (C:)":
@@ -940,13 +1029,17 @@ def populate_cache_from_notion():
                 break
 
         if c_disk_id:
-            for it_id in list(root_items):
-                it = cached_items.get(it_id, {})
-                if it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X") and it_id != c_disk_id:
-                    if it_id in root_items:
-                        root_items.remove(it_id)
-                    cached_items[it_id]["parent_id"] = c_disk_id
-                    children_map.setdefault(c_disk_id, []).append(it_id)
+            for it_id, it in cached_items.items():
+                if it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X") and not it.get("parent_id") and it_id != c_disk_id:
+                    it["parent_id"] = c_disk_id
+
+        # Rebuild children_map and root_items
+        for it_id, it in cached_items.items():
+            pid = it.get("parent_id")
+            if pid and pid in cached_items:
+                children_map.setdefault(pid, []).append(it_id)
+            else:
+                root_items.append(it_id)
 
         with CACHE_LOCK:
             DRIVE_CACHE["items"] = cached_items
@@ -3043,11 +3136,6 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 elif not target_parent_notion_id:
                     target_parent_notion_id = api_client.ensure_root("Local Disk (C:)")
 
-                file_type = FILE_TYPE_MAP.get(ext, "Other")
-                emoji = EMOJI_MAP.get(file_type, "📄")
-                encoded_p = urllib.parse.quote(str(local_file_path))
-                open_url = f"http://127.0.0.1:{PORT}/view?path={encoded_p}"
-
                 payload = {
                     "parent": {"database_id": DEFAULT_DB_ID},
                     "icon": {"type": "emoji", "emoji": emoji},
@@ -3057,7 +3145,6 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                         "File Type": {"select": {"name": file_type}},
                         "File Extension": {"rich_text": [{"text": {"content": ext}}]},
                         "File Size": {"number": size_mb},
-                        "Open in Browser": {"url": open_url},
                         "Description": {"rich_text": [{"text": {"content": f"Path: {local_file_path}"}}]},
                         "Favorite": {"checkbox": False}
                     }
@@ -3068,6 +3155,8 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 res = requests.post("https://api.notion.com/v1/pages", headers=api_client.headers, json=payload, timeout=30)
                 if res.status_code == 200:
                     new_page_id = res.json()["id"].replace("-", "")
+                    cloud_url = f"https://www.notion.so/{new_page_id}"
+                    requests.patch(f"https://api.notion.com/v1/pages/{new_page_id}", headers=api_client.headers, json={"properties": {"Open in Browser": {"url": cloud_url}}}, timeout=15)
                     register_drive_cache_item(
                         new_page_id, file_name, "File", ext, size_mb, file_size,
                         target_parent_notion_id, str(local_file_path), time.time()

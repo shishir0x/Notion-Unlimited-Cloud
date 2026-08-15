@@ -101,6 +101,59 @@ def record_file(
     }
 
 
+def record_folder(
+    state: Dict[str, Any],
+    path: str,
+    notion_id: str,
+    mtime: float,
+    file_count: int = 0,
+    android: bool = False,
+):
+    """Record a successfully synced folder into the state dict."""
+    bucket = "android_folders" if android else "folders"
+    state.setdefault(bucket, {})
+    state[bucket][path] = {
+        "notion_id": notion_id,
+        "mtime": mtime,
+        "file_count": file_count,
+        "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def check_folder(
+    state: Dict[str, Any],
+    path: str,
+    mtime: float,
+    file_count: int,
+    android: bool = False,
+) -> Optional[str]:
+    """
+    Check whether a folder needs syncing.
+
+    Returns:
+      - None            → folder is up-to-date, skip it
+      - "new"           → folder has never been synced
+      - "modified"      → folder changed since last sync (returns existing notion_id via state)
+    """
+    bucket = "android_folders" if android else "folders"
+    folders = state.get(bucket, {})
+    prev = folders.get(path)
+    if prev is None:
+        return "new"
+    if abs(prev.get("mtime", 0) - mtime) > 1.0 or prev.get("file_count", 0) != file_count:
+        return "modified"
+    return None  # up-to-date
+
+
+def get_folder_notion_id(
+    state: Dict[str, Any], path: str, android: bool = False
+) -> Optional[str]:
+    """Retrieve the Notion page ID for a previously synced folder."""
+    bucket = "android_folders" if android else "folders"
+    folders = state.get(bucket, {})
+    return folders.get(path, {}).get("notion_id")
+
+
 def check_file(
     state: Dict[str, Any],
     path: str,

@@ -42,11 +42,26 @@ class FileItem:
 
 
 @dataclass
+class FolderItem:
+    """A folder discovered during a scan."""
+    path: str          # Absolute local path
+    name: str          # Folder name only
+    mtime: float       # Unix timestamp of last modification
+    file_count: int    # Number of files in this folder (non-recursive)
+    parent_path: str   # Parent directory path
+    display_path: str = ""     # Human-readable Windows-style path for display
+    status_tag: str = ""       # "NEW" | "MODIFIED" | "" (filled by diff step)
+    existing_notion_id: Optional[str] = None
+    is_android: bool = False
+
+
+@dataclass
 class SyncResult:
     uploaded: int = 0
     updated: int = 0
     skipped: int = 0
     failed: int = 0
+    deleted: int = 0
     total_scanned: int = 0
 
 
@@ -88,6 +103,126 @@ def scan_local(root: str) -> Generator[FileItem, None, None]:
                 )
             except OSError:
                 continue
+
+
+def scan_folders(root: str) -> Generator[FolderItem, None, None]:
+    """
+    Walk a local directory tree and yield FolderItem for every non-ignored folder.
+    This includes empty folders and folders with files.
+    Each folder is yielded with its modification time and file count.
+    """
+    root_path = Path(root).resolve()
+    if not root_path.exists():
+        return
+
+    # Yield root_path itself if it is a directory and not a drive root (e.g. C:\)
+    # This guarantees that even if a selected folder is completely empty, it gets synced to Notion
+    if root_path.is_dir() and root_path.parent != root_path:
+        try:
+            st = root_path.stat()
+            file_count = len([f for f in root_path.iterdir() if f.is_file() and not F.should_ignore_file(f)])
+            yield FolderItem(
+                path=str(root_path),
+                name=root_path.name,
+                mtime=st.st_mtime,
+                file_count=file_count,
+                parent_path=str(root_path.parent),
+                display_path=str(root_path),
+                is_android=False,
+            )
+        except OSError:
+            pass
+
+    for dirpath, dirs, files in os.walk(root_path):
+        # Prune ignored directories in-place so os.walk won't descend into them
+        dirs[:] = [
+            d for d in dirs
+            if not F.should_ignore_dir(d) and not d.startswith(".")
+        ]
+
+        # Skip the root directory itself as we already handled it above
+        if Path(dirpath).resolve() == root_path:
+            continue
+
+        try:
+            folder_path = Path(dirpath)
+            st = folder_path.stat()
+            file_count = len([f for f in files if not F.should_ignore_file(folder_path / f)])
+            
+            yield FolderItem(
+                path=str(folder_path),
+                name=folder_path.name,
+                mtime=st.st_mtime,
+                file_count=file_count,
+                parent_path=str(folder_path.parent),
+                display_path=str(folder_path),
+                is_android=False,
+            )
+        except OSError:
+            continue
+
+
+def scan_android_folders(
+    device_id: str,
+    adb_root: str,
+    win_label: str,
+) -> Generator[FolderItem, None, None]:
+    """
+    Scan an Android storage path via ADB and yield FolderItem for every directory (including empty ones).
+    """
+    cmd = (
+        f"find '{adb_root}' "
+        f"-name '.*' -prune -o "
+        f"-path '{adb_root}/Android' -prune -o "
+        f"-path '*/LOST.DIR' -prune -o "
+        f"-path '*/.trash' -prune -o "
+        f"-type d -exec stat -c '%n|%Y' {{}} + 2>/dev/null"
+    )
+    try:
+        proc = subprocess.run(
+            ["adb", "-s", device_id, "shell", cmd],
+            capture_output=True, text=True, errors="ignore", timeout=60,
+        )
+    except Exception:
+        return
+
+    for line in proc.stdout.splitlines():
+        if "|" not in line:
+            continue
+        parts = line.strip().split("|")
+        if len(parts) != 2:
+            continue
+
+        dpath_adb, raw_mtime = parts
+        if F.should_ignore_android_path(dpath_adb):
+            continue
+
+        dname = dpath_adb.rstrip("/").split("/")[-1]
+        if not dname or any(dname.lower().startswith(p) for p in F.IGNORED_PREFIXES) or F.should_ignore_dir(dname):
+            continue
+
+        # Skip the adb_root container itself
+        if dpath_adb.rstrip("/") == adb_root.rstrip("/"):
+            continue
+
+        try:
+            mtime = float(raw_mtime)
+        except ValueError:
+            mtime = 0.0
+
+        rel = dpath_adb.replace(adb_root, "").replace("/", "\\").lstrip("\\")
+        display = f"{win_label}\\{rel}" if rel else win_label
+        parent_adb = "/".join(dpath_adb.rstrip("/").split("/")[:-1])
+
+        yield FolderItem(
+            path=dpath_adb,
+            name=dname,
+            mtime=mtime,
+            file_count=0,
+            parent_path=parent_adb,
+            display_path=display,
+            is_android=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +332,88 @@ def compute_diff(
     return to_sync, skipped
 
 
+def compute_folder_diff(
+    folders: List[FolderItem],
+    state: Dict[str, Any],
+) -> Tuple[List[FolderItem], int]:
+    """
+    Compare scanned folders against the state index.
+    Populates each folder's status_tag ("NEW" | "MODIFIED") and existing_notion_id.
+    Returns (folders_to_sync, skipped_count).
+    """
+    to_sync: List[FolderItem] = []
+    skipped = 0
+
+    for folder in folders:
+        change = S.check_folder(
+            state, folder.path, folder.mtime, folder.file_count,
+            android=folder.is_android,
+        )
+        if change is None:
+            skipped += 1
+            continue
+        folder.status_tag = "NEW" if change == "new" else "MODIFIED"
+        if change == "modified":
+            folder.existing_notion_id = S.get_folder_notion_id(
+                state, folder.path, android=folder.is_android,
+            )
+        to_sync.append(folder)
+
+    return to_sync, skipped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Deletion of missing files
+# ─────────────────────────────────────────────────────────────────────────────
+
+def delete_missing_files(
+    api: NotionAPI,
+    state: Dict[str, Any],
+    all_scanned_paths: set,
+    root_path: Optional[str] = None,
+    android: bool = False,
+    on_progress: Optional[ProgressCallback] = None,
+) -> int:
+    """
+    Delete Notion pages for files that no longer exist locally within the scanned root_path.
+    Returns the number of files successfully deleted.
+    """
+    bucket = "android_files" if android else "files"
+    state_files = state.get(bucket, {})
+
+    # Scope missing files ONLY to the scanned root directory
+    missing = {}
+    for path, info in list(state_files.items()):
+        if root_path:
+            norm_path = path.replace("\\", "/").lower()
+            norm_root = root_path.replace("\\", "/").lower().rstrip("/")
+            if not norm_path.startswith(norm_root):
+                continue
+
+        if path not in all_scanned_paths:
+            # For local files, verify it actually does not exist on disk before deleting
+            if not android and Path(path).exists():
+                continue
+            missing[path] = info
+
+    deleted_count = 0
+    total = len(missing)
+
+    for idx, (path, info) in enumerate(missing.items()):
+        notion_id = info.get("notion_id")
+        if not notion_id:
+            continue
+
+        if on_progress:
+            on_progress(idx, total, None, "DELETING")
+
+        if api.delete_page(notion_id):
+            state_files.pop(path, None)
+            deleted_count += 1
+
+    return deleted_count
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Notion folder path builder
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +434,7 @@ def _get_local_folder_parts(file_path: str) -> Tuple[str, str, List[str]]:
 
 
 def _get_android_folder_parts(
-    item: FileItem,
+    item: Any,
     adb_root: str,
     container_name: str,
     container_emoji: str,
@@ -225,7 +442,7 @@ def _get_android_folder_parts(
     """
     For an Android file, return (root_name, emoji, relative_parts).
     """
-    parent_adb = item.parent_path
+    parent_adb = getattr(item, "parent_path", "")
     rel = parent_adb.replace(adb_root, "").lstrip("/")
     parts = [p for p in rel.split("/") if p]
     return container_name, container_emoji, parts
@@ -233,17 +450,18 @@ def _get_android_folder_parts(
 
 def ensure_notion_path(
     api: NotionAPI,
-    item: FileItem,
+    item: Any,
     adb_root: Optional[str] = None,
     container_name: Optional[str] = None,
     container_emoji: str = "📱",
     server_port: int = 8765,
 ) -> Optional[str]:
     """
-    Ensure all parent folders exist in Notion for the given file item.
+    Ensure all parent folders exist in Notion for the given file or folder item.
     Returns the Notion ID of the deepest parent folder.
     """
-    if item.is_android and adb_root and container_name:
+    is_android = getattr(item, "is_android", False)
+    if is_android and adb_root and container_name:
         root_name, root_emoji, rel_parts = _get_android_folder_parts(
             item, adb_root, container_name, container_emoji
         )
@@ -259,9 +477,44 @@ def ensure_notion_path(
     return api.build_folder_path(rel_parts, root_id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File upload to Notion
-# ─────────────────────────────────────────────────────────────────────────────
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css",
+    ".json", ".yaml", ".yml", ".xml", ".csv", ".log", ".sql", ".sh", ".bat",
+    ".ini", ".env", ".toml", ".c", ".cpp", ".h", ".rs", ".go", ".java", ".php"
+}
+
+def upload_file_content_to_page(api: NotionAPI, notion_id: str, item: FileItem):
+    """If file is text/code and size < 250KB, read content and embed as Notion code blocks."""
+    if item.ext.lower() not in TEXT_EXTENSIONS or item.size > 250 * 1024 or item.is_android:
+        return
+    try:
+        content = Path(item.path).read_text(encoding="utf-8", errors="replace")
+        if not content:
+            return
+        chunks = [content[i:i+1900] for i in range(0, min(len(content), 10000), 1900)]
+        blocks = []
+        lang_map = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".tsx": "typescript", ".html": "html", ".css": "css",
+            ".json": "json", ".md": "markdown", ".sql": "sql",
+            ".sh": "bash", ".bat": "bash", ".java": "java", ".c": "c",
+            ".cpp": "cpp", ".rs": "rust", ".go": "go", ".xml": "xml"
+        }
+        lang = lang_map.get(item.ext.lower(), "plain text")
+        for chunk in chunks:
+            blocks.append({
+                "object": "block",
+                "type": "code",
+                "code": {
+                    "rich_text": [{"type": "text", "text": {"content": chunk}}],
+                    "language": lang
+                }
+            })
+        if blocks:
+            api.append_block_children(notion_id, blocks)
+    except Exception:
+        pass
+
 
 def upload_file(
     api: NotionAPI,
@@ -277,20 +530,16 @@ def upload_file(
     """
     ftype, emoji = F.classify_file(item.ext)
     size_mb = round(item.size / (1024 * 1024), 4)
-
-    # URL to open/view the file via the local web server
-    encoded_path = urllib.parse.quote(item.path)
-    view_url = f"http://127.0.0.1:{server_port}/view?path={encoded_path}"
-
     display = item.display_path or item.path
 
     if item.status_tag == "MODIFIED" and item.existing_notion_id:
         # Update existing Notion page (no duplicate created)
+        cloud_url = f"https://www.notion.so/{item.existing_notion_id}"
         ok = api.update_page(
             item.existing_notion_id,
             {
                 "File Size": {"number": size_mb},
-                "Open in Browser": {"url": view_url},
+                "Open in Browser": {"url": cloud_url},
                 "Description": {"rich_text": [{"text": {"content": f"Path: {display} (Updated)"}}]},
             },
         )
@@ -299,6 +548,7 @@ def upload_file(
                 state, item.path, item.existing_notion_id,
                 item.mtime, item.size, android=item.is_android,
             )
+            upload_file_content_to_page(api, item.existing_notion_id, item)
         return ok
 
     else:
@@ -309,7 +559,6 @@ def upload_file(
             "File Type": {"select": {"name": ftype}},
             "File Extension": {"rich_text": [{"text": {"content": item.ext}}]},
             "File Size": {"number": size_mb},
-            "Open in Browser": {"url": view_url},
             "Description": {"rich_text": [{"text": {"content": f"Path: {display}"}}]},
             "Favorite": {"checkbox": False},
         }
@@ -318,10 +567,13 @@ def upload_file(
 
         notion_id = api.create_page(props, icon_emoji=emoji)
         if notion_id:
+            cloud_url = f"https://www.notion.so/{notion_id}"
+            api.update_page(notion_id, {"Open in Browser": {"url": cloud_url}})
             S.record_file(
                 state, item.path, notion_id,
                 item.mtime, item.size, android=item.is_android,
             )
+            upload_file_content_to_page(api, notion_id, item)
             try:
                 import notion_server
                 notion_server.register_drive_cache_item(
@@ -331,6 +583,58 @@ def upload_file(
                 )
             except Exception:
                 pass
+        return notion_id is not None
+
+
+def upload_folder(
+    api: NotionAPI,
+    state: Dict[str, Any],
+    folder: FolderItem,
+    parent_notion_id: Optional[str],
+) -> bool:
+    """
+    Upload a single FolderItem to Notion (POST for NEW, PATCH for MODIFIED).
+    Updates the state dict on success.
+    Returns True on success.
+    """
+    display = folder.display_path or folder.path
+
+    if folder.status_tag == "MODIFIED" and folder.existing_notion_id:
+        # Update existing Notion folder page
+        cloud_url = f"https://www.notion.so/{folder.existing_notion_id}"
+        ok = api.update_page(
+            folder.existing_notion_id,
+            {
+                "Open in Browser": {"url": cloud_url},
+                "Description": {"rich_text": [{"text": {"content": f"Path: {display} (Updated)"}}]},
+            },
+        )
+        if ok:
+            S.record_folder(
+                state, folder.path, folder.existing_notion_id,
+                folder.mtime, folder.file_count,
+            )
+        return ok
+
+    else:
+        # Use ensure_folder to find or create the folder without duplicates
+        notion_id = api.ensure_folder(folder.name, parent_notion_id, emoji="📁")
+        if notion_id:
+            cloud_url = f"https://www.notion.so/{notion_id}"
+            try:
+                api.update_page(
+                    notion_id,
+                    {
+                        "Open in Browser": {"url": cloud_url},
+                        "Description": {"rich_text": [{"text": {"content": f"Path: {display}"}}]},
+                    },
+                )
+            except Exception:
+                pass
+            S.record_folder(
+                state, folder.path, notion_id,
+                folder.mtime, folder.file_count,
+            )
         return notion_id is not None
 
 
@@ -349,10 +653,16 @@ def run_sync(
     adb_root: Optional[str] = None,
     container_name: Optional[str] = None,
     container_emoji: str = "📱",
+    delete_missing: bool = False,
+    all_scanned_paths: Optional[set] = None,
+    root_path: Optional[str] = None,
 ) -> SyncResult:
     """
     Upload all items in the list to Notion using the differential engine.
     Saves state incrementally after each file so it's always resumable.
+
+    If delete_missing=True, also deletes Notion pages for files that no longer
+    exist locally within the scanned root_path.
     """
     result = SyncResult(total_scanned=len(items))
     total = len(items)
@@ -377,6 +687,73 @@ def run_sync(
 
         if ok:
             if item.status_tag == "MODIFIED":
+                result.updated += 1
+            else:
+                result.uploaded += 1
+        else:
+            result.failed += 1
+
+        # Save state immediately — even if we're interrupted, progress is kept
+        S.save_state(state)
+
+    # Delete files that no longer exist locally within the scanned root directory
+    if delete_missing and all_scanned_paths is not None:
+        android = any(item.is_android for item in items) if items else (adb_root is not None)
+        deleted = delete_missing_files(
+            api, state, all_scanned_paths,
+            root_path=root_path or adb_root,
+            android=android,
+            on_progress=on_progress,
+        )
+        result.deleted = deleted
+        S.save_state(state)
+
+    if on_progress:
+        on_progress(total, total, None, "DONE")
+
+    return result
+
+
+def run_folder_sync(
+    api: NotionAPI,
+    state: Dict[str, Any],
+    folders: List[FolderItem],
+    on_progress: Optional[ProgressCallback] = None,
+    cancel_flag: Optional[Callable[[], bool]] = None,
+    adb_root: Optional[str] = None,
+    container_name: Optional[str] = None,
+    container_emoji: str = "📱",
+) -> SyncResult:
+    """
+    Upload all folders in the list to Notion using the differential engine.
+    Saves state incrementally after each folder so it's always resumable.
+
+    Folders are synced BEFORE files so the folder hierarchy exists in Notion
+    before any files are uploaded into them.
+    """
+    result = SyncResult(total_scanned=len(folders))
+    total = len(folders)
+
+    for idx, folder in enumerate(folders):
+        if cancel_flag and cancel_flag():
+            break
+
+        if on_progress:
+            on_progress(idx, total, folder, folder.status_tag)
+
+        # Resolve parent folder in Notion
+        parent_id = ensure_notion_path(
+            api, folder,
+            adb_root=adb_root,
+            container_name=container_name,
+            container_emoji=container_emoji,
+            server_port=8765,
+        )
+
+        ok = upload_folder(api, state, folder, parent_id)
+
+        if ok:
+            if folder.status_tag == "MODIFIED":
                 result.updated += 1
             else:
                 result.uploaded += 1
