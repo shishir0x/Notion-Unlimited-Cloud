@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Cache and State Files
+.notion_sync_state.json
+.notion_drive_cache.json
+*.log
+
+# Environment and Secrets
+.env
+.env.local
+
+# Operating System Files
+desktop.ini
+Thumbs.db
+.DS_Store
