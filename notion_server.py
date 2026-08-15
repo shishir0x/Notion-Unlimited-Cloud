@@ -27,6 +27,7 @@ except AttributeError:
 import io
 import time
 import json
+import re
 import zipfile
 import mimetypes
 import hmac
@@ -121,6 +122,18 @@ CACHE_LOCK = threading.RLock()
 def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0):
     """Instantly registers a file or folder in the in-memory cache and bumps version so browser GUI live updates."""
     with CACHE_LOCK:
+        existing = DRIVE_CACHE["items"].get(item_id)
+        if existing:
+            old_parent = existing.get("parent_id")
+            if old_parent != parent_id:
+                if old_parent:
+                    old_children = DRIVE_CACHE["children"].get(old_parent, [])
+                    if item_id in old_children:
+                        old_children.remove(item_id)
+                else:
+                    if item_id in DRIVE_CACHE["root_items"]:
+                        DRIVE_CACHE["root_items"].remove(item_id)
+
         DRIVE_CACHE["items"][item_id] = {
             "id": item_id,
             "name": name,
@@ -339,8 +352,9 @@ class BackgroundSyncRunner:
         for part in rel_parts:
             cache_k = (part, curr_id)
             if cache_k in self.folder_cache:
+                parent_cache_id = curr_id
                 curr_id = self.folder_cache[cache_k]
-                register_drive_cache_item(curr_id, part, "Folder", "", 0, 0, curr_id, part)
+                register_drive_cache_item(curr_id, part, "Folder", "", 0, 0, parent_cache_id, part)
             else:
                 payload = {
                     "parent": {"database_id": self.db_id},
@@ -2143,6 +2157,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         let currentMainTab = 'drive';
         let currentSyncSubTab = 'queue';
         let lastCacheVersion = -1;
+        let driveFetchInFlight = false;
+        let queuedDriveFolderId = undefined;
+        let visibleFiles = [];
+        const MAX_RENDER_FILES = 150;
+        const LARGE_FOLDER_THRESHOLD = 200;
 
         const fileIcons = {
             'pdf': 'fa-file-pdf', 'doc': 'fa-file-word', 'docx': 'fa-file-word',
@@ -2189,15 +2208,35 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 
         async function fetchDrive(folderId = null) {
             currentFolderId = folderId;
+            if (driveFetchInFlight) {
+                queuedDriveFolderId = folderId;
+                return;
+            }
+
+            driveFetchInFlight = true;
             const url = folderId ? `/api/drive?folder_id=${encodeURIComponent(folderId)}` : '/api/drive';
             try {
-                const res = await fetch(url);
-                driveData = await res.json();
+                const res = await fetch(url, { cache: 'no-store' });
+                if (!res.ok) {
+                    throw new Error(`Drive request failed: ${res.status}`);
+                }
+                const data = await res.json();
+                if (!data || !Array.isArray(data.folders) || !Array.isArray(data.files)) {
+                    throw new Error('Drive response payload is malformed');
+                }
+                driveData = data;
                 sortItems();
                 renderView();
                 renderBreadcrumbs();
             } catch (e) {
                 console.error("Drive fetch error:", e);
+            } finally {
+                driveFetchInFlight = false;
+                if (queuedDriveFolderId !== undefined) {
+                    const nextFolderId = queuedDriveFolderId;
+                    queuedDriveFolderId = undefined;
+                    fetchDrive(nextFolderId);
+                }
             }
         }
 
@@ -2213,6 +2252,16 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             if (!timestamp || timestamp === 0) return '-';
             const d = new Date(timestamp * 1000);
             return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function isAndroidLikePath(p) {
+            if (!p) return false;
+            return p.includes('Internal shared storage') ||
+                   p.includes('Internal Storage') ||
+                   p.includes('SD card') ||
+                   p.includes('SD Card') ||
+                   p.startsWith('/storage') ||
+                   p.startsWith('/sdcard');
         }
 
         function changeSort(val) {
@@ -2267,18 +2316,34 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             const isEmpty = (!driveData.folders || driveData.folders.length === 0) && (!driveData.files || driveData.files.length === 0);
             document.getElementById('emptyMessage').style.display = isEmpty ? 'block' : 'none';
 
+            const allFiles = Array.isArray(driveData.files) ? driveData.files : [];
+            const displayedFiles = allFiles.slice(0, MAX_RENDER_FILES);
+            visibleFiles = displayedFiles;
+            const isLargeFolder = allFiles.length > LARGE_FOLDER_THRESHOLD;
+
+            const existingWarn = document.getElementById('largeFolderWarning');
+            if (existingWarn) {
+                existingWarn.remove();
+            }
+            if (allFiles.length > MAX_RENDER_FILES) {
+                const warning = document.createElement('div');
+                warning.id = 'largeFolderWarning';
+                warning.style.cssText = 'margin:10px 0 14px; padding:10px 12px; border:1px solid #3C4043; border-radius:10px; color:#c9d1d9; background:#1d232a; font-size:12px;';
+                warning.textContent = `Large folder detected: showing first ${MAX_RENDER_FILES.toLocaleString()} of ${allFiles.length.toLocaleString()} files for smooth browsing.`;
+                const container = document.getElementById('viewMyDrive');
+                if (container) container.prepend(warning);
+            }
+
             if (viewMode === 'grid') {
                 const fg = document.getElementById('foldersGrid');
                 const fs = document.getElementById('filesGrid');
-                fg.innerHTML = '';
-                fs.innerHTML = '';
 
                 document.getElementById('foldersSection').style.display = driveData.folders.length ? 'block' : 'none';
                 document.getElementById('filesSection').style.display = driveData.files.length ? 'block' : 'none';
 
-                driveData.folders.forEach(f => {
+                const folderCards = driveData.folders.map((f) => {
                     const countTxt = f.item_count !== undefined ? `${f.item_count} items` : '';
-                    fg.innerHTML += `
+                    return `
                         <div class="folder-card" onclick="fetchDrive('${f.id}')" title="${f.name}">
                             <i class="${getFolderIcon(f.name)}"></i>
                             <div style="overflow:hidden;">
@@ -2288,17 +2353,19 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         </div>
                     `;
                 });
+                fg.innerHTML = folderCards.join('');
 
-                driveData.files.forEach(f => {
+                const fileCards = displayedFiles.map((f, i) => {
                     const ext = (f.extension || '').replace('.', '').toLowerCase();
                     const iconClass = fileIcons[ext] || 'fa-file';
                     const isImg = ['jpg','jpeg','png','webp','gif','svg'].includes(ext);
-                    const thumb = isImg 
-                        ? `<img src="/view?path=${encodeURIComponent(f.local_path)}" loading="lazy" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='block');">` 
+                    const useThumb = isImg && !isLargeFolder && !isAndroidLikePath(f.local_path);
+                    const thumb = useThumb
+                        ? `<img src="/view?path=${encodeURIComponent(f.local_path)}" loading="lazy" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='block');"><i class="fa-solid ${iconClass}" style="display:none;"></i>`
                         : `<i class="fa-solid ${iconClass}"></i>`;
 
-                    fs.innerHTML += `
-                        <div class="file-card" onclick='previewFile(${JSON.stringify(f)})' title="${f.name}">
+                    return `
+                        <div class="file-card" onclick='previewFileByIndex(${i})' title="${f.name}">
                             <div class="file-thumb">${thumb}</div>
                             <div class="file-info">
                                 <i class="fa-solid ${iconClass}"></i>
@@ -2311,12 +2378,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         </div>
                     `;
                 });
+                fs.innerHTML = fileCards.join('');
             } else {
                 const tbody = document.getElementById('driveTableBody');
-                tbody.innerHTML = '';
-
-                driveData.folders.forEach(f => {
-                    tbody.innerHTML += `
+                const folderRows = driveData.folders.map((f) => {
+                    return `
                         <tr onclick="fetchDrive('${f.id}')">
                             <td><div class="table-item-name"><i class="${getFolderIcon(f.name)}"></i><span>${f.name}</span></div></td>
                             <td>Folder</td>
@@ -2327,11 +2393,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     `;
                 });
 
-                driveData.files.forEach(f => {
+                const fileRows = displayedFiles.map((f, i) => {
                     const ext = (f.extension || '').replace('.', '').toLowerCase();
                     const iconClass = fileIcons[ext] || 'fa-file';
-                    tbody.innerHTML += `
-                        <tr onclick='previewFile(${JSON.stringify(f)})'>
+                    return `
+                        <tr onclick='previewFileByIndex(${i})'>
                             <td><div class="table-item-name"><i class="fa-solid ${iconClass}"></i><span>${f.name}</span></div></td>
                             <td>${f.type || ext.toUpperCase() || 'File'}</td>
                             <td>${formatDate(f.mtime)}</td>
@@ -2345,6 +2411,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         </tr>
                     `;
                 });
+                tbody.innerHTML = folderRows.join('') + fileRows.join('');
             }
         }
 
@@ -2365,6 +2432,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     `;
                 });
             }
+        }
+
+        function previewFileByIndex(idx) {
+            if (idx < 0 || idx >= visibleFiles.length) return;
+            previewFile(visibleFiles[idx]);
         }
 
         function previewFile(f) {
@@ -2444,7 +2516,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 if (st.cache_version !== undefined && st.cache_version !== lastCacheVersion) {
                     lastCacheVersion = st.cache_version;
                     if (currentMainTab === 'drive') {
-                        fetchDrive(currentFolderId);
+                        const browsingDeepFolder = !!currentFolderId;
+                        const skipDeepAutoReloadWhileSync = st.is_running && browsingDeepFolder;
+                        if (!skipDeepAutoReloadWhileSync) {
+                            fetchDrive(currentFolderId);
+                        }
                     }
                     fetchStorageStats();
                 }
@@ -2770,7 +2846,7 @@ def get_cached_sdcard_id() -> str:
 
 def resolve_android_path(p: str) -> str:
     """Canonicalize any Android path (display or ADB) into a valid ADB Linux path."""
-    clean = p.replace("\\", "/").strip()
+    clean = re.sub(r"[\\/]+", "/", p.strip())
     # Already canonical ADB path
     if clean.startswith("/storage/emulated/0/"):
         return clean
@@ -3122,7 +3198,12 @@ class NotionServerHandler(BaseHTTPRequestHandler):
 
                 breadcrumbs = []
                 curr = folder_id
+                seen = set()
                 while curr:
+                    if curr in seen:
+                        # Break potential parent cycles from stale/corrupt cache data.
+                        break
+                    seen.add(curr)
                     c_item = DRIVE_CACHE["items"].get(curr)
                     if not c_item:
                         break

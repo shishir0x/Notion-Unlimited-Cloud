@@ -108,7 +108,14 @@ def start_background_file_server(port: int = LOCAL_SERVER_PORT):
     try:
         import notion_server
         notion_server.load_disk_cache()
-        server = ThreadingHTTPServer(("0.0.0.0", port), notion_server.NotionFileServerHandler)
+        handler_cls = getattr(
+            notion_server,
+            "NotionServerHandler",
+            getattr(notion_server, "NotionFileServerHandler", None),
+        )
+        if handler_cls is None:
+            return None
+        server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"🚀 Google Drive Web GUI active on http://127.0.0.1:{port}")

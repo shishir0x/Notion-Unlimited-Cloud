@@ -5,7 +5,9 @@ Handles all HTTP communication with Notion so the rest of the code
 never has to deal with raw requests, pagination, or retry logic.
 """
 
+import json
 import time
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
@@ -137,8 +139,6 @@ class NotionAPI:
         Fetch all existing Folder pages into the local cache.
         Loads instantly from local disk cache (<0.01s) if available.
         """
-        import json
-        from pathlib import Path
         cache_path = Path.home() / ".notion_drive_cache.json"
         if cache_path.exists():
             try:

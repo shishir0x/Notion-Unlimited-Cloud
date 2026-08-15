@@ -26,7 +26,7 @@ import threading
 import webbrowser
 import urllib.request
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 # ── Ensure the project root is on sys.path ────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -124,6 +124,15 @@ def notify_server(payload: dict):
             pass
     except Exception as e:
         # Fallback print if server error occurs
+        pass
+
+
+def refresh_server_cache_once() -> None:
+    """Ask the Web Drive server to refresh cache so synced files appear immediately."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/refresh", timeout=2.5):
+            pass
+    except Exception:
         pass
 
 
@@ -276,6 +285,7 @@ def sync_local(path: str, force: bool = False):
         "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
         "log_message": f"Sync completed for {path}: {result.uploaded} uploaded, {result.updated} updated."
     })
+    refresh_server_cache_once()
 
     print(f"\n  ✅ Sync complete!")
     print(f"     Uploaded : {result.uploaded:,}")
@@ -384,6 +394,7 @@ def sync_android(device: StorageDevice):
         "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
         "log_message": f"Sync completed for {device.label}: {result.uploaded} uploaded, {result.updated} updated."
     })
+    refresh_server_cache_once()
 
     print(f"\n  ✅ Android sync complete!")
     print(f"     Uploaded : {result.uploaded:,}")
