@@ -108,18 +108,17 @@ def scan_android(
     win_label : Windows label for display e.g. "This PC\\OnePlus Nord CE4\\Internal shared storage"
     """
     cmd = (
-        f"find '{adb_root}/' -type f "
-        f"-not -path '*/.*' "
-        f"-not -path '*/Android*' "
-        f"-not -path '*/.thumbnails*' "
-        f"-not -path '*/LOST.DIR*' "
-        f"-not -path '*/.trash*' "
-        f"-exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+        f"find '{adb_root}' "
+        f"-name '.*' -prune -o "
+        f"-path '{adb_root}/Android' -prune -o "
+        f"-path '*/LOST.DIR' -prune -o "
+        f"-path '*/.trash' -prune -o "
+        f"-type f -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
     )
     try:
         proc = subprocess.run(
             ["adb", "-s", device_id, "shell", cmd],
-            capture_output=True, text=True, errors="ignore", timeout=300,
+            capture_output=True, text=True, errors="ignore", timeout=60,
         )
     except Exception:
         return

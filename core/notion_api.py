@@ -134,9 +134,29 @@ class NotionAPI:
 
     def preload_folders(self):
         """
-        Fetch all existing Folder pages from Notion into the local cache.
-        Call this once before a sync run to avoid redundant API calls.
+        Fetch all existing Folder pages into the local cache.
+        Loads instantly from local disk cache (<0.01s) if available.
         """
+        import json
+        from pathlib import Path
+        cache_path = Path.home() / ".notion_drive_cache.json"
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                loaded = 0
+                for nid, it in data.get("items", {}).items():
+                    if it.get("type") == "Folder":
+                        clean_name = it.get("name", "").replace("📁 ", "").strip()
+                        parent_id = it.get("parent_id")
+                        if clean_name:
+                            self._folder_cache[(clean_name, parent_id)] = nid
+                            loaded += 1
+                if loaded > 0:
+                    return
+            except Exception:
+                pass
+
         for item in self.query_all({"property": "Type", "select": {"equals": "Folder"}}):
             nid = item["id"].replace("-", "")
             props = item.get("properties", {})

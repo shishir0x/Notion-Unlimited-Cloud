@@ -218,7 +218,7 @@ def sync_android(device: StorageDevice):
     print(f"  🔗 Preloading Notion folder cache…")
     api.preload_folders()
 
-    print(f"  🔍 Reading file list from device (this may take 1-2 minutes)…")
+    print(f"  🔍 Reading file list from device…")
     all_items = list(ENGINE.scan_android(
         device.adb_device_id, device.adb_path, win_label
     ))
