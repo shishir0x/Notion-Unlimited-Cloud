@@ -66,7 +66,7 @@ _load_env_credentials()
 
 from core import config
 
-PORT = config.LOCAL_SERVER_PORT
+PORT = int(os.environ.get("PORT", config.LOCAL_SERVER_PORT))
 NOTION_VERSION = config.NOTION_VERSION
 DEFAULT_API_KEY = config.NOTION_TOKEN
 DEFAULT_DB_ID = config.NOTION_DATABASE_ID.replace("-", "")
