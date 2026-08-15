@@ -1,148 +1,242 @@
-# ☁️ Notion Unlimited Cloud & Web Drive File Manager
+# ☁️ Notion Unlimited Cloud & Web Drive
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Notion API](https://img.shields.io/badge/Notion%20API-v2022--06--28-black.svg)](https://developers.notion.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://microsoft.com)
+[![Platform: Windows · macOS · Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6.svg)](https://github.com/shishir0x/Notion-Unlimited-Cloud)
 
-Transform your **Notion Database** into a high-speed, unlimited cloud storage drive with a modern **Google Drive & OneDrive Web GUI**, **Git-like differential sync engine**, **live real-time filesystem watcher**, and **1-click browser preview & dynamic folder ZIP downloads**.
-
----
-
-## 🌟 Key Features
-
-### 🌐 1. Google Drive & OneDrive Web GUI (`http://127.0.0.1:8765`)
-- **Familiar Drive Interface**: Dark-themed SPA (Single Page Application) with folder cards, file grids, and storage metrics.
-- **Interactive Breadcrumb Navigation**: Seamlessly navigate through deep nested directory structures (e.g., `My Drive > Users > nitro > Documents > Projects`).
-- **Instant File Search**: Real-time multi-level search across all files and folders.
-- **1-Click In-Browser Previews**: Built-in modal viewer & direct Edge/Chrome tab streaming for PDFs, images, text, and code files.
-- **Dynamic ZIP Folder Downloads**: Pack and download entire directory trees on the fly into `.zip` archives with a single click.
-
-### ⚡ 2. Git-Style Differential Sync Engine
-- **Delta-Only Syncing**: Tracks file modification times (`mtime`) and sizes via local state tracking (`.notion_sync_state.json`), updating *only* changed or newly added files.
-- **Hierarchical Relational Structure**: Mirrored exact parent-child relations directly in Notion using multi-parent relations.
-- **Rich File Metadata**: Automatically categorizes files (PDF, Code, Image, Word, Excel, ZIP, etc.) with custom emojis, extensions, and file sizes.
-- **Hidden & Dot-File Support**: Full support for syncing hidden configurations and dot-directories (`.vscode`, `.gitconfig`, `.gitignore`).
-
-### 👀 3. Live Auto-Upload File Watcher
-- **Real-Time Daemon**: Continuously monitors your local filesystem (e.g., `C:\Users`).
-- **Dynamic Progress Bar**: Beautiful terminal UI with visual progress bars (`[██████░░] 75% (3/4) [filename.pdf] [Rem: 1]`).
-- **Automatic Uploads**: Instantly pushes newly created or modified files into your Notion database in the background.
-
-### 🚀 4. 1-Click Desktop Launcher (`Notion_Sync.bat`)
-- Clean Windows batch runner that automatically starts the background web server and opens the interactive menu.
+> Turn your **Notion database** into an unlimited cloud drive with a Google Drive-style web interface, Git-style incremental sync, real-time file watcher, and universal storage device support (local drives + Android via ADB).
 
 ---
 
-## 📁 Repository Structure
+## ✨ What It Does
 
-```text
-Notion-Unlimited-Cloud/
-│
-├── notion_git_sync.py      # Git-like CLI synchronization & live watcher engine
-├── notion_server.py        # Local multithreaded server & Google Drive Web GUI SPA
-├── Notion_Sync.bat         # 1-click Windows Desktop batch launcher
-├── requirements.txt        # Python package dependencies
-├── .env.example            # Environment configuration template
-├── .gitignore              # Ignored cache, state, and temp files
-└── README.md               # Documentation and usage guide
-```
+| Feature | Description |
+|---|---|
+| 🔍 **Auto Device Discovery** | Detects all connected drives (C:, D:, USB sticks) and Android phones via ADB automatically — no hardcoding |
+| 📁 **Folder Selector** | Interactive menu to choose exactly which folders to upload |
+| ⚡ **Git-Style Incremental Sync** | Tracks file `mtime` + `size` — only uploads new or changed files. Skips unchanged files instantly with 0 API calls |
+| 🔄 **No Duplicates** | Modified files are updated in-place via Notion PATCH (no duplicate rows ever created) |
+| 🌐 **Web Drive GUI** | Modern Google Drive-style web app at `http://127.0.0.1:8765` — browse, search, preview, and download files |
+| 📱 **Android USB Sync** | Sync phone Internal Storage and SD Card directly to Notion over USB — no PC disk space used |
+| 👀 **Live File Watcher** | Monitors a folder in real time and auto-uploads any new or changed file |
+| 💾 **Resumable** | State is saved after every single file, so interrupted syncs always resume where they left off |
 
 ---
 
-## 🚀 Quick Start & Installation
+## 🚀 Quick Start (3 Steps)
 
-### 1. Clone the Repository
+### Step 1 — Clone & Install
+
 ```bash
 git clone https://github.com/shishir0x/Notion-Unlimited-Cloud.git
 cd Notion-Unlimited-Cloud
-```
-
-### 2. Install Dependencies
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configure Notion API Credentials
-Create a `.env` file or export your environment variables:
+### Step 2 — Configure Notion (First Run Only)
+
+**Option A — Automatic (recommended):**
+```bash
+python setup.py
+```
+The wizard walks you through creating a Notion integration and guides you to your Database ID.
+
+**Option B — Manual:**
+Create a `.env` file:
 ```ini
-NOTION_TOKEN=ntn_your_notion_integration_token_here
+NOTION_TOKEN=ntn_your_integration_secret_here
 NOTION_DATABASE_ID=your_32_character_database_id_here
 ```
 
-> **How to get your Notion Token & Database ID:**
-> 1. Go to [Notion Integrations](https://www.notion.so/my-integrations) and create an **Internal Integration**.
-> 2. Copy the **Internal Integration Secret** (`ntn_...`).
-> 3. Create a Database in Notion and share it with your integration (`...` $\rightarrow$ `Connections` $\rightarrow$ `Add Connection`).
-> 4. Copy the 32-character ID from your Notion database URL (`https://notion.so/<DATABASE_ID>?v=...`).
+> **How to get these values:**
+> 1. Go to [Notion Integrations](https://www.notion.so/my-integrations) → `+ New Integration` → Copy the **Internal Integration Secret** (starts with `ntn_`)
+> 2. Create a full-page **Database** in Notion → Click `...` → `Connections` → add your integration
+> 3. Copy the **32-character ID** from the database URL: `https://notion.so/workspace/`**`DATABASE_ID`**`?v=...`
+
+### Step 3 — Run
+
+**Windows (double-click):**
+```
+Notion_Sync.bat
+```
+
+**All platforms (terminal):**
+```bash
+python notion_sync.py
+```
+
+You'll see the interactive device selector:
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║  ☁️   NOTION UNLIMITED CLOUD & WEB DRIVE                      ║
+║  Your personal unlimited cloud — powered by Notion API        ║
+╚═══════════════════════════════════════════════════════════════╝
+
+  🔍 Detecting connected storage devices…
+  ✅ 3 device(s) found
+
+  Select a storage source to sync:
+
+  ── LOCAL DRIVES ─────────────────────────────────────────
+    [1] 💽  Local Disk (C:)               238.4 GB used / 476.8 GB total
+    [2] 💽  Local Disk (D:)               120.0 GB used / 240.0 GB total
+
+  ── ANDROID (OnePlus Nord CE4 — connected via USB) ──────
+    [3] 📱  OnePlus Nord CE4 — Internal Storage
+    [4] 💾  OnePlus Nord CE4 — SD Card
+
+  ── OTHER OPTIONS ────────────────────────────────────────
+    [g] 🌐  Open Web Drive GUI (http://127.0.0.1:8765)
+    [s] 📊  Show Sync Status (git status view)
+    [r] 🔄  Rebuild index from Notion
+    [n] 📝  Open Notion database in browser
+    [q] ❌  Exit
+
+  Enter your choice:
+```
+
+After selecting a drive, you pick a subfolder:
+
+```
+  📁 Choose what to sync from Local Disk (C:):
+
+    [1] 👤  All User Folders (Desktop + Documents + Downloads + Pictures + Music + Videos)
+    [2] 🖥️  Desktop
+    [3] 📄  Documents
+    [4] ⬇️  Downloads
+    [5] 🖼️  Pictures
+    [6] 🎵  Music
+    [7] 🎬  Videos
+    [8] 📁  Custom path...
+```
 
 ---
 
-## 🖥️ Usage
+## 🖥️ Web Drive GUI
 
-### 🖱️ Method A: 1-Click Desktop Launcher
-Simply double-click **`Notion_Sync.bat`** to start the background server and display the CLI dashboard:
-
-```text
-====================================================================
-        ☁️ NOTION UNLIMITED CLOUD & WEB DRIVE DASHBOARD
-====================================================================
-  [1] ⚡ Upload Only Changed & New Files (Smart Incremental Sync)
-  [2] 🚀 Upload All Files (Force Full Cloud Sync)
-  [3] 👀 Start Real-Time Auto-Sync Watcher (Live Background Monitor)
-  [4] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)
-  [5] 📊 Check Storage Status & File Integrity (Git-Style Inspect)
-  [6] 🔄 Rebuild & Refresh Local Cloud Index (Sync state from Notion)
-  [7] 📝 Open Notion Database in Browser
-  [8] ❌ Exit
-====================================================================
-Select an option [1-8]:
-```
-
-### ⌨️ Method B: Command Line (CLI)
-
-#### 1. Smart Incremental Sync (Changed & New Files Only):
-```bash
-python notion_git_sync.py sync --path "C:\Users"
-```
-
-#### 2. Full Force Cloud Sync (Upload All Files):
-```bash
-python notion_git_sync.py sync-all --path "C:\Users"
-```
-
-#### 3. Real-Time Auto-Sync Watcher:
-```bash
-python notion_git_sync.py watch --path "C:\Users" --interval 4
-```
-
-#### 4. Launch Web Drive GUI Server:
-```bash
-python notion_git_sync.py gui
-```
-Or run directly:
+Start the GUI server:
 ```bash
 python notion_server.py
 ```
 Open **`http://127.0.0.1:8765`** in your browser.
 
-#### 5. Inspect Cloud Storage Status:
+Features:
+- 📂 Browse full folder tree (same structure as your local disk)
+- 🔍 Real-time search across all files
+- 👁️ In-browser preview for images, PDFs, text files, code
+- 📥 Download any file or folder as a ZIP
+- ⚡ Live Sync Activity panel — watch files upload in real time
+
+---
+
+## ⌨️ Command Line Usage
+
 ```bash
-python notion_git_sync.py status --path "C:\Users"
+# Interactive device selector (recommended)
+python notion_sync.py
+
+# Check what needs syncing (like git status)
+python notion_sync.py status --path "C:\Users\nitro\Documents"
+
+# Sync a specific folder (incremental — only new/changed)
+python notion_sync.py sync --path "C:\Users\nitro\Documents"
+
+# Force re-upload everything
+python notion_sync.py sync-all --path "C:\Users\nitro\Documents"
+
+# Watch a folder and auto-upload changes every 4 seconds
+python notion_sync.py watch --path "C:\Users\nitro\Documents" --interval 4
+
+# Open web browser GUI
+python notion_sync.py gui
+
+# Rebuild local index from Notion (after database changes)
+python notion_sync.py rebuild
 ```
 
-#### 6. Rebuild Local Index from Notion:
-```bash
-python notion_git_sync.py rebuild
+---
+
+## 📁 Project Structure
+
+```
+Notion-Unlimited-Cloud/
+│
+├── notion_sync.py          Main entry point — device selector & sync runner
+├── notion_server.py        Web Drive GUI server (http://127.0.0.1:8765)
+├── setup.py                First-time setup wizard
+├── Notion_Sync.bat         Windows 1-click launcher
+│
+├── core/                   Shared library (no code duplication)
+│   ├── config.py           Credential loading & shared constants
+│   ├── storage.py          Universal storage device discovery
+│   ├── filters.py          Unified file/folder ignore rules
+│   ├── state.py            Git-style .notion_sync_state.json manager
+│   ├── notion_api.py       Notion REST API wrapper (retry, pagination, cache)
+│   └── sync_engine.py      Differential scan → diff → upload engine
+│
+├── requirements.txt        Python dependencies
+├── .env.example            Credential template
+└── .env                    Your credentials (git-ignored, never committed)
+```
+
+---
+
+## 📱 Android Phone Sync (ADB)
+
+Requirements:
+1. Install [ADB (Android Debug Bridge)](https://developer.android.com/tools/releases/platform-tools)
+2. On your phone: **Settings → Developer Options → USB Debugging → Enable**
+3. Connect phone via USB cable
+4. Tap **"Allow"** on the USB Debugging authorization prompt
+5. Run `adb devices` to verify — you should see your device ID
+
+The app will automatically detect your phone and list both Internal Storage and SD Card as sync options. Files are streamed directly from phone to Notion — **0 bytes used on your PC disk**.
+
+> **Android app data excluded:** The `Android/` folder (app caches, APK data) is always excluded to avoid uploading irrelevant app files.
+
+---
+
+## ⚡ How Incremental Sync Works (Git-Style)
+
+Every file is tracked by its **path + modification time + size** in `.notion_sync_state.json`:
+
+```
+Local file scan
+       │
+       ▼
+Compare mtime & size with .notion_sync_state.json
+       │
+   ┌───┴───────────────────────────────────────────────────────┐
+   │                         │                                 │
+   ▼                         ▼                                 ▼
+[UP-TO-DATE]             [NEW FILE]                     [MODIFIED]
+mtime & size             Never synced                   Size or date
+unchanged                                               changed
+   │                         │                                 │
+   ▼                         ▼                                 ▼
+⏩ SKIP                  ➕ POST to Notion            🔄 PATCH in Notion
+(0 Notion API calls)    (Create new page)            (Update existing page)
+                              │                                 │
+                              └───────────────┬─────────────────┘
+                                              │
+                                              ▼
+                               💾 Save to .notion_sync_state.json
+                               🔴 LIVE update in Web Drive GUI
 ```
 
 ---
 
 ## 🛡️ Privacy & Safety
-- **Git-Ignored State**: Local state tracking (`.notion_sync_state.json`) and cache files (`.notion_drive_cache.json`) are strictly excluded from version control.
-- **Safety Filters**: System-critical folders (`AppData`, `node_modules`, `__pycache__`, `$Recycle.Bin`) and sensitive locked files (`ntuser.dat`, registry hives) are automatically skipped.
+
+- **Credentials never committed:** `.env`, `.notion_sync_state.json`, and `.notion_drive_cache.json` are all git-ignored
+- **System folders excluded:** `AppData`, `Windows`, `node_modules`, `$Recycle.Bin`, `__pycache__`, and all system-critical directories are automatically skipped
+- **Android app data excluded:** The `Android/` directory, `.thumbnails`, and `LOST.DIR` are always excluded
+- **No file content sent:** Only file metadata (name, size, path, modification date) is stored in Notion. File content is served locally on demand via `http://127.0.0.1:8765`
 
 ---
 
 ## 📄 License
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+MIT License — see [LICENSE](LICENSE) for details.
