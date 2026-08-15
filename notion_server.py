@@ -2206,6 +2206,40 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 # ==============================================================================
 # HTTP SERVER ROUTING
 # ==============================================================================
+
+def resolve_android_path(p: str) -> str:
+    """Canonicalize any Android path (display or ADB) into a valid ADB Linux path."""
+    clean = p.replace("\\", "/").strip()
+    # Already canonical ADB path
+    if clean.startswith("/storage/emulated/0/"):
+        return clean
+    if clean.startswith("/sdcard/"):
+        return "/storage/emulated/0/" + clean[len("/sdcard/"):]
+    
+    # SD card canonical
+    m = re.match(r"^/storage/([0-9A-Fa-f\-]+)/(.+)$", clean)
+    if m and m.group(1) not in ("emulated", "self"):
+        return clean
+
+    # SD card display path
+    if "sd card" in clean.lower() or "4a21-0000" in clean.lower():
+        rel = re.sub(r"^.*?(?:sd card|4a21-0000)/?", "", clean, flags=re.IGNORECASE).lstrip("/")
+        sd_id = "4A21-0000"
+        try:
+            out = subprocess.check_output(["adb", "shell", "ls", "/storage"], timeout=3).decode("utf-8", errors="ignore")
+            for s in out.split():
+                if s not in ("emulated", "self", "persist", "sdcard0"):
+                    sd_id = s
+                    break
+        except Exception:
+            pass
+        return f"/storage/{sd_id}/{rel}"
+
+    # Internal storage display path
+    rel = re.sub(r"^.*?(?:internal shared storage|internal storage|storage/emulated/0)/?", "", clean, flags=re.IGNORECASE).lstrip("/")
+    return f"/storage/emulated/0/{rel}"
+
+
 class NotionServerHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         # Suppress standard HTTP request logs to avoid Unicode/BrokenPipe errors
@@ -2275,13 +2309,33 @@ class NotionServerHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/sync/status":
             with SYNC_LOCK:
-                st_copy = dict(SYNC_STATE)
+                st_copy = {
+                    "is_running": SYNC_STATE.get("is_running", False),
+                    "current_target": SYNC_STATE.get("current_target", "ALL"),
+                    "total_files": SYNC_STATE.get("total_files", 0),
+                    "synced_files": SYNC_STATE.get("synced_files", 0),
+                    "remaining_files": SYNC_STATE.get("remaining_files", 0),
+                    "percent": SYNC_STATE.get("percent", 0),
+                    "current_file": SYNC_STATE.get("current_file", "None"),
+                    "current_path": SYNC_STATE.get("current_path", ""),
+                    "current_size_str": SYNC_STATE.get("current_size_str", "0 KB"),
+                    "speed_str": SYNC_STATE.get("speed_str", "0 files/min"),
+                    "status_message": SYNC_STATE.get("status_message", "Ready to sync"),
+                    "queue": list(SYNC_STATE.get("queue", [])),
+                    "history": list(SYNC_STATE.get("history", [])),
+                    "logs": list(SYNC_STATE.get("logs", []))[-50:],
+                }
             with CACHE_LOCK:
                 st_copy["cache_version"] = DRIVE_CACHE.get("version", 0)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(st_copy).encode("utf-8"))
+            try:
+                payload = json.dumps(st_copy).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception:
+                pass
             return
 
         if parsed.path == "/api/drive":
@@ -2404,21 +2458,7 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                       clean_path_str.startswith("/sdcard"))
 
         if is_android:
-            phone_path = clean_path_str
-            if "SD card" in norm_str or "SD Card" in norm_str or "/storage/4A21-0000" in clean_path_str:
-                clean_rel = norm_str.replace("This PC\\OnePlus Nord CE4\\SD card", "").replace("SD card", "").replace("SD Card", "").replace("/storage/4A21-0000", "").replace("\\", "/").lstrip("/")
-                try:
-                    stor_out = subprocess.check_output(["adb", "shell", "ls", "/storage"]).decode("utf-8")
-                    for s in stor_out.split():
-                        if s not in ("emulated", "self", "persist", "sdcard0"):
-                            phone_path = f"/storage/{s}/{clean_rel}"
-                            break
-                except Exception:
-                    phone_path = f"/storage/4A21-0000/{clean_rel}"
-            else:
-                clean_rel = norm_str.replace("This PC\\OnePlus Nord CE4\\Internal shared storage", "").replace("Internal shared storage", "").replace("Internal Storage", "").replace("/storage/emulated/0", "").replace("/sdcard", "").replace("\\", "/").lstrip("/")
-                phone_path = f"/storage/emulated/0/{clean_rel}"
-
+            phone_path = resolve_android_path(clean_path_str)
             fname = phone_path.split("/")[-1]
             mime, _ = mimetypes.guess_type(fname)
             mime = mime or "application/octet-stream"
@@ -2426,7 +2466,7 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             try:
                 proc = subprocess.Popen(["adb", "exec-out", "cat", phone_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 content, err = proc.communicate()
-                if proc.returncode == 0 and content:
+                if proc.returncode == 0 and content and not content.startswith(b"cat: "):
                     self.send_response(200)
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(len(content)))
@@ -2447,7 +2487,7 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
             .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
             a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
-            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your OnePlus Nord CE4 via USB with USB Debugging enabled to stream this file live.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
+            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your phone via USB with USB Debugging enabled to view this file.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
             self.wfile.write(err_html.encode("utf-8"))
             return
 

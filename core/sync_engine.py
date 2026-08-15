@@ -324,6 +324,15 @@ def upload_file(
                 state, item.path, notion_id,
                 item.mtime, item.size, android=item.is_android,
             )
+            try:
+                import notion_server
+                notion_server.register_drive_cache_item(
+                    notion_id, item.name, "File", item.ext,
+                    size_mb, int(item.size), parent_notion_id,
+                    item.path, item.mtime
+                )
+            except Exception:
+                pass
         return notion_id is not None
 
 

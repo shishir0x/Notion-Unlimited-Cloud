@@ -14,6 +14,23 @@ from typing import Any, Dict, Optional
 from core.config import STATE_FILE
 
 
+def _normalize_android_path(p: str) -> str:
+    """Normalize any Android file path into canonical ADB format."""
+    clean = p.replace("\\", "/").strip()
+    if clean.startswith("/sdcard/"):
+        return "/storage/emulated/0/" + clean[len("/sdcard/"):]
+    if "Internal shared storage" in clean:
+        rel = clean.split("Internal shared storage")[-1].lstrip("/")
+        return f"/storage/emulated/0/{rel}"
+    if "Internal Storage" in clean:
+        rel = clean.split("Internal Storage")[-1].lstrip("/")
+        return f"/storage/emulated/0/{rel}"
+    if "SD card" in clean or "SD Card" in clean:
+        rel = clean.replace("This PC/OnePlus Nord CE4/SD card", "").replace("SD card", "").replace("SD Card", "").lstrip("/")
+        return f"/storage/4A21-0000/{rel}"
+    return clean
+
+
 def load_state() -> Dict[str, Any]:
     """
     Load the sync state index from disk.
@@ -35,7 +52,12 @@ def load_state() -> Dict[str, Any]:
                     data = json.load(f)
                 if isinstance(data, dict):
                     data.setdefault("files", {})
-                    data.setdefault("android_files", {})
+                    raw_af = data.setdefault("android_files", {})
+                    # Auto-normalize all Android keys to canonical ADB paths
+                    norm_af = {}
+                    for k, v in raw_af.items():
+                        norm_af[_normalize_android_path(k)] = v
+                    data["android_files"] = norm_af
                     data.setdefault("folders", {})
                     data.setdefault("last_sync", None)
                     return data
