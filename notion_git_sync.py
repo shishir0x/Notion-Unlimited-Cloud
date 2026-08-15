@@ -433,9 +433,9 @@ class NotionGitSyncEngine:
         items_to_sync = []
         for storage_label, base_path in storage_targets:
             scan_path = f"{base_path}/{folder_filter}" if folder_filter else base_path
-            print(f"🔍 Scanning {storage_label} ({scan_path}) directly on phone...")
+            print(f"🔍 Scanning {storage_label} ({scan_path}) directly on phone (Excluding Android app data)...")
             
-            cmd = f"find '{scan_path}' -type f -not -path '*/.*' -not -path '*/Android/data*' -not -path '*/Android/obb*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+            cmd = f"find '{scan_path}' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
             try:
                 find_out = subprocess.check_output(["adb", "-s", device_id, "shell", cmd]).decode("utf-8", errors="ignore")
                 for line in find_out.splitlines():
@@ -446,6 +446,9 @@ class NotionGitSyncEngine:
                             fname = fpath.split("/")[-1]
                             ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
                             
+                            # Exclude Android and system folders
+                            if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath:
+                                continue
                             if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
                                 continue
                             if ext in IGNORED_FILE_EXTENSIONS:
@@ -482,6 +485,9 @@ class NotionGitSyncEngine:
             file_type = FILE_TYPE_MAP.get(it["ext"], "Other")
             emoji = EMOJI_MAP.get(file_type, "📄")
             size_mb = round(it["size"] / (1024 * 1024), 2)
+            
+            encoded_fpath = urllib.parse.quote(it["fpath"])
+            open_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/view?path={encoded_fpath}"
 
             payload = {
                 "parent": {"database_id": self.db_id},
@@ -492,6 +498,7 @@ class NotionGitSyncEngine:
                     "File Type": {"select": {"name": file_type}},
                     "File Extension": {"rich_text": [{"text": {"content": it["ext"]}}]},
                     "File Size": {"number": size_mb},
+                    "Open in Browser": {"url": open_url},
                     "Description": {"rich_text": [{"text": {"content": f"Path: {it['display_path']}"}}]},
                     "Favorite": {"checkbox": False}
                 }

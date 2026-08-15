@@ -1239,6 +1239,56 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
 
         # Clean parameter
         clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
+        is_android = clean_path_str.startswith("/") or clean_path_str.startswith("Internal Storage") or clean_path_str.startswith("SD Card")
+
+        if is_android:
+            phone_path = clean_path_str
+            if phone_path.startswith("Internal Storage"):
+                phone_path = phone_path.replace("Internal Storage", "/sdcard")
+            elif phone_path.startswith("SD Card"):
+                try:
+                    import subprocess
+                    stor_out = subprocess.check_output(["adb", "shell", "ls", "/storage"]).decode("utf-8")
+                    for s in stor_out.split():
+                        if s not in ("emulated", "self", "persist", "sdcard0"):
+                            phone_path = phone_path.replace("SD Card", f"/storage/{s}")
+                            break
+                except Exception:
+                    pass
+
+            fname = phone_path.split("/")[-1]
+            mime, _ = mimetypes.guess_type(fname)
+            mime = mime or "application/octet-stream"
+
+            try:
+                import subprocess
+                proc = subprocess.Popen(["adb", "exec-out", "cat", phone_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                content, err = proc.communicate()
+                if proc.returncode == 0 and content:
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(content)))
+                    if parsed.path == "/download":
+                        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                    else:
+                        self.send_header("Content-Disposition", "inline")
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+            except Exception as e:
+                print(f"[!] ADB stream error: {e}")
+
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            err_html = f"""<!DOCTYPE html><html><head><title>Device Not Connected</title>
+            <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
+            .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
+            a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
+            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your Android phone via USB with USB Debugging enabled to stream this file live.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
+            self.wfile.write(err_html.encode("utf-8"))
+            return
+
         target_path = Path(clean_path_str).resolve()
 
         if not target_path.exists():
