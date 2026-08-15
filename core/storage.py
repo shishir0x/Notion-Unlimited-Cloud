@@ -220,35 +220,46 @@ def _adb_available() -> bool:
 
 
 def _discover_android() -> List[StorageDevice]:
-    """Find Android phones via ADB and list their Internal Storage and SD Card."""
+    """Find Android phones via ADB and list their Internal Storage and SD Card.
+
+    Parses `adb devices -l` output which uses SPACES (not tabs) as separator:
+        3b518df7    device product:CPH2613IN model:CPH2613 device:OP5D3FL1 transport_id:1
+    """
     devices: List[StorageDevice] = []
     if not _adb_available():
         return devices
 
     try:
         out = subprocess.check_output(
-            ["adb", "devices", "-l"], timeout=8
+            ["adb", "devices", "-l"], timeout=10
         ).decode("utf-8", errors="ignore")
     except Exception:
         return devices
 
     for line in out.splitlines():
         line = line.strip()
-        if not line or line.startswith("List of") or "\t" not in line:
+        # Skip blank lines and the "List of devices attached" header
+        if not line or line.startswith("List of"):
             continue
+
+        # Split on whitespace — works whether separator is spaces or tabs
         parts = line.split()
-        if len(parts) < 2 or parts[1] != "device":
+        if len(parts) < 2:
             continue
 
         device_id = parts[0]
-        # Try to get device model
+        status = parts[1]   # "device", "offline", "unauthorized", "no permissions"
+        if status != "device":
+            continue        # skip non-ready devices
+
+        # Extract human-readable model from extended -l fields e.g. "model:CPH2613"
         model = "Android Device"
         for token in parts[2:]:
             if token.startswith("model:"):
                 model = token.replace("model:", "").replace("_", " ").strip()
                 break
 
-        # Internal storage (always present)
+        # Internal storage is always present on a connected, authorized device
         devices.append(StorageDevice(
             label=f"{model} — Internal Storage",
             device_type="android_internal",
@@ -259,7 +270,7 @@ def _discover_android() -> List[StorageDevice]:
             device_model=model,
         ))
 
-        # SD card (optional)
+        # SD card is optional — check if one is mounted
         sd_path = _find_sdcard_path(device_id)
         if sd_path:
             devices.append(StorageDevice(

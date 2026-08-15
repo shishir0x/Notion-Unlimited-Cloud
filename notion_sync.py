@@ -75,13 +75,23 @@ def start_web_server(port: int = None) -> bool:
     try:
         import notion_server
         from http.server import ThreadingHTTPServer
-        notion_server.load_disk_cache()
-        srv = ThreadingHTTPServer(("0.0.0.0", port), notion_server.NotionFileServerHandler)
+        # Load disk cache first (populates from Notion if needed)
+        if hasattr(notion_server, "load_disk_cache"):
+            notion_server.load_disk_cache()
+        # Use the correct handler class name from notion_server.py
+        handler_cls = getattr(
+            notion_server,
+            "NotionServerHandler",        # current name
+            getattr(notion_server, "NotionFileServerHandler", None),  # legacy fallback
+        )
+        if handler_cls is None:
+            raise AttributeError("Cannot find request handler class in notion_server.py")
+        srv = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         global _server_instance
         _server_instance = srv
-        time.sleep(0.3)
+        time.sleep(0.5)
         print(f"  🚀 Web Drive GUI started → http://127.0.0.1:{port}")
         return True
     except Exception as e:
