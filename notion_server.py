@@ -4,10 +4,11 @@ A modern, full-featured Web GUI mirroring Google Drive & OneDrive.
 Serves a responsive single-page web app at http://127.0.0.1:8765
 Features:
 - Full Google Drive UI (Grid/List views, breadcrumbs, search, multi-column sorting)
+- Live Real-Time File Structure Updates: New files and folders appear instantly in My Drive as they are uploaded
 - In-browser file preview (PDF, Images, Video, Audio, Code)
 - Live ADB streaming for connected Android phone (OnePlus Nord CE4) & SD card (0 PC disk bytes)
 - Exact Windows Explorer Paths: 'This PC\\OnePlus Nord CE4\\Internal shared storage' & 'This PC\\OnePlus Nord CE4\\SD card'
-- Real-time Sync Activity & Dynamic Sliding Window Live Queue Control Center (Left sidebar tab)
+- Real-time Sync Activity & Dynamic Sliding Window Live Queue Control Center
 """
 
 import os
@@ -61,8 +62,36 @@ CACHE_FILE = Path.home() / ".notion_drive_cache.json"
 DRIVE_CACHE = {
     "items": {},
     "children": {},
-    "root_items": []
+    "root_items": [],
+    "version": 1
 }
+CACHE_LOCK = threading.Lock()
+
+def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0):
+    """Instantly registers a file or folder in the in-memory cache and bumps version so browser GUI live updates."""
+    with CACHE_LOCK:
+        DRIVE_CACHE["items"][item_id] = {
+            "id": item_id,
+            "name": name,
+            "type": item_type,
+            "extension": ext,
+            "size_mb": size_mb,
+            "size_bytes": size_bytes,
+            "mtime": mtime or time.time(),
+            "ctime": mtime or time.time(),
+            "created_time": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "last_edited_time": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "parent_id": parent_id,
+            "local_path": local_path
+        }
+        if parent_id:
+            children_list = DRIVE_CACHE["children"].setdefault(parent_id, [])
+            if item_id not in children_list:
+                children_list.append(item_id)
+        else:
+            if item_id not in DRIVE_CACHE["root_items"]:
+                DRIVE_CACHE["root_items"].append(item_id)
+        DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
 
 # ==============================================================================
 # REAL-TIME SYNC STATE & SYNC MANAGER
@@ -80,9 +109,9 @@ SYNC_STATE = {
     "start_time": None,
     "speed_str": "-",
     "status_message": "Ready to sync",
-    "queue": [],      # Dynamic sliding window: active file + next upcoming queued files
-    "history": [],    # Full completed history: {"name": str, "path": str, "size_str": str, "time": str, "status": str}
-    "logs": []        # Live console logs
+    "queue": [],
+    "history": [],
+    "logs": []
 }
 
 CANCEL_SYNC_FLAG = False
@@ -151,6 +180,7 @@ class BackgroundSyncRunner:
             try:
                 res = requests.post(f"https://api.notion.com/v1/databases/{self.db_id}/query", headers=self.headers, json=payload, timeout=20).json()
                 for it in res.get("results", []):
+                    nid = it["id"].replace("-", "")
                     props = it.get("properties", {})
                     title_list = props.get("Name", {}).get("title", [])
                     name = title_list[0].get("plain_text", "") if title_list else ""
@@ -159,7 +189,8 @@ class BackgroundSyncRunner:
                     parent_id = parents[0] if parents else None
                     item_type = props.get("Type", {}).get("select", {}).get("name", "")
                     if item_type == "Folder":
-                        self.folder_cache[(clean_name, parent_id)] = it["id"].replace("-", "")
+                        self.folder_cache[(clean_name, parent_id)] = nid
+                        register_drive_cache_item(nid, clean_name, "Folder", "", 0, 0, parent_id, clean_name)
                 has_more = res.get("has_more", False)
                 start_cursor = res.get("next_cursor")
             except Exception:
@@ -167,7 +198,9 @@ class BackgroundSyncRunner:
 
     def ensure_root(self, name: str, emoji: str = "💽") -> str:
         if (name, None) in self.folder_cache:
-            return self.folder_cache[(name, None)]
+            nid = self.folder_cache[(name, None)]
+            register_drive_cache_item(nid, name, "Folder", "", 0, 0, None, name)
+            return nid
         payload = {
             "parent": {"database_id": self.db_id},
             "icon": {"type": "emoji", "emoji": emoji},
@@ -182,6 +215,7 @@ class BackgroundSyncRunner:
             if res.status_code == 200:
                 nid = res.json()["id"].replace("-", "")
                 self.folder_cache[(name, None)] = nid
+                register_drive_cache_item(nid, name, "Folder", "", 0, 0, None, name)
                 return nid
         except Exception:
             pass
@@ -220,6 +254,7 @@ class BackgroundSyncRunner:
             cache_k = (part, curr_id)
             if cache_k in self.folder_cache:
                 curr_id = self.folder_cache[cache_k]
+                register_drive_cache_item(curr_id, part, "Folder", "", 0, 0, curr_id, part)
             else:
                 payload = {
                     "parent": {"database_id": self.db_id},
@@ -234,6 +269,7 @@ class BackgroundSyncRunner:
                 if res.status_code == 200:
                     nid = res.json()["id"].replace("-", "")
                     self.folder_cache[cache_k] = nid
+                    register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
                     curr_id = nid
                 else:
                     if "Sub-item hierarchy" in res.text:
@@ -242,6 +278,7 @@ class BackgroundSyncRunner:
                         if res2.status_code == 200:
                             nid = res2.json()["id"].replace("-", "")
                             self.folder_cache[cache_k] = nid
+                            register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
                             curr_id = nid
                         else:
                             return curr_id
@@ -484,6 +521,19 @@ class BackgroundSyncRunner:
             try:
                 res = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=30)
                 status_ok = res.status_code == 200
+                if status_ok:
+                    new_file_id = res.json()["id"].replace("-", "")
+                    register_drive_cache_item(
+                        new_file_id,
+                        it["name"],
+                        "File",
+                        it["ext"],
+                        mb,
+                        int(it["size"]),
+                        parent_notion_id,
+                        it["display_path"] if it["is_android"] else it["fpath"],
+                        it.get("mtime", 0)
+                    )
             except Exception:
                 status_ok = False
 
@@ -527,31 +577,35 @@ def trigger_background_sync(target: str):
 # DISK CACHING & NOTION DATA ENGINE
 # ==============================================================================
 def enrich_cache_items():
-    for item_id, item in DRIVE_CACHE["items"].items():
-        lp = item.get("local_path", "")
-        if lp and Path(lp).exists():
-            try:
-                st = Path(lp).stat()
-                item["mtime"] = st.st_mtime
-                item["ctime"] = st.st_ctime
-                item["size_bytes"] = st.st_size
-                item["size_mb"] = round(st.st_size / (1024 * 1024), 2)
-            except Exception:
-                pass
+    with CACHE_LOCK:
+        for item_id, item in DRIVE_CACHE["items"].items():
+            lp = item.get("local_path", "")
+            if lp and Path(lp).exists():
+                try:
+                    st = Path(lp).stat()
+                    item["mtime"] = st.st_mtime
+                    item["ctime"] = st.st_ctime
+                    item["size_bytes"] = st.st_size
+                    item["size_mb"] = round(st.st_size / (1024 * 1024), 2)
+                except Exception:
+                    pass
 
 def save_disk_cache():
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(DRIVE_CACHE, f)
-    except Exception as e:
-        print(f"[!] Error saving disk cache: {e}")
+    with CACHE_LOCK:
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(DRIVE_CACHE, f)
+        except Exception as e:
+            print(f"[!] Error saving disk cache: {e}")
 
 def load_disk_cache():
     global DRIVE_CACHE
     if CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                DRIVE_CACHE = json.load(f)
+                data = json.load(f)
+                with CACHE_LOCK:
+                    DRIVE_CACHE.update(data)
             enrich_cache_items()
             print(f"[+] Loaded {len(DRIVE_CACHE['items'])} items from disk cache!")
             return True
@@ -654,9 +708,12 @@ def populate_cache_from_notion():
                     cached_items[it_id]["parent_id"] = c_disk_id
                     children_map.setdefault(c_disk_id, []).append(it_id)
 
-        DRIVE_CACHE["items"] = cached_items
-        DRIVE_CACHE["children"] = children_map
-        DRIVE_CACHE["root_items"] = root_items
+        with CACHE_LOCK:
+            DRIVE_CACHE["items"] = cached_items
+            DRIVE_CACHE["children"] = children_map
+            DRIVE_CACHE["root_items"] = root_items
+            DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+
         enrich_cache_items()
         save_disk_cache()
         print(f"[+] Notion cache refreshed: {len(cached_items)} items.")
@@ -1542,6 +1599,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         let sortDir = 1;
         let currentMainTab = 'drive';
         let currentSyncSubTab = 'queue';
+        let lastCacheVersion = -1;
 
         const fileIcons = {
             'pdf': 'fa-file-pdf', 'doc': 'fa-file-word', 'docx': 'fa-file-word',
@@ -1568,7 +1626,9 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             document.getElementById('viewMyDrive').style.display = tab === 'drive' ? 'flex' : 'none';
             document.getElementById('viewSyncCenter').style.display = tab === 'sync' ? 'flex' : 'none';
 
-            if (tab === 'sync') {
+            if (tab === 'drive') {
+                fetchDrive(currentFolderId);
+            } else if (tab === 'sync') {
                 pollSyncStatus();
             }
         }
@@ -1857,6 +1917,14 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 const res = await fetch('/api/sync/status');
                 const st = await res.json();
 
+                if (st.cache_version !== undefined && st.cache_version !== lastCacheVersion) {
+                    lastCacheVersion = st.cache_version;
+                    if (currentMainTab === 'drive') {
+                        fetchDrive(currentFolderId);
+                    }
+                    fetchStorageStats();
+                }
+
                 const badge = document.getElementById('syncNavBadge');
                 const icon = document.getElementById('syncNavIcon');
                 if (st.is_running) {
@@ -1953,7 +2021,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 
         fetchDrive();
         fetchStorageStats();
-        setInterval(fetchStorageStats, 30000);
+        setInterval(fetchStorageStats, 15000);
         setInterval(pollSyncStatus, 1000);
     </script>
 </body>
@@ -2003,6 +2071,8 @@ class NotionServerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/sync/status":
             with SYNC_LOCK:
                 st_copy = dict(SYNC_STATE)
+            with CACHE_LOCK:
+                st_copy["cache_version"] = DRIVE_CACHE.get("version", 0)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -2014,61 +2084,66 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             if folder_id:
                 folder_id = folder_id.replace("-", "")
 
-            if folder_id:
-                child_ids = DRIVE_CACHE["children"].get(folder_id, [])
-            else:
-                ROOT_DEVICE_NAMES = {
-                    "Local Disk (C:)", "Local Disk (D:)",
-                    "Internal shared storage", "SD card",
-                    "Internal Storage", "SD Card"
-                }
-                child_ids = [cid for cid in DRIVE_CACHE["items"] if DRIVE_CACHE["items"][cid].get("name") in ROOT_DEVICE_NAMES]
-                if not child_ids:
-                    child_ids = DRIVE_CACHE["root_items"]
-
-            folders = []
-            files = []
-            for cid in child_ids:
-                item = DRIVE_CACHE["items"].get(cid)
-                if not item:
-                    continue
-                if item.get("type") == "Folder":
-                    sub_count = len(DRIVE_CACHE["children"].get(cid, []))
-                    item_copy = dict(item)
-                    item_copy["item_count"] = sub_count
-                    folders.append(item_copy)
+            with CACHE_LOCK:
+                if folder_id:
+                    child_ids = list(DRIVE_CACHE["children"].get(folder_id, []))
                 else:
-                    files.append(dict(item))
+                    ROOT_DEVICE_NAMES = {
+                        "Local Disk (C:)", "Local Disk (D:)",
+                        "Internal shared storage", "SD card",
+                        "Internal Storage", "SD Card"
+                    }
+                    child_ids = [cid for cid, it in DRIVE_CACHE["items"].items() if it.get("name") in ROOT_DEVICE_NAMES and not it.get("parent_id")]
+                    if not child_ids:
+                        child_ids = list(DRIVE_CACHE["root_items"])
 
-            breadcrumbs = []
-            curr = folder_id
-            while curr:
-                c_item = DRIVE_CACHE["items"].get(curr)
-                if not c_item:
-                    break
-                breadcrumbs.insert(0, {"id": curr, "name": c_item["name"]})
-                curr = c_item.get("parent_id")
+                folders = []
+                files = []
+                for cid in child_ids:
+                    item = DRIVE_CACHE["items"].get(cid)
+                    if not item:
+                        continue
+                    if item.get("type") == "Folder":
+                        sub_count = len(DRIVE_CACHE["children"].get(cid, []))
+                        item_copy = dict(item)
+                        item_copy["item_count"] = sub_count
+                        folders.append(item_copy)
+                    else:
+                        files.append(dict(item))
+
+                breadcrumbs = []
+                curr = folder_id
+                while curr:
+                    c_item = DRIVE_CACHE["items"].get(curr)
+                    if not c_item:
+                        break
+                    breadcrumbs.insert(0, {"id": curr, "name": c_item["name"]})
+                    curr = c_item.get("parent_id")
+
+                resp_data = {
+                    "folders": sorted(folders, key=lambda x: x["name"].lower()),
+                    "files": sorted(files, key=lambda x: x["name"].lower()),
+                    "breadcrumbs": breadcrumbs,
+                    "version": DRIVE_CACHE.get("version", 0)
+                }
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({
-                "folders": sorted(folders, key=lambda x: x["name"].lower()),
-                "files": sorted(files, key=lambda x: x["name"].lower()),
-                "breadcrumbs": breadcrumbs
-            }).encode("utf-8"))
+            self.wfile.write(json.dumps(resp_data).encode("utf-8"))
             return
 
         if parsed.path == "/api/search":
             query = params.get("q", [""])[0].lower()
             matching_files = []
             matching_folders = []
-            for it in DRIVE_CACHE["items"].values():
-                if query in it["name"].lower():
-                    if it["type"] == "Folder":
-                        matching_folders.append(it)
-                    else:
-                        matching_files.append(it)
+            with CACHE_LOCK:
+                for it in DRIVE_CACHE["items"].values():
+                    if query in it["name"].lower():
+                        if it["type"] == "Folder":
+                            matching_folders.append(dict(it))
+                        else:
+                            matching_files.append(dict(it))
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2081,8 +2156,9 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/stats":
-            total_size_mb = sum(it.get("size_mb", 0) for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
-            total_files = sum(1 for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+            with CACHE_LOCK:
+                total_size_mb = sum(it.get("size_mb", 0) for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+                total_files = sum(1 for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
