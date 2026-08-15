@@ -1925,7 +1925,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     const iconClass = fileIcons[ext] || 'fa-file';
                     const isImg = ['jpg','jpeg','png','webp','gif','svg'].includes(ext);
                     const thumb = isImg 
-                        ? `<img src="/view?path=${encodeURIComponent(f.local_path)}" loading="lazy">` 
+                        ? `<img src="/view?path=${encodeURIComponent(f.local_path)}" loading="lazy" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='block');">` 
                         : `<i class="fa-solid ${iconClass}"></i>`;
 
                     fs.innerHTML += `
@@ -2207,6 +2207,28 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 # HTTP SERVER ROUTING
 # ==============================================================================
 
+
+# ── ADB Caching & Concurrency Control ──────────────────────────────────────────
+_SDCARD_ID_CACHE = {"id": "4A21-0000", "ts": 0}
+ADB_SEMAPHORE = threading.Semaphore(2)  # Max 2 concurrent ADB file transfers
+
+def get_cached_sdcard_id() -> str:
+    """Return cached SD card volume ID without spawning a subprocess every time."""
+    now = time.time()
+    if now - _SDCARD_ID_CACHE["ts"] < 60:
+        return _SDCARD_ID_CACHE["id"]
+    try:
+        out = subprocess.check_output(["adb", "shell", "ls", "/storage"], timeout=2).decode("utf-8", errors="ignore")
+        for s in out.split():
+            if s not in ("emulated", "self", "persist", "sdcard0"):
+                _SDCARD_ID_CACHE["id"] = s
+                _SDCARD_ID_CACHE["ts"] = now
+                return s
+    except Exception:
+        pass
+    return _SDCARD_ID_CACHE["id"]
+
+
 def resolve_android_path(p: str) -> str:
     """Canonicalize any Android path (display or ADB) into a valid ADB Linux path."""
     clean = p.replace("\\", "/").strip()
@@ -2224,15 +2246,7 @@ def resolve_android_path(p: str) -> str:
     # SD card display path
     if "sd card" in clean.lower() or "4a21-0000" in clean.lower():
         rel = re.sub(r"^.*?(?:sd card|4a21-0000)/?", "", clean, flags=re.IGNORECASE).lstrip("/")
-        sd_id = "4A21-0000"
-        try:
-            out = subprocess.check_output(["adb", "shell", "ls", "/storage"], timeout=3).decode("utf-8", errors="ignore")
-            for s in out.split():
-                if s not in ("emulated", "self", "persist", "sdcard0"):
-                    sd_id = s
-                    break
-        except Exception:
-            pass
+        sd_id = get_cached_sdcard_id()
         return f"/storage/{sd_id}/{rel}"
 
     # Internal storage display path
@@ -2463,9 +2477,23 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             mime, _ = mimetypes.guess_type(fname)
             mime = mime or "application/octet-stream"
 
+            acquired = ADB_SEMAPHORE.acquire(timeout=4.0)
+            if not acquired:
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"ADB busy, try again")
+                return
+
+            proc = None
             try:
-                proc = subprocess.Popen(["adb", "exec-out", "cat", phone_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                content, err = proc.communicate()
+                proc = subprocess.Popen(
+                    ["adb", "exec-out", "cat", phone_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                content, err = proc.communicate(timeout=6.0)
                 if proc.returncode == 0 and content and not content.startswith(b"cat: "):
                     self.send_response(200)
                     self.send_header("Content-Type", mime)
@@ -2477,8 +2505,17 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(content)
                     return
-            except Exception as e:
-                print(f"[!] ADB stream error: {e}")
+            except subprocess.TimeoutExpired:
+                if proc:
+                    try:
+                        proc.kill()
+                        proc.communicate(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                ADB_SEMAPHORE.release()
 
             self.send_response(404)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2575,7 +2612,8 @@ def start_server():
         print("[+] Initializing cache from Notion DB...")
         populate_cache_from_notion()
     
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), NotionServerHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), NotionServerHandler)
+    server.daemon_threads = True
     print(f"🚀 Google Drive Web GUI active on http://127.0.0.1:{PORT}")
     try:
         server.serve_forever()
