@@ -4,11 +4,15 @@ A modern, full-featured Web GUI mirroring Google Drive & OneDrive.
 Serves a responsive single-page web app at http://127.0.0.1:8765
 Features:
 - Full Google Drive UI (Grid/List views, breadcrumbs, search, multi-column sorting)
-- Live Real-Time File Structure Updates: New files and folders appear instantly in My Drive as they are uploaded
-- In-browser file preview (PDF, Images, Video, Audio, Code)
-- Live ADB streaming for connected Android phone (OnePlus Nord CE4) & SD card (0 PC disk bytes)
+- Git-Style Persistent State Tracking (.notion_sync_state.json):
+  * Reads tracked files and folders on every sync
+  * Detects NEW, MODIFIED, and UP-TO-DATE items
+  * Skips unchanged files instantaneously (0 API calls wasted)
+  * Updates modified files via Notion PATCH without creating duplicate rows
+  * Saves state after every single file so progress is 100% resilient and resumable
+- Live real-time file structure updates in browser
+- Live ADB streaming for OnePlus Nord CE4 & SD card (0 PC disk bytes)
 - Exact Windows Explorer Paths: 'This PC\\OnePlus Nord CE4\\Internal shared storage' & 'This PC\\OnePlus Nord CE4\\SD card'
-- Real-time Sync Activity & Dynamic Sliding Window Live Queue Control Center
 """
 
 import os
@@ -58,6 +62,7 @@ NOTION_VERSION = "2022-06-28"
 DEFAULT_API_KEY = os.getenv("NOTION_TOKEN", "")
 DEFAULT_DB_ID = os.getenv("NOTION_DATABASE_ID", "").replace("-", "")
 CACHE_FILE = Path.home() / ".notion_drive_cache.json"
+STATE_FILE = Path(__file__).parent / ".notion_sync_state.json"
 
 DRIVE_CACHE = {
     "items": {},
@@ -92,6 +97,41 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
             if item_id not in DRIVE_CACHE["root_items"]:
                 DRIVE_CACHE["root_items"].append(item_id)
         DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+
+# ==============================================================================
+# GIT-STYLE PERSISTENT STATE MANAGEMENT (.notion_sync_state.json)
+# ==============================================================================
+def load_sync_state() -> Dict[str, Any]:
+    state_paths = [
+        STATE_FILE,
+        Path.home() / ".notion_sync_state.json",
+        Path.cwd() / ".notion_sync_state.json"
+    ]
+    for sp in state_paths:
+        if sp.exists():
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data.setdefault("files", {})
+                        data.setdefault("android_files", {})
+                        data.setdefault("folders", {})
+                        return data
+            except Exception:
+                pass
+    return {"files": {}, "android_files": {}, "folders": {}}
+
+def save_sync_state(state: Dict[str, Any]):
+    state_paths = [
+        STATE_FILE,
+        Path.home() / ".notion_sync_state.json"
+    ]
+    for sp in state_paths:
+        try:
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass
 
 # ==============================================================================
 # REAL-TIME SYNC STATE & SYNC MANAGER
@@ -289,12 +329,16 @@ class BackgroundSyncRunner:
     def run_sync(self, target: str):
         global CANCEL_SYNC_FLAG
         CANCEL_SYNC_FLAG = False
-        add_sync_log(f"Starting sync operation for target: {target.upper()}...")
+        add_sync_log(f"⚡ Starting Git-style differential sync for target: {target.upper()}...")
+
+        state = load_sync_state()
+        pc_tracked = state.setdefault("files", {})
+        android_tracked = state.setdefault("android_files", {})
 
         with SYNC_LOCK:
             SYNC_STATE["is_running"] = True
             SYNC_STATE["current_target"] = target.upper()
-            SYNC_STATE["status_message"] = "Scanning directories & detecting changes..."
+            SYNC_STATE["status_message"] = "Scanning directories & calculating Git-style differential changes..."
             SYNC_STATE["start_time"] = time.time()
             SYNC_STATE["queue"] = []
             SYNC_STATE["synced_files"] = 0
@@ -302,7 +346,9 @@ class BackgroundSyncRunner:
 
         self.load_folders()
         files_to_sync = []
+        skipped_count = 0
 
+        # 1. Local PC scanning (C:)
         if target in ("c", "all"):
             add_sync_log("Scanning Local Disk (C:)...")
             user_dirs = [
@@ -322,18 +368,32 @@ class BackgroundSyncRunner:
                         fp = Path(root) / f
                         try:
                             st = fp.stat()
-                            files_to_sync.append({
-                                "fpath": str(fp),
-                                "display_path": str(fp),
-                                "name": f,
-                                "size": st.st_size,
-                                "mtime": st.st_mtime,
-                                "ext": ext,
-                                "is_android": False
-                            })
+                            fpath_str = str(fp)
+                            prev = pc_tracked.get(fpath_str)
+                            is_new = prev is None
+                            is_modified = False
+                            if prev:
+                                if abs(prev.get("mtime", 0) - st.st_mtime) > 1.0 or prev.get("size", 0) != st.st_size:
+                                    is_modified = True
+                            
+                            if is_new or is_modified:
+                                files_to_sync.append({
+                                    "fpath": fpath_str,
+                                    "display_path": fpath_str,
+                                    "name": f,
+                                    "size": st.st_size,
+                                    "mtime": st.st_mtime,
+                                    "ext": ext,
+                                    "is_android": False,
+                                    "status_tag": "NEW" if is_new else "MODIFIED",
+                                    "existing_notion_id": prev.get("notion_id") if prev else None
+                                })
+                            else:
+                                skipped_count += 1
                         except Exception:
                             pass
 
+        # 2. Local PC scanning (D:)
         if target in ("d", "all"):
             d_root = Path("D:/")
             if d_root.exists():
@@ -347,18 +407,32 @@ class BackgroundSyncRunner:
                         fp = Path(root) / f
                         try:
                             st = fp.stat()
-                            files_to_sync.append({
-                                "fpath": str(fp),
-                                "display_path": str(fp),
-                                "name": f,
-                                "size": st.st_size,
-                                "mtime": st.st_mtime,
-                                "ext": ext,
-                                "is_android": False
-                            })
+                            fpath_str = str(fp)
+                            prev = pc_tracked.get(fpath_str)
+                            is_new = prev is None
+                            is_modified = False
+                            if prev:
+                                if abs(prev.get("mtime", 0) - st.st_mtime) > 1.0 or prev.get("size", 0) != st.st_size:
+                                    is_modified = True
+                            
+                            if is_new or is_modified:
+                                files_to_sync.append({
+                                    "fpath": fpath_str,
+                                    "display_path": fpath_str,
+                                    "name": f,
+                                    "size": st.st_size,
+                                    "mtime": st.st_mtime,
+                                    "ext": ext,
+                                    "is_android": False,
+                                    "status_tag": "NEW" if is_new else "MODIFIED",
+                                    "existing_notion_id": prev.get("notion_id") if prev else None
+                                })
+                            else:
+                                skipped_count += 1
                         except Exception:
                             pass
 
+        # 3. Android phone scanning (OnePlus Nord CE4)
         if target in ("phone", "sdcard", "all"):
             add_sync_log("Scanning OnePlus Nord CE4 via ADB USB bridge...")
             try:
@@ -366,7 +440,7 @@ class BackgroundSyncRunner:
                 dev_lines = [l.strip() for l in dev_out.splitlines() if l.strip() and not l.startswith("List of")]
                 if dev_lines:
                     dev_id = dev_lines[0].split()[0]
-                    add_sync_log(f"Connected Android device found: {dev_id} (OnePlus Nord CE4)")
+                    add_sync_log(f"Connected Android device: {dev_id} (OnePlus Nord CE4)")
                     
                     phone_targets = []
                     if target in ("phone", "all"):
@@ -390,7 +464,7 @@ class BackgroundSyncRunner:
                             pass
 
                     for win_label, linux_base, container_name in phone_targets:
-                        add_sync_log(f"Scanning {container_name} ({linux_base}) excluding Android system app data...")
+                        add_sync_log(f"Scanning {container_name} ({linux_base}) excluding Android app data...")
                         cmd = f"find '{linux_base}/' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
                         try:
                             proc = subprocess.run(["adb", "-s", dev_id, "shell", cmd], capture_output=True, text=True, errors="ignore")
@@ -407,18 +481,32 @@ class BackgroundSyncRunner:
                                             continue
                                         if ext in IGNORED_FILE_EXTENSIONS:
                                             continue
+                                        
                                         rel_path = fpath.replace(linux_base, "").replace("/", "\\").lstrip("\\")
                                         disp_full = f"{win_label}\\{rel_path}"
-                                        files_to_sync.append({
-                                            "fpath": fpath,
-                                            "display_path": disp_full,
-                                            "name": fname,
-                                            "size": fsize,
-                                            "mtime": fmtime,
-                                            "ext": ext,
-                                            "is_android": True,
-                                            "container_name": container_name
-                                        })
+                                        
+                                        prev = android_tracked.get(fpath)
+                                        is_new = prev is None
+                                        is_modified = False
+                                        if prev:
+                                            if abs(prev.get("mtime", 0) - fmtime) > 1.0 or prev.get("size", 0) != fsize:
+                                                is_modified = True
+                                        
+                                        if is_new or is_modified:
+                                            files_to_sync.append({
+                                                "fpath": fpath,
+                                                "display_path": disp_full,
+                                                "name": fname,
+                                                "size": fsize,
+                                                "mtime": fmtime,
+                                                "ext": ext,
+                                                "is_android": True,
+                                                "container_name": container_name,
+                                                "status_tag": "NEW" if is_new else "MODIFIED",
+                                                "existing_notion_id": prev.get("notion_id") if prev else None
+                                            })
+                                        else:
+                                            skipped_count += 1
                         except Exception as e:
                             add_sync_log(f"ADB scan notice for {container_name}: {e}")
                 else:
@@ -427,7 +515,19 @@ class BackgroundSyncRunner:
                 add_sync_log(f"ADB error: {e}")
 
         total = len(files_to_sync)
-        add_sync_log(f"Found {total} files queued for sync.")
+        add_sync_log(f"🔍 Git Status: {total} files changed/new ({skipped_count} up-to-date, skipped)")
+
+        if total == 0:
+            add_sync_log(f"✨ 100% Up to Date! All {skipped_count} files verified against state index.")
+            with SYNC_LOCK:
+                SYNC_STATE["is_running"] = False
+                SYNC_STATE["total_files"] = skipped_count
+                SYNC_STATE["synced_files"] = skipped_count
+                SYNC_STATE["remaining_files"] = 0
+                SYNC_STATE["percent"] = 100
+                SYNC_STATE["status_message"] = f"100% Up to Date ({skipped_count} files verified)"
+                SYNC_STATE["queue"] = []
+            return
 
         def build_live_window(current_idx: int, active_item: dict, active_status: str) -> list:
             window = []
@@ -439,7 +539,8 @@ class BackgroundSyncRunner:
                     "name": active_item["name"],
                     "path": active_item["display_path"],
                     "size_str": sz_str,
-                    "status": active_status
+                    "status": active_status,
+                    "tag": active_item.get("status_tag", "NEW")
                 })
             next_items = files_to_sync[current_idx:current_idx + 15]
             for offset, n_it in enumerate(next_items, start=current_idx + 1):
@@ -450,7 +551,8 @@ class BackgroundSyncRunner:
                     "name": n_it["name"],
                     "path": n_it["display_path"],
                     "size_str": n_sz_str,
-                    "status": "queued"
+                    "status": "queued",
+                    "tag": n_it.get("status_tag", "NEW")
                 })
             return window
 
@@ -460,7 +562,7 @@ class BackgroundSyncRunner:
             SYNC_STATE["total_files"] = total
             SYNC_STATE["remaining_files"] = total
             SYNC_STATE["queue"] = initial_window
-            SYNC_STATE["status_message"] = f"Uploading {total} files to Notion Cloud..."
+            SYNC_STATE["status_message"] = f"Syncing {total} changes to Notion Cloud ({skipped_count} up-to-date)..."
 
         start_t = time.time()
         for idx, it in enumerate(files_to_sync, 1):
@@ -518,24 +620,55 @@ class BackgroundSyncRunner:
             if parent_notion_id:
                 payload["properties"]["Parent Folder"] = {"relation": [{"id": parent_notion_id}]}
 
-            try:
-                res = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=30)
-                status_ok = res.status_code == 200
-                if status_ok:
-                    new_file_id = res.json()["id"].replace("-", "")
-                    register_drive_cache_item(
-                        new_file_id,
-                        it["name"],
-                        "File",
-                        it["ext"],
-                        mb,
-                        int(it["size"]),
-                        parent_notion_id,
-                        it["display_path"] if it["is_android"] else it["fpath"],
-                        it.get("mtime", 0)
-                    )
-            except Exception:
-                status_ok = False
+            new_page_id = None
+            if it.get("existing_notion_id"):
+                # MODIFIED: update existing page in Notion
+                try:
+                    res = requests.patch(f"https://api.notion.com/v1/pages/{it['existing_notion_id']}", headers=self.headers, json={"properties": payload["properties"]}, timeout=30)
+                    status_ok = res.status_code == 200
+                    new_page_id = it["existing_notion_id"]
+                except Exception:
+                    status_ok = False
+            else:
+                # NEW: create new page in Notion
+                try:
+                    res = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=30)
+                    status_ok = res.status_code == 200
+                    if status_ok:
+                        new_page_id = res.json()["id"].replace("-", "")
+                except Exception:
+                    status_ok = False
+
+            if status_ok and new_page_id:
+                # 1. Update persistent Git-style state immediately
+                if it["is_android"]:
+                    android_tracked[it["fpath"]] = {
+                        "notion_id": new_page_id,
+                        "mtime": it["mtime"],
+                        "size": it["size"],
+                        "display_path": it["display_path"]
+                    }
+                else:
+                    pc_tracked[it["fpath"]] = {
+                        "notion_id": new_page_id,
+                        "mtime": it["mtime"],
+                        "size": it["size"],
+                        "display_path": it["display_path"]
+                    }
+                save_sync_state(state)
+
+                # 2. Update live in-memory browser cache
+                register_drive_cache_item(
+                    new_page_id,
+                    it["name"],
+                    "File",
+                    it["ext"],
+                    mb,
+                    int(it["size"]),
+                    parent_notion_id,
+                    it["display_path"] if it["is_android"] else it["fpath"],
+                    it.get("mtime", 0)
+                )
 
             with SYNC_LOCK:
                 SYNC_STATE["history"].insert(0, {
@@ -551,7 +684,7 @@ class BackgroundSyncRunner:
                 next_active = files_to_sync[idx] if idx < total else None
                 SYNC_STATE["queue"] = build_live_window(idx + 1, next_active, "uploading" if next_active else "synced")
 
-            add_sync_log(f"Synced ({idx}/{total}): {it['name']} ({sz_str}) -> {'OK (200)' if status_ok else 'Failed'}")
+            add_sync_log(f"Synced ({idx}/{total}) [{it.get('status_tag','NEW')}]: {it['name']} ({sz_str}) -> {'OK (200)' if status_ok else 'Failed'}")
 
         with SYNC_LOCK:
             SYNC_STATE["synced_files"] = total
@@ -559,11 +692,10 @@ class BackgroundSyncRunner:
             SYNC_STATE["percent"] = 100
             SYNC_STATE["is_running"] = False
             SYNC_STATE["current_file"] = "Completed"
-            SYNC_STATE["status_message"] = "All files successfully synchronized!"
+            SYNC_STATE["status_message"] = f"All {total} changes synchronized ({skipped_count} up-to-date)!"
             SYNC_STATE["queue"] = []
 
-        add_sync_log("✨ Sync operation completed successfully! Refreshing drive cache...")
-        populate_cache_from_notion()
+        add_sync_log("✨ Differential sync completed successfully! Saved persistent state.")
 
 def trigger_background_sync(target: str):
     if SYNC_STATE["is_running"]:
@@ -624,6 +756,10 @@ def populate_cache_from_notion():
     has_more = True
     start_cursor = None
 
+    state = load_sync_state()
+    pc_tracked = state.setdefault("files", {})
+    android_tracked = state.setdefault("android_files", {})
+
     try:
         while has_more:
             payload = {"page_size": 100}
@@ -663,15 +799,30 @@ def populate_cache_from_notion():
             ctime = 0
             size_bytes = int(size_mb * 1024 * 1024)
 
-            if local_p and Path(local_p).exists():
-                try:
-                    stat = Path(local_p).stat()
-                    mtime = stat.st_mtime
-                    ctime = stat.st_ctime
-                    size_bytes = stat.st_size
-                    size_mb = round(size_bytes / (1024 * 1024), 2)
-                except Exception:
-                    pass
+            if local_p:
+                if "This PC\\OnePlus Nord CE4" in local_p or local_p.startswith("/storage") or local_p.startswith("/sdcard"):
+                    # Mobile file in state
+                    android_tracked.setdefault(local_p, {
+                        "notion_id": it_id,
+                        "mtime": 0,
+                        "size": size_bytes,
+                        "display_path": local_p
+                    })
+                elif Path(local_p).exists():
+                    try:
+                        stat = Path(local_p).stat()
+                        mtime = stat.st_mtime
+                        ctime = stat.st_ctime
+                        size_bytes = stat.st_size
+                        size_mb = round(size_bytes / (1024 * 1024), 2)
+                        pc_tracked[local_p] = {
+                            "notion_id": it_id,
+                            "mtime": mtime,
+                            "size": size_bytes,
+                            "display_path": local_p
+                        }
+                    except Exception:
+                        pass
 
             cached_items[it_id] = {
                 "id": it_id,
@@ -692,6 +843,8 @@ def populate_cache_from_notion():
                 children_map.setdefault(parent_id, []).append(it_id)
             else:
                 root_items.append(it_id)
+
+        save_sync_state(state)
 
         c_disk_id = None
         for it_id, it in cached_items.items():
@@ -1319,6 +1472,17 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         .status-pill.synced { background: rgba(52,168,83,0.15); color: #81C995; }
         .status-pill.failed { background: rgba(234,67,53,0.15); color: #F28B82; }
 
+        .tag-pill {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-right: 6px;
+        }
+        .tag-pill.NEW { background: rgba(52,168,83,0.2); color: #81C995; }
+        .tag-pill.MODIFIED { background: rgba(251,188,4,0.2); color: #FDD663; }
+
         .console-logs {
             background: #111;
             border: 1px solid var(--border-color);
@@ -1464,8 +1628,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     <div class="sync-title-area">
                         <div class="sync-pulse-dot" id="syncPulseDot"></div>
                         <div>
-                            <h2 style="font-size: 18px; font-weight: 600;" id="syncMainStatus">Sync Activity & Live Queue</h2>
-                            <div style="font-size: 12px; color: var(--text-muted);" id="syncSubStatus">Direct In-Memory ADB & Local Git Sync</div>
+                            <h2 style="font-size: 18px; font-weight: 600;" id="syncMainStatus">Git-Style Differential Sync</h2>
+                            <div style="font-size: 12px; color: var(--text-muted);" id="syncSubStatus">Tracks .notion_sync_state.json • Skips unchanged files automatically</div>
                         </div>
                     </div>
 
@@ -1501,7 +1665,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         <div class="stat-value" id="statUploaded">0</div>
                     </div>
                     <div class="stat-box">
-                        <div class="stat-label">Remaining in Queue</div>
+                        <div class="stat-label">Remaining Changes</div>
                         <div class="stat-value" id="statRemaining">0</div>
                     </div>
                     <div class="stat-box">
@@ -1515,7 +1679,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     <i class="fa-solid fa-cloud-arrow-up fa-fade"></i>
                     <div class="active-file-details">
                         <div class="active-file-name" id="activeFileName">Waiting for sync to start...</div>
-                        <div class="active-file-path" id="activeFilePath">Queue is currently idle. Click a sync button above to begin.</div>
+                        <div class="active-file-path" id="activeFilePath">Persistent state loaded. Click a sync button above to calculate differential changes.</div>
                     </div>
                     <div id="activeFileSize" style="font-weight: 600; font-size: 13px; color: var(--accent-blue);">-</div>
                 </div>
@@ -1539,6 +1703,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 <table class="sync-table">
                     <thead>
                         <tr>
+                            <th>Change</th>
                             <th>File Name</th>
                             <th>Target Cloud Path</th>
                             <th>Size</th>
@@ -1546,7 +1711,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         </tr>
                     </thead>
                     <tbody id="syncQueueTableBody">
-                        <tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No files currently in queue.</td></tr>
+                        <tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No files currently in queue.</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -1940,9 +2105,9 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 }
 
                 document.getElementById('syncMainStatus').innerText = st.is_running ? `Syncing ${st.current_target}...` : st.status_message;
-                document.getElementById('syncSubStatus').innerText = st.is_running ? `Active file: ${st.current_file}` : 'Direct In-Memory ADB & Local Git Sync';
+                document.getElementById('syncSubStatus').innerText = st.is_running ? `Active: ${st.current_file}` : 'Tracks .notion_sync_state.json • Skips unchanged files automatically';
                 document.getElementById('syncProgressLabel').innerText = `Progress: ${st.percent}%`;
-                document.getElementById('syncStatsDetail').innerText = `${st.synced_files} / ${st.total_files} files (${st.remaining_files} remaining)`;
+                document.getElementById('syncStatsDetail').innerText = `${st.synced_files} / ${st.total_files} changes (${st.remaining_files} remaining)`;
                 document.getElementById('syncProgressBar').style.width = `${st.percent}%`;
 
                 document.getElementById('statTarget').innerText = st.current_target;
@@ -1958,8 +2123,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     document.getElementById('activeFilePath').innerText = st.current_path;
                     document.getElementById('activeFileSize').innerText = st.current_size_str;
                 } else if (!st.is_running && st.total_files > 0) {
-                    document.getElementById('activeFileName').innerText = "All queued files synced!";
-                    document.getElementById('activeFilePath').innerText = "Notion Cloud database is 100% up to date.";
+                    document.getElementById('activeFileName').innerText = "All changes synchronized!";
+                    document.getElementById('activeFilePath').innerText = "Notion Cloud database is 100% up to date with persistent state.";
                     document.getElementById('activeFileSize').innerText = "✅ Complete";
                 }
 
@@ -1968,8 +2133,10 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     qBody.innerHTML = '';
                     st.queue.forEach(q => {
                         const statusPill = `<span class="status-pill ${q.status}">${q.status}</span>`;
+                        const tagPill = `<span class="tag-pill ${q.tag || 'NEW'}">${q.tag || 'NEW'}</span>`;
                         qBody.innerHTML += `
                             <tr>
+                                <td>${tagPill}</td>
                                 <td style="font-weight:500;">${q.name}</td>
                                 <td style="color:var(--text-muted); font-size:12px;">${q.path}</td>
                                 <td>${q.size_str}</td>
@@ -1979,12 +2146,12 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     });
                 } else {
                     if (!st.is_running && st.synced_files > 0) {
-                        qBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #81C995; padding: 24px; font-weight: 500;">
+                        qBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: #81C995; padding: 24px; font-weight: 500;">
                             <i class="fa-solid fa-circle-check" style="font-size: 20px; display: block; margin-bottom: 6px;"></i>
                             All files have finished syncing! View completed items in the 'Completed History' tab.
                         </td></tr>`;
                     } else {
-                        qBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No files currently in queue.</td></tr>`;
+                        qBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No changes currently in queue. Click a sync button above to calculate differential changes.</td></tr>`;
                     }
                 }
 
