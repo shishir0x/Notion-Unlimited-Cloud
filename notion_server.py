@@ -64,10 +64,15 @@ def _load_env_credentials():
 
 _load_env_credentials()
 
-PORT = int(os.getenv("LOCAL_SERVER_PORT", "8765"))
-NOTION_VERSION = "2022-06-28"
-DEFAULT_API_KEY = os.getenv("NOTION_TOKEN", "")
-DEFAULT_DB_ID = os.getenv("NOTION_DATABASE_ID", "").replace("-", "")
+from core import config
+
+PORT = config.LOCAL_SERVER_PORT
+NOTION_VERSION = config.NOTION_VERSION
+DEFAULT_API_KEY = config.NOTION_TOKEN
+DEFAULT_DB_ID = config.NOTION_DATABASE_ID.replace("-", "")
+
+UPLOADS_DIR = Path.home() / "NotionDrive_Uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
 CACHE_FILE = Path.home() / ".notion_drive_cache.json"
 STATE_FILE = Path(__file__).parent / ".notion_sync_state.json"
 
@@ -774,10 +779,35 @@ def populate_cache_from_notion():
             payload = {"page_size": 100}
             if start_cursor:
                 payload["start_cursor"] = start_cursor
-            res = requests.post(f"https://api.notion.com/v1/databases/{DEFAULT_DB_ID}/query", headers=headers, json=payload, timeout=20).json()
-            items.extend(res.get("results", []))
-            has_more = res.get("has_more", False)
-            start_cursor = res.get("next_cursor")
+            
+            # Retry on 429 or transient error
+            res = None
+            for attempt in range(5):
+                try:
+                    res = requests.post(f"https://api.notion.com/v1/databases/{DEFAULT_DB_ID}/query", headers=headers, json=payload, timeout=20)
+                    if res.status_code == 429:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    elif res.status_code == 200:
+                        break
+                    else:
+                        time.sleep(1)
+                except Exception:
+                    time.sleep(1)
+
+            if not res or res.status_code != 200:
+                print(f"[!] Notion query returned status {res.status_code if res else 'None'}")
+                break
+
+            data = res.json()
+            batch = data.get("results", [])
+            items.extend(batch)
+            has_more = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+
+        if not items:
+            print("[!] Notion query returned 0 items; retaining existing cache.")
+            return
 
         cached_items = {}
         children_map = {}
@@ -1505,6 +1535,107 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             line-height: 1.6;
         }
         .log-entry { margin-bottom: 2px; }
+    
+        /* New Button & Dropdown */
+        .btn-new {
+            background-color: #37393B;
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 12px 20px;
+            font-size: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            cursor: pointer;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+            margin: 0 4px 16px;
+            transition: all 0.2s;
+            position: relative;
+        }
+        .btn-new:hover { background-color: #444746; box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
+        .btn-new i.plus { color: #A8C7FA; font-size: 18px; }
+
+        .dropdown-menu {
+            position: absolute;
+            top: 52px;
+            left: 0;
+            background: #28292A;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            width: 220px;
+            padding: 8px 0;
+            display: none;
+            flex-direction: column;
+            z-index: 1000;
+        }
+        .dropdown-menu.show { display: flex; }
+        .dropdown-item {
+            padding: 10px 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 13px;
+            color: var(--text-main);
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .dropdown-item:hover { background: #333537; color: var(--accent-blue); }
+        .dropdown-item i { width: 18px; text-align: center; font-size: 15px; }
+        .dropdown-divider { height: 1px; background: var(--border-color); margin: 6px 0; }
+
+        /* Full-screen Drag & Drop Overlay */
+        #dropOverlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(19, 19, 20, 0.88);
+            border: 3px dashed #A8C7FA;
+            border-radius: 16px;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            z-index: 9999;
+            pointer-events: none;
+            backdrop-filter: blur(4px);
+        }
+        #dropOverlay.active { display: flex; }
+        #dropOverlay i { font-size: 48px; color: #A8C7FA; animation: bounce 1s infinite alternate; }
+        #dropOverlay h2 { font-size: 22px; color: #E3E3E3; font-weight: 500; }
+        #dropOverlay p { font-size: 14px; color: var(--text-muted); }
+
+        @keyframes bounce {
+            from { transform: translateY(0); }
+            to { transform: translateY(-10px); }
+        }
+
+        /* Floating Upload Toast */
+        #uploadToast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #28292A;
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 16px 20px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+            width: 360px;
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 5000;
+        }
+        .upload-header { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; color: #E3E3E3; }
+        .upload-filename { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .upload-progress-bg { background: #3C4043; height: 6px; border-radius: 3px; overflow: hidden; }
+        .upload-progress-bar { background: #34A853; height: 100%; width: 0%; border-radius: 3px; transition: width 0.2s; }
+
     </style>
 </head>
 <body>
@@ -2195,6 +2326,174 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
 
+        
+        // ── Drag & Drop & Upload Handlers ────────────────────────────────────
+        function toggleNewMenu(e) {
+            e.stopPropagation();
+            const m = document.getElementById('newDropdownMenu');
+            m.classList.toggle('show');
+        }
+
+        function closeNewMenu() {
+            const m = document.getElementById('newDropdownMenu');
+            if (m) m.classList.remove('show');
+        }
+
+        document.addEventListener('click', closeNewMenu);
+
+        function triggerFileInput() {
+            closeNewMenu();
+            document.getElementById('nativeFileInput').click();
+        }
+
+        function triggerFolderInput() {
+            closeNewMenu();
+            document.getElementById('nativeFolderInput').click();
+        }
+
+        function handleFileSelect(e) {
+            const files = Array.from(e.target.files);
+            if (files.length) uploadFileList(files);
+            e.target.value = '';
+        }
+
+        function handleFolderSelect(e) {
+            const files = Array.from(e.target.files);
+            if (files.length) uploadFileList(files);
+            e.target.value = '';
+        }
+
+        // Drag and drop events on window
+        let dragCounter = 0;
+        window.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            dragCounter++;
+            document.getElementById('dropOverlay').classList.add('active');
+        });
+
+        window.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dragCounter--;
+            if (dragCounter <= 0) {
+                dragCounter = 0;
+                document.getElementById('dropOverlay').classList.remove('active');
+            }
+        });
+
+        window.addEventListener('dragover', (e) => {
+            e.preventDefault();
+        });
+
+        window.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            dragCounter = 0;
+            document.getElementById('dropOverlay').classList.remove('active');
+
+            const items = e.dataTransfer.items;
+            if (!items || !items.length) return;
+
+            const filesToUpload = [];
+            const queue = [];
+
+            for (let i = 0; i < items.length; i++) {
+                const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+                if (entry) {
+                    queue.push(traverseFileTree(entry, ''));
+                }
+            }
+
+            const results = await Promise.all(queue);
+            const flatFiles = results.flat();
+            if (flatFiles.length) {
+                uploadFileList(flatFiles);
+            }
+        });
+
+        function traverseFileTree(item, path) {
+            return new Promise((resolve) => {
+                path = path || '';
+                if (item.isFile) {
+                    item.file((file) => {
+                        file.relPath = path + file.name;
+                        resolve([file]);
+                    });
+                } else if (item.isDirectory) {
+                    const dirReader = item.createReader();
+                    dirReader.readEntries(async (entries) => {
+                        const subPromises = entries.map((entry) => traverseFileTree(entry, path + item.name + '/'));
+                        const subResults = await Promise.all(subPromises);
+                        resolve(subResults.flat());
+                    });
+                } else {
+                    resolve([]);
+                }
+            });
+        }
+
+        async function uploadFileList(files) {
+            const toast = document.getElementById('uploadToast');
+            const title = document.getElementById('uploadToastTitle');
+            const fileLbl = document.getElementById('uploadToastFile');
+            const percentLbl = document.getElementById('uploadToastPercent');
+            const bar = document.getElementById('uploadToastBar');
+
+            toast.style.display = 'flex';
+            const total = files.length;
+
+            for (let i = 0; i < total; i++) {
+                const file = files[i];
+                const relPath = file.relPath || file.webkitRelativePath || file.name;
+                const pct = Math.round(((i) / total) * 100);
+
+                title.innerText = `Uploading (${i + 1}/${total})...`;
+                percentLbl.innerText = `${pct}%`;
+                fileLbl.innerText = relPath;
+                bar.style.width = `${pct}%`;
+
+                try {
+                    const base64Data = await readFileAsBase64(file);
+                    const payload = {
+                        name: file.name,
+                        rel_path: relPath,
+                        data_b64: base64Data,
+                        parent_folder_id: currentFolderId
+                    };
+
+                    await fetch('/api/upload', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                } catch (err) {
+                    console.error("Upload error for " + file.name, err);
+                }
+            }
+
+            bar.style.width = '100%';
+            percentLbl.innerText = '100%';
+            title.innerText = 'Upload Complete!';
+            fileLbl.innerText = `Successfully uploaded ${total} file(s) to Notion Cloud.`;
+
+            setTimeout(() => {
+                toast.style.display = 'none';
+                fetchDrive(currentFolderId);
+                fetchStorageStats();
+            }, 2500);
+        }
+
+        function readFileAsBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const res = reader.result;
+                    const base64 = res.split(',')[1] || '';
+                    resolve(base64);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
         fetchDrive();
         fetchStorageStats();
         setInterval(fetchStorageStats, 15000);
@@ -2307,6 +2606,109 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"success": true, "message": "Cancelled"}')
             return
 
+        if parsed.path == "/api/sync/update":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                with SYNC_LOCK:
+                    for k, v in data.items():
+                        SYNC_STATE[k] = v
+                    if "is_syncing" in data:
+                        SYNC_STATE["is_running"] = bool(data["is_syncing"])
+                    if "current_index" in data:
+                        SYNC_STATE["synced_files"] = data["current_index"]
+                    if "log_message" in data and data["log_message"]:
+                        add_sync_log(data["log_message"])
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": true}')
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if parsed.path == "/api/upload":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                upload_req = json.loads(body.decode("utf-8"))
+                
+                # upload_req: {"name": str, "rel_path": str, "data_b64": str, "parent_folder_id": str}
+                import base64
+                file_name = upload_req.get("name", "untitled")
+                rel_path = upload_req.get("rel_path", file_name)
+                parent_id = upload_req.get("parent_folder_id")
+                data_bytes = base64.b64decode(upload_req.get("data_b64", ""))
+                
+                # Save locally in UPLOADS_DIR
+                local_file_path = UPLOADS_DIR / rel_path.replace("/", "\\")
+                local_file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(local_file_path, "wb") as f:
+                    f.write(data_bytes)
+                
+                file_size = len(data_bytes)
+                size_mb = round(file_size / (1024 * 1024), 4)
+                ext = Path(file_name).suffix.lower()
+                
+                # Create Notion page
+                api_client = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                target_parent_notion_id = parent_id
+                
+                # If rel_path contains subfolders, build them in Notion
+                parts = [p for p in rel_path.replace("\\", "/").split("/")[:-1] if p]
+                if parts:
+                    target_parent_notion_id = api_client.build_folder_path(parts, parent_id or api_client.ensure_root("Local Disk (C:)"))
+                elif not target_parent_notion_id:
+                    target_parent_notion_id = api_client.ensure_root("Local Disk (C:)")
+
+                file_type = FILE_TYPE_MAP.get(ext, "Other")
+                emoji = EMOJI_MAP.get(file_type, "📄")
+                encoded_p = urllib.parse.quote(str(local_file_path))
+                open_url = f"http://127.0.0.1:{PORT}/view?path={encoded_p}"
+
+                payload = {
+                    "parent": {"database_id": DEFAULT_DB_ID},
+                    "icon": {"type": "emoji", "emoji": emoji},
+                    "properties": {
+                        "Name": {"title": [{"text": {"content": file_name}}]},
+                        "Type": {"select": {"name": "File"}},
+                        "File Type": {"select": {"name": file_type}},
+                        "File Extension": {"rich_text": [{"text": {"content": ext}}]},
+                        "File Size": {"number": size_mb},
+                        "Open in Browser": {"url": open_url},
+                        "Description": {"rich_text": [{"text": {"content": f"Path: {local_file_path}"}}]},
+                        "Favorite": {"checkbox": False}
+                    }
+                }
+                if target_parent_notion_id:
+                    payload["properties"]["Parent Folder"] = {"relation": [{"id": target_parent_notion_id}]}
+
+                res = requests.post("https://api.notion.com/v1/pages", headers=api_client.headers, json=payload, timeout=30)
+                if res.status_code == 200:
+                    new_page_id = res.json()["id"].replace("-", "")
+                    register_drive_cache_item(
+                        new_page_id, file_name, "File", ext, size_mb, file_size,
+                        target_parent_notion_id, str(local_file_path), time.time()
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": new_page_id, "name": file_name}).encode("utf-8"))
+                    return
+
+                self.send_response(500)
+                self.end_headers()
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+        
         self.send_response(404)
         self.end_headers()
 

@@ -1,7 +1,11 @@
 @echo off
 setlocal EnableDelayedExpansion
+chcp 65001 >nul 2>&1
 cd /d "%~dp0"
 title Notion Unlimited Cloud
+
+set "LOCAL_SERVER_PORT=8765"
+set "PYTHONIOENCODING=utf-8"
 
 :: ── Check Python ──────────────────────────────────────────────────────────────
 python --version >nul 2>&1
@@ -37,14 +41,24 @@ if not exist "%~dp0.env" (
 )
 
 :: ── Start background Web Drive GUI server (if not already running) ─────────────
-netstat -ano | findstr :%LOCAL_SERVER_PORT% >nul 2>&1
+netstat -ano | findstr ":8765 " >nul 2>&1
 if %ERRORLEVEL% neq 0 (
+    echo  Starting Notion Web Drive server...
     start "" /B pythonw "%~dp0notion_server.py"
-    timeout /t 1 /nobreak >nul
+    timeout /t 2 /nobreak >nul
 )
 
-:: ── Launch the interactive sync dashboard ─────────────────────────────────────
-python "%~dp0notion_sync.py" %*
+:: ── Open Google Drive-style Web GUI in default browser ────────────────────────
+echo  Opening Notion Web Drive in your browser...
+start http://127.0.0.1:8765
+
+:: ── Launch interactive terminal CLI (if arguments passed or user wants CLI) ───
+if "%~1"=="" (
+    python "%~dp0notion_sync.py"
+) else (
+    python "%~dp0notion_sync.py" %*
+)
+
 if %ERRORLEVEL% neq 0 (
     echo.
     echo  An error occurred. Check the output above.

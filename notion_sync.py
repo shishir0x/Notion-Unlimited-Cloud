@@ -120,6 +120,27 @@ def _progress(current: int, total: int, fname: str, tag: str):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+    # Live notify local Web Drive server so browser GUI updates in real time
+    try:
+        payload = json.dumps({
+            "is_running": current < total,
+            "percent": int(pct * 100),
+            "synced_files": current,
+            "total_files": total,
+            "remaining_files": max(0, total - current),
+            "current_file": fname if current < total else "Completed",
+            "status_message": f"Syncing {current}/{total} changes via Terminal..." if current < total else f"All {total} files synchronized from Terminal!"
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/sync/update",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        urllib.request.urlopen(req, timeout=0.4)
+    except Exception:
+        pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYNC — local directory
