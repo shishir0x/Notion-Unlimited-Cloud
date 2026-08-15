@@ -5,7 +5,8 @@ Serves a responsive single-page web app at http://127.0.0.1:8765
 Features:
 - Full Google Drive UI (Grid/List views, breadcrumbs, search, multi-column sorting)
 - In-browser file preview (PDF, Images, Video, Audio, Code)
-- Live ADB streaming for connected Android phone files & SD card (0 PC disk bytes)
+- Live ADB streaming for connected Android phone (OnePlus Nord CE4) & SD card (0 PC disk bytes)
+- Exact Windows Explorer Paths: 'This PC\\OnePlus Nord CE4\\Internal shared storage' & 'This PC\\OnePlus Nord CE4\\SD card'
 - Real-time Sync Activity & Dynamic Sliding Window Live Queue Control Center (Left sidebar tab)
 """
 
@@ -187,8 +188,14 @@ class BackgroundSyncRunner:
         return None
 
     def ensure_folder_path(self, folder_str: str) -> str:
-        folder_str = folder_str.replace("\\", "/")
-        is_android = folder_str.startswith("/") or folder_str.startswith("Internal Storage") or folder_str.startswith("SD Card")
+        norm = folder_str.replace("/", "\\").strip()
+        is_android = ("This PC\\OnePlus Nord CE4" in norm or 
+                      "Internal shared storage" in norm or 
+                      "Internal Storage" in norm or 
+                      "SD card" in norm or 
+                      "SD Card" in norm or
+                      norm.startswith("/storage") or
+                      norm.startswith("/sdcard"))
 
         if not is_android:
             path_obj = Path(folder_str).resolve()
@@ -197,21 +204,19 @@ class BackgroundSyncRunner:
             container_id = self.ensure_root(root_name, "💽")
             rel_parts = [p for p in path_obj.parts[1:] if p]
         else:
-            if folder_str.startswith("/storage/4A21-0000") or folder_str.startswith("SD Card"):
-                root_name = "SD Card"
+            if "SD card" in norm or "SD Card" in norm or "/storage/4A21-0000" in norm:
+                root_name = "SD card"
                 container_id = self.ensure_root(root_name, "💾")
-                clean = folder_str.replace("/storage/4A21-0000", "").replace("SD Card", "")
-                rel_parts = [p for p in clean.split("/") if p]
+                clean = norm.replace("This PC\\OnePlus Nord CE4\\SD card", "").replace("SD card", "").replace("SD Card", "").replace("/storage/4A21-0000", "")
+                rel_parts = [p for p in clean.replace("/", "\\").split("\\") if p]
             else:
-                root_name = "Internal Storage"
+                root_name = "Internal shared storage"
                 container_id = self.ensure_root(root_name, "📱")
-                clean = folder_str.replace("/sdcard", "").replace("Internal Storage", "")
-                rel_parts = [p for p in clean.split("/") if p]
+                clean = norm.replace("This PC\\OnePlus Nord CE4\\Internal shared storage", "").replace("Internal shared storage", "").replace("Internal Storage", "").replace("/storage/emulated/0", "").replace("/sdcard", "")
+                rel_parts = [p for p in clean.replace("/", "\\").split("\\") if p]
 
         curr_id = container_id
-        built_parts = []
         for part in rel_parts:
-            built_parts.append(part)
             cache_k = (part, curr_id)
             if cache_k in self.folder_cache:
                 curr_id = self.folder_cache[cache_k]
@@ -318,57 +323,67 @@ class BackgroundSyncRunner:
                             pass
 
         if target in ("phone", "sdcard", "all"):
-            add_sync_log("Scanning Android phone via ADB...")
+            add_sync_log("Scanning OnePlus Nord CE4 via ADB USB bridge...")
             try:
                 dev_out = subprocess.check_output(["adb", "devices"]).decode("utf-8")
                 dev_lines = [l.strip() for l in dev_out.splitlines() if l.strip() and not l.startswith("List of")]
                 if dev_lines:
                     dev_id = dev_lines[0].split()[0]
-                    add_sync_log(f"Connected Android device found: {dev_id}")
+                    add_sync_log(f"Connected Android device found: {dev_id} (OnePlus Nord CE4)")
                     
                     phone_targets = []
                     if target in ("phone", "all"):
-                        phone_targets.append(("Internal Storage", "/sdcard"))
+                        phone_targets.append((
+                            "This PC\\OnePlus Nord CE4\\Internal shared storage",
+                            "/storage/emulated/0",
+                            "Internal shared storage"
+                        ))
                     if target in ("sdcard", "all"):
                         try:
                             stor_out = subprocess.check_output(["adb", "-s", dev_id, "shell", "ls", "/storage"]).decode("utf-8")
                             for s in stor_out.split():
                                 if s not in ("emulated", "self", "persist", "sdcard0"):
-                                    phone_targets.append(("SD Card", f"/storage/{s}"))
+                                    phone_targets.append((
+                                        "This PC\\OnePlus Nord CE4\\SD card",
+                                        f"/storage/{s}",
+                                        "SD card"
+                                    ))
                                     break
                         except Exception:
                             pass
 
-                    for label, base_p in phone_targets:
-                        add_sync_log(f"Scanning {label} ({base_p}) excluding Android system app data...")
-                        cmd = f"find '{base_p}' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+                    for win_label, linux_base, container_name in phone_targets:
+                        add_sync_log(f"Scanning {container_name} ({linux_base}) excluding Android system app data...")
+                        cmd = f"find '{linux_base}/' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
                         try:
-                            find_out = subprocess.check_output(["adb", "-s", dev_id, "shell", cmd]).decode("utf-8", errors="ignore")
-                            for line in find_out.splitlines():
+                            proc = subprocess.run(["adb", "-s", dev_id, "shell", cmd], capture_output=True, text=True, errors="ignore")
+                            for line in proc.stdout.splitlines():
                                 if "|" in line:
                                     parts = line.strip().split("|")
                                     if len(parts) == 3:
                                         fpath, fsize, fmtime = parts[0], int(parts[1]), float(parts[2])
                                         fname = fpath.split("/")[-1]
                                         ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
-                                        if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath:
+                                        if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath:
                                             continue
                                         if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
                                             continue
                                         if ext in IGNORED_FILE_EXTENSIONS:
                                             continue
-                                        rel_disp = fpath.replace(base_p, label)
+                                        rel_path = fpath.replace(linux_base, "").replace("/", "\\").lstrip("\\")
+                                        disp_full = f"{win_label}\\{rel_path}"
                                         files_to_sync.append({
                                             "fpath": fpath,
-                                            "display_path": rel_disp,
+                                            "display_path": disp_full,
                                             "name": fname,
                                             "size": fsize,
                                             "mtime": fmtime,
                                             "ext": ext,
-                                            "is_android": True
+                                            "is_android": True,
+                                            "container_name": container_name
                                         })
                         except Exception as e:
-                            add_sync_log(f"ADB scan notice for {label}: {e}")
+                            add_sync_log(f"ADB scan notice for {container_name}: {e}")
                 else:
                     add_sync_log("Notice: No Android phone detected over USB.")
             except Exception as e:
@@ -378,7 +393,6 @@ class BackgroundSyncRunner:
         add_sync_log(f"Found {total} files queued for sync.")
 
         def build_live_window(current_idx: int, active_item: dict, active_status: str) -> list:
-            """Builds a dynamic sliding window: active file at top + upcoming pending files."""
             window = []
             if active_item:
                 mb = round(active_item["size"] / (1024 * 1024), 2)
@@ -390,7 +404,6 @@ class BackgroundSyncRunner:
                     "size_str": sz_str,
                     "status": active_status
                 })
-            # Add up to 15 next queued files
             next_items = files_to_sync[current_idx:current_idx + 15]
             for offset, n_it in enumerate(next_items, start=current_idx + 1):
                 n_mb = round(n_it["size"] / (1024 * 1024), 2)
@@ -437,11 +450,10 @@ class BackgroundSyncRunner:
                 rate = round((idx / elapsed) * 60, 1)
                 SYNC_STATE["speed_str"] = f"{rate} files/min"
 
-                # Active item is set to "uploading" in live sliding queue
                 SYNC_STATE["queue"] = build_live_window(idx, it, "uploading")
 
             if it["is_android"]:
-                parent_folder_str = "/".join(it["display_path"].split("/")[:-1])
+                parent_folder_str = "\\".join(it["display_path"].split("\\")[:-1])
             else:
                 parent_folder_str = str(Path(it["fpath"]).parent)
 
@@ -475,7 +487,6 @@ class BackgroundSyncRunner:
             except Exception:
                 status_ok = False
 
-            # Add completed file to Completed History & slide the queue window
             with SYNC_LOCK:
                 SYNC_STATE["history"].insert(0, {
                     "name": it["name"],
@@ -487,7 +498,6 @@ class BackgroundSyncRunner:
                 if len(SYNC_STATE["history"]) > 200:
                     SYNC_STATE["history"].pop()
 
-                # Dynamic slide: completed file is removed, next pending files pulled in
                 next_active = files_to_sync[idx] if idx < total else None
                 SYNC_STATE["queue"] = build_live_window(idx + 1, next_active, "uploading" if next_active else "synced")
 
@@ -500,7 +510,7 @@ class BackgroundSyncRunner:
             SYNC_STATE["is_running"] = False
             SYNC_STATE["current_file"] = "Completed"
             SYNC_STATE["status_message"] = "All files successfully synchronized!"
-            SYNC_STATE["queue"] = []  # Clear live queue when finished
+            SYNC_STATE["queue"] = []
 
         add_sync_log("✨ Sync operation completed successfully! Refreshing drive cache...")
         populate_cache_from_notion()
@@ -1545,8 +1555,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 
         function getFolderIcon(name) {
             if (name.includes('Local Disk (C:)') || name.includes('Local Disk (D:)')) return 'fa-solid fa-hard-drive';
-            if (name.includes('Internal Storage')) return 'fa-solid fa-mobile-screen-button';
-            if (name.includes('SD Card')) return 'fa-solid fa-sd-card';
+            if (name.includes('Internal shared storage') || name.includes('Internal Storage')) return 'fa-solid fa-mobile-screen-button';
+            if (name.includes('SD card') || name.includes('SD Card')) return 'fa-solid fa-sd-card';
             return 'fa-solid fa-folder';
         }
 
@@ -1872,7 +1882,6 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 document.getElementById('statRemaining').innerText = st.remaining_files;
                 document.getElementById('statSpeed').innerText = st.speed_str;
 
-                // Sub-tab counter badges
                 document.getElementById('badgeQueueCount').innerText = st.remaining_files || (st.queue ? st.queue.length : 0);
                 document.getElementById('badgeHistoryCount').innerText = st.history ? st.history.length : 0;
 
@@ -2008,7 +2017,11 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             if folder_id:
                 child_ids = DRIVE_CACHE["children"].get(folder_id, [])
             else:
-                ROOT_DEVICE_NAMES = {"Local Disk (C:)", "Local Disk (D:)", "Internal Storage", "SD Card"}
+                ROOT_DEVICE_NAMES = {
+                    "Local Disk (C:)", "Local Disk (D:)",
+                    "Internal shared storage", "SD card",
+                    "Internal Storage", "SD Card"
+                }
                 child_ids = [cid for cid in DRIVE_CACHE["items"] if DRIVE_CACHE["items"][cid].get("name") in ROOT_DEVICE_NAMES]
                 if not child_ids:
                     child_ids = DRIVE_CACHE["root_items"]
@@ -2100,21 +2113,30 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             return
 
         clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
-        is_android = clean_path_str.startswith("/") or clean_path_str.startswith("Internal Storage") or clean_path_str.startswith("SD Card")
+        norm_str = clean_path_str.replace("/", "\\")
+        is_android = ("This PC\\OnePlus Nord CE4" in norm_str or 
+                      "Internal shared storage" in norm_str or 
+                      "Internal Storage" in norm_str or 
+                      "SD card" in norm_str or 
+                      "SD Card" in norm_str or
+                      clean_path_str.startswith("/storage") or
+                      clean_path_str.startswith("/sdcard"))
 
         if is_android:
             phone_path = clean_path_str
-            if phone_path.startswith("Internal Storage"):
-                phone_path = phone_path.replace("Internal Storage", "/sdcard")
-            elif phone_path.startswith("SD Card"):
+            if "SD card" in norm_str or "SD Card" in norm_str or "/storage/4A21-0000" in clean_path_str:
+                clean_rel = norm_str.replace("This PC\\OnePlus Nord CE4\\SD card", "").replace("SD card", "").replace("SD Card", "").replace("/storage/4A21-0000", "").replace("\\", "/").lstrip("/")
                 try:
                     stor_out = subprocess.check_output(["adb", "shell", "ls", "/storage"]).decode("utf-8")
                     for s in stor_out.split():
                         if s not in ("emulated", "self", "persist", "sdcard0"):
-                            phone_path = phone_path.replace("SD Card", f"/storage/{s}")
+                            phone_path = f"/storage/{s}/{clean_rel}"
                             break
                 except Exception:
-                    pass
+                    phone_path = f"/storage/4A21-0000/{clean_rel}"
+            else:
+                clean_rel = norm_str.replace("This PC\\OnePlus Nord CE4\\Internal shared storage", "").replace("Internal shared storage", "").replace("Internal Storage", "").replace("/storage/emulated/0", "").replace("/sdcard", "").replace("\\", "/").lstrip("/")
+                phone_path = f"/storage/emulated/0/{clean_rel}"
 
             fname = phone_path.split("/")[-1]
             mime, _ = mimetypes.guess_type(fname)
@@ -2144,7 +2166,7 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
             .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
             a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
-            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your Android phone via USB with USB Debugging enabled to stream this file live.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
+            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your OnePlus Nord CE4 via USB with USB Debugging enabled to stream this file live.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
             self.wfile.write(err_html.encode("utf-8"))
             return
 

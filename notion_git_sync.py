@@ -331,27 +331,33 @@ class NotionGitSyncEngine:
         return None
 
     def ensure_notion_folder_path(self, folder_path_str: Any) -> str:
-        """Creates hierarchy rooted in Local Disk (C:), Local Disk (D:), Internal Storage, or SD Card."""
-        folder_str = str(folder_path_str).replace("\\", "/")
-        is_android = folder_str.startswith("/") or folder_str.startswith("Internal Storage") or folder_str.startswith("SD Card")
+        """Creates hierarchy rooted in Local Disk (C:), Local Disk (D:), Internal shared storage, or SD card."""
+        folder_str = str(folder_path_str).replace("/", "\\").strip()
+        is_android = ("This PC\\OnePlus Nord CE4" in folder_str or 
+                      "Internal shared storage" in folder_str or 
+                      "Internal Storage" in folder_str or 
+                      "SD card" in folder_str or 
+                      "SD Card" in folder_str or
+                      folder_str.startswith("/storage") or
+                      folder_str.startswith("/sdcard"))
         
         if not is_android:
             path_obj = Path(folder_path_str).resolve()
             drive_letter = path_obj.drive.upper().rstrip(":")
             root_container_name = f"Local Disk ({drive_letter}:)" if drive_letter else "Local Disk (C:)"
             container_id = self.ensure_root_container(root_container_name, "💽")
-            rel_parts = [p for p in path_obj.parts[1:] if p] # Skip C:\
+            rel_parts = [p for p in path_obj.parts[1:] if p]
         else:
-            if folder_str.startswith("/storage/4A21-0000") or folder_str.startswith("/storage/sdcard1") or folder_str.startswith("SD Card"):
-                root_container_name = "SD Card"
+            if "SD card" in folder_str or "SD Card" in folder_str or "/storage/4A21-0000" in folder_str:
+                root_container_name = "SD card"
                 container_id = self.ensure_root_container(root_container_name, "💾")
-                clean = folder_str.replace("/storage/4A21-0000", "").replace("/storage/sdcard1", "").replace("SD Card", "")
-                rel_parts = [p for p in clean.split("/") if p]
+                clean = folder_str.replace("This PC\\OnePlus Nord CE4\\SD card", "").replace("SD card", "").replace("SD Card", "").replace("/storage/4A21-0000", "")
+                rel_parts = [p for p in clean.replace("/", "\\").split("\\") if p]
             else:
-                root_container_name = "Internal Storage"
+                root_container_name = "Internal shared storage"
                 container_id = self.ensure_root_container(root_container_name, "📱")
-                clean = folder_str.replace("/storage/emulated/0", "").replace("/sdcard", "").replace("Internal Storage", "")
-                rel_parts = [p for p in clean.split("/") if p]
+                clean = folder_str.replace("This PC\\OnePlus Nord CE4\\Internal shared storage", "").replace("Internal shared storage", "").replace("Internal Storage", "").replace("/storage/emulated/0", "").replace("/sdcard", "")
+                rel_parts = [p for p in clean.replace("/", "\\").split("\\") if p]
 
         current_parent_id = container_id
         for part in rel_parts:
@@ -412,17 +418,25 @@ class NotionGitSyncEngine:
             return
 
         device_id = lines[0].split()[0]
-        print(f"✅ Found Connected Android Device: {device_id}")
+        print(f"✅ Found Connected Android Device: {device_id} (OnePlus Nord CE4)")
 
         storage_targets = []
         if target in ("internal", "both"):
-            storage_targets.append(("Internal Storage", "/sdcard"))
+            storage_targets.append((
+                "This PC\\OnePlus Nord CE4\\Internal shared storage",
+                "/storage/emulated/0",
+                "Internal shared storage"
+            ))
         if target in ("sdcard", "both"):
             try:
                 stor_out = subprocess.check_output(["adb", "-s", device_id, "shell", "ls", "/storage"]).decode("utf-8")
                 for s in stor_out.split():
                     if s not in ("emulated", "self", "persist", "sdcard0"):
-                        storage_targets.append(("SD Card", f"/storage/{s}"))
+                        storage_targets.append((
+                            "This PC\\OnePlus Nord CE4\\SD card",
+                            f"/storage/{s}",
+                            "SD card"
+                        ))
                         break
             except Exception:
                 pass
@@ -431,14 +445,14 @@ class NotionGitSyncEngine:
         self.load_notion_folders()
 
         items_to_sync = []
-        for storage_label, base_path in storage_targets:
-            scan_path = f"{base_path}/{folder_filter}" if folder_filter else base_path
-            print(f"🔍 Scanning {storage_label} ({scan_path}) directly on phone (Excluding Android app data)...")
+        for win_label, linux_base, container_name in storage_targets:
+            scan_path = f"{linux_base}/{folder_filter}" if folder_filter else linux_base
+            print(f"🔍 Scanning {container_name} ({scan_path}) directly on phone (Excluding Android app data)...")
             
-            cmd = f"find '{scan_path}' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+            cmd = f"find '{scan_path}/' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
             try:
-                find_out = subprocess.check_output(["adb", "-s", device_id, "shell", cmd]).decode("utf-8", errors="ignore")
-                for line in find_out.splitlines():
+                proc = subprocess.run(["adb", "-s", device_id, "shell", cmd], capture_output=True, text=True, errors="ignore")
+                for line in proc.stdout.splitlines():
                     if "|" in line:
                         parts = line.strip().split("|")
                         if len(parts) == 3:
@@ -446,7 +460,6 @@ class NotionGitSyncEngine:
                             fname = fpath.split("/")[-1]
                             ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
                             
-                            # Exclude Android and system folders
                             if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath:
                                 continue
                             if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
@@ -454,20 +467,21 @@ class NotionGitSyncEngine:
                             if ext in IGNORED_FILE_EXTENSIONS:
                                 continue
 
-                            rel_display = fpath.replace(base_path, storage_label)
+                            rel_path = fpath.replace(linux_base, "").replace("/", "\\").lstrip("\\")
+                            disp_full = f"{win_label}\\{rel_path}"
                             prev = android_tracked.get(fpath)
                             if not prev or abs(prev.get("mtime", 0) - fmtime) > 1.0 or prev.get("size", 0) != fsize:
                                 items_to_sync.append({
                                     "fpath": fpath,
-                                    "display_path": rel_display,
+                                    "display_path": disp_full,
                                     "name": fname,
                                     "size": fsize,
                                     "mtime": fmtime,
                                     "ext": ext,
-                                    "storage_label": storage_label
+                                    "storage_label": container_name
                                 })
             except Exception as e:
-                print(f"   [!] Error scanning {storage_label}: {e}")
+                print(f"   [!] Error scanning {container_name}: {e}")
 
         total = len(items_to_sync)
         if total == 0:
@@ -479,7 +493,7 @@ class NotionGitSyncEngine:
         for idx, it in enumerate(items_to_sync, 1):
             render_progress_bar(idx - 1, total, prefix="Syncing Phone", current_file=it["name"])
 
-            parent_folder_str = "/".join(it["display_path"].split("/")[:-1])
+            parent_folder_str = "\\".join(it["display_path"].split("\\")[:-1])
             parent_notion_id = self.ensure_notion_folder_path(parent_folder_str)
 
             file_type = FILE_TYPE_MAP.get(it["ext"], "Other")
