@@ -82,7 +82,7 @@ DRIVE_CACHE = {
     "root_items": [],
     "version": 1
 }
-CACHE_LOCK = threading.Lock()
+CACHE_LOCK = threading.RLock()
 
 def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0):
     """Instantly registers a file or folder in the in-memory cache and bumps version so browser GUI live updates."""
@@ -167,7 +167,7 @@ SYNC_STATE = {
 }
 
 CANCEL_SYNC_FLAG = False
-SYNC_LOCK = threading.Lock()
+SYNC_LOCK = threading.RLock()
 
 def add_sync_log(msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -2568,20 +2568,24 @@ class NotionServerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/sync/start":
             target = params.get("target", ["all"])[0].lower()
             ok, msg = trigger_background_sync(target)
+            resp_bytes = json.dumps({"success": ok, "message": msg}).encode("utf-8")
             self.send_response(200 if ok else 400)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp_bytes)))
             self.end_headers()
-            self.wfile.write(json.dumps({"success": ok, "message": msg}).encode("utf-8"))
+            self.wfile.write(resp_bytes)
             return
 
         if parsed.path == "/api/sync/cancel":
             global CANCEL_SYNC_FLAG
             CANCEL_SYNC_FLAG = True
             add_sync_log("Sync cancellation requested by user.")
+            resp_bytes = b'{"success": true, "message": "Cancelled"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp_bytes)))
             self.end_headers()
-            self.wfile.write(b'{"success": true, "message": "Cancelled"}')
+            self.wfile.write(resp_bytes)
             return
 
         if parsed.path == "/api/sync/update":
@@ -2591,17 +2595,24 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 data = json.loads(body.decode("utf-8"))
                 with SYNC_LOCK:
                     for k, v in data.items():
-                        SYNC_STATE[k] = v
+                        if k in SYNC_STATE and k not in ("history", "logs"):
+                            SYNC_STATE[k] = v
                     if "is_syncing" in data:
                         SYNC_STATE["is_running"] = bool(data["is_syncing"])
                     if "current_index" in data:
                         SYNC_STATE["synced_files"] = data["current_index"]
                     if "log_message" in data and data["log_message"]:
                         add_sync_log(data["log_message"])
+                    if "history_item" in data and data["history_item"]:
+                        SYNC_STATE["history"].insert(0, data["history_item"])
+                        if len(SYNC_STATE["history"]) > 100:
+                            SYNC_STATE["history"].pop()
+                resp_bytes = b'{"success": true}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp_bytes)))
                 self.end_headers()
-                self.wfile.write(b'{"success": true}')
+                self.wfile.write(resp_bytes)
                 return
             except Exception as e:
                 self.send_response(500)

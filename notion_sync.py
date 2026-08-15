@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -103,13 +104,42 @@ def start_web_server(port: int = None) -> bool:
 # Progress bar (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _progress(current: int, total: int, fname: str, tag: str):
+# ─────────────────────────────────────────────────────────────────────────────
+# Progress bar (CLI & Web Live Bridge)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYNC_START_TIME = None
+_BYTES_TRANSFERRED = 0
+
+def notify_server(payload: dict):
+    """Notify the local Web Drive server so browser GUI updates in real time."""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/sync/update",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as res:
+            pass
+    except Exception as e:
+        # Fallback print if server error occurs
+        pass
+
+
+def _progress(current: int, total: int, item: Any, tag: str):
+    global _SYNC_START_TIME, _BYTES_TRANSFERRED
+    if _SYNC_START_TIME is None:
+        _SYNC_START_TIME = time.time()
+        _BYTES_TRANSFERRED = 0
+
     if total == 0:
         return
     bar_len = 28
     pct = current / total if total else 0
     filled = int(bar_len * pct)
     bar = "█" * filled + "░" * (bar_len - filled)
+    fname = item.name if (item and hasattr(item, "name")) else (str(item) if item else "")
     short = (fname[:22] + "…") if len(fname) > 23 else fname
     tag_str = f"[{tag}]" if tag and tag != "DONE" else ""
     sys.stdout.write(
@@ -120,26 +150,37 @@ def _progress(current: int, total: int, fname: str, tag: str):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    # Live notify local Web Drive server so browser GUI updates in real time
-    try:
-        payload = json.dumps({
-            "is_running": current < total,
-            "percent": int(pct * 100),
-            "synced_files": current,
-            "total_files": total,
-            "remaining_files": max(0, total - current),
-            "current_file": fname if current < total else "Completed",
-            "status_message": f"Syncing {current}/{total} changes via Terminal..." if current < total else f"All {total} files synchronized from Terminal!"
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/sync/update",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        urllib.request.urlopen(req, timeout=0.4)
-    except Exception:
-        pass
+    elapsed = max(0.1, time.time() - _SYNC_START_TIME)
+    if item and hasattr(item, "size"):
+        _BYTES_TRANSFERRED += item.size
+
+    speed_files_per_min = round((current / elapsed) * 60, 1) if current > 0 else 0
+    speed_mb_s = round((_BYTES_TRANSFERRED / elapsed) / 1e6, 2)
+    speed_str = f"{speed_files_per_min} files/min ({speed_mb_s} MB/s)"
+
+    size_str = f"{item.size / 1e6:.2f} MB" if (item and hasattr(item, "size")) else "-"
+    disp_path = item.display_path if (item and hasattr(item, "display_path")) else (item.path if (item and hasattr(item, "path")) else "")
+
+    notify_server({
+        "is_running": current < total,
+        "percent": int(pct * 100),
+        "synced_files": current,
+        "total_files": total,
+        "remaining_files": max(0, total - current),
+        "current_file": fname if current < total else "Completed",
+        "current_path": disp_path,
+        "current_size_str": size_str,
+        "speed_str": speed_str,
+        "status_message": f"Syncing {current+1}/{total} changes via Terminal..." if current < total else f"All {total} files synchronized from Terminal!",
+        "log_message": f"Synced: {fname} [{tag}]" if fname and current < total else None,
+        "history_item": {
+            "name": fname,
+            "path": disp_path,
+            "size_str": size_str,
+            "time": time.strftime("%H:%M:%S"),
+            "status": "success"
+        } if (fname and current > 0) else None
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,6 +192,16 @@ def sync_local(path: str, force: bool = False):
     _ensure_credentials()
     api = NotionAPI(cfg.NOTION_TOKEN, cfg.NOTION_DATABASE_ID)
     state = S.load_state()
+
+    notify_server({
+        "is_running": True,
+        "current_target": f"Local: {path}",
+        "status_message": f"Scanning {path}...",
+        "percent": 0,
+        "synced_files": 0,
+        "total_files": 0,
+        "current_file": "Scanning filesystem..."
+    })
 
     print(f"\n  🔍 Scanning: {path}")
     print(f"  🔗 Preloading Notion folder cache…")
@@ -171,6 +222,25 @@ def sync_local(path: str, force: bool = False):
     new_c = sum(1 for i in to_sync if i.status_tag == "NEW")
     mod_c = sum(1 for i in to_sync if i.status_tag == "MODIFIED")
 
+    queue_items = [{
+        "name": it.name,
+        "path": it.display_path or it.path,
+        "size_str": f"{it.size / 1e6:.2f} MB",
+        "tag": it.status_tag,
+        "status": "pending"
+    } for it in to_sync[:80]]
+
+    notify_server({
+        "is_running": len(to_sync) > 0,
+        "current_target": f"Local: {path}",
+        "total_files": len(to_sync),
+        "remaining_files": len(to_sync),
+        "synced_files": 0,
+        "percent": 0,
+        "queue": queue_items,
+        "status_message": f"Found {len(to_sync)} changes to sync" if to_sync else "Everything up to date!"
+    })
+
     print()
     print(f"  ✅ {skipped:,} files up-to-date (skipped)")
     print(f"  🟢 {new_c:,} new files to upload")
@@ -179,7 +249,16 @@ def sync_local(path: str, force: bool = False):
 
     if not to_sync:
         print("  ✨ Everything is already in sync! Nothing to upload.")
+        notify_server({
+            "is_running": False,
+            "percent": 100,
+            "status_message": "Everything is already in sync!",
+            "log_message": f"Scan completed for {path}: 0 changes needed."
+        })
         return
+
+    global _SYNC_START_TIME
+    _SYNC_START_TIME = time.time()
 
     print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
     result = ENGINE.run_sync(
@@ -187,6 +266,16 @@ def sync_local(path: str, force: bool = False):
         on_progress=_progress,
         server_port=cfg.LOCAL_SERVER_PORT,
     )
+
+    notify_server({
+        "is_running": False,
+        "percent": 100,
+        "synced_files": len(to_sync),
+        "remaining_files": 0,
+        "current_file": "Sync Complete",
+        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
+        "log_message": f"Sync completed for {path}: {result.uploaded} uploaded, {result.updated} updated."
+    })
 
     print(f"\n  ✅ Sync complete!")
     print(f"     Uploaded : {result.uploaded:,}")
@@ -214,6 +303,16 @@ def sync_android(device: StorageDevice):
     api = NotionAPI(cfg.NOTION_TOKEN, cfg.NOTION_DATABASE_ID)
     state = S.load_state()
 
+    notify_server({
+        "is_running": True,
+        "current_target": device.label,
+        "status_message": f"Scanning {device.label} via ADB…",
+        "percent": 0,
+        "synced_files": 0,
+        "total_files": 0,
+        "current_file": "Scanning device via ADB..."
+    })
+
     print(f"\n  📱 Scanning {device.label} via ADB…")
     print(f"  🔗 Preloading Notion folder cache…")
     api.preload_folders()
@@ -228,6 +327,25 @@ def sync_android(device: StorageDevice):
     new_c = sum(1 for i in to_sync if i.status_tag == "NEW")
     mod_c = sum(1 for i in to_sync if i.status_tag == "MODIFIED")
 
+    queue_items = [{
+        "name": it.name,
+        "path": it.display_path or it.path,
+        "size_str": f"{it.size / 1e6:.2f} MB",
+        "tag": it.status_tag,
+        "status": "pending"
+    } for it in to_sync[:80]]
+
+    notify_server({
+        "is_running": len(to_sync) > 0,
+        "current_target": device.label,
+        "total_files": len(to_sync),
+        "remaining_files": len(to_sync),
+        "synced_files": 0,
+        "percent": 0,
+        "queue": queue_items,
+        "status_message": f"Found {len(to_sync)} changes to sync" if to_sync else "Everything up to date!"
+    })
+
     print()
     print(f"  ✅ {skipped:,} files up-to-date (skipped)")
     print(f"  🟢 {new_c:,} new files to upload")
@@ -236,7 +354,16 @@ def sync_android(device: StorageDevice):
 
     if not to_sync:
         print("  ✨ Everything is already in sync! Nothing to upload.")
+        notify_server({
+            "is_running": False,
+            "percent": 100,
+            "status_message": "Everything is already in sync!",
+            "log_message": f"Scan completed for {device.label}: 0 changes needed."
+        })
         return
+
+    global _SYNC_START_TIME
+    _SYNC_START_TIME = time.time()
 
     print(f"  ⚡ Uploading {len(to_sync):,} files…\n")
     result = ENGINE.run_sync(
@@ -247,6 +374,16 @@ def sync_android(device: StorageDevice):
         container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
         container_emoji=container_emoji,
     )
+
+    notify_server({
+        "is_running": False,
+        "percent": 100,
+        "synced_files": len(to_sync),
+        "remaining_files": 0,
+        "current_file": "Sync Complete",
+        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated.",
+        "log_message": f"Sync completed for {device.label}: {result.uploaded} uploaded, {result.updated} updated."
+    })
 
     print(f"\n  ✅ Android sync complete!")
     print(f"     Uploaded : {result.uploaded:,}")

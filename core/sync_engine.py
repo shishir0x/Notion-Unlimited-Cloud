@@ -22,9 +22,8 @@ from core import filters as F
 from core.notion_api import NotionAPI
 from core import state as S
 
-# ─── Progress callback type ───────────────────────────────────────────────────
-# (current: int, total: int, file_name: str, status_tag: str) → None
-ProgressCallback = Callable[[int, int, str, str], None]
+# (current: int, total: int, file_item: Optional[FileItem], status_tag: str) → None
+ProgressCallback = Callable[[int, int, Any, str], None]
 
 
 @dataclass
@@ -363,7 +362,7 @@ def run_sync(
             break
 
         if on_progress:
-            on_progress(idx, total, item.name, item.status_tag)
+            on_progress(idx, total, item, item.status_tag)
 
         # Resolve parent folder in Notion
         parent_id = ensure_notion_path(
@@ -388,6 +387,6 @@ def run_sync(
         S.save_state(state)
 
     if on_progress:
-        on_progress(total, total, "", "DONE")
+        on_progress(total, total, None, "DONE")
 
     return result
