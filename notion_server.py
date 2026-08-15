@@ -503,7 +503,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             <div class="modal-header">
                 <span style="font-weight: 600;" id="modalTitle">File Preview</span>
                 <div style="display: flex; gap: 10px;">
-                    <a id="modalDownloadBtn" class="action-btn" title="Download"><i class="fa-solid fa-download"></i></a>
+                    <a id="modalOpenTabBtn" class="action-btn" title="Open in New Tab" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                    <a id="modalDownloadBtn" class="action-btn" title="Download File"><i class="fa-solid fa-download"></i></a>
                     <button class="action-btn" onclick="closeModal()"><i class="fa-solid fa-xmark"></i></button>
                 </div>
             </div>
@@ -621,20 +622,26 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             const body = document.getElementById('modalBody');
             const title = document.getElementById('modalTitle');
             const dlBtn = document.getElementById('modalDownloadBtn');
+            const tabBtn = document.getElementById('modalOpenTabBtn');
 
             title.innerText = f.name;
             dlBtn.href = `/download?path=${encodeURIComponent(f.local_path)}`;
+            tabBtn.href = `/view?path=${encodeURIComponent(f.local_path)}`;
             body.innerHTML = '';
 
             const ext = (f.extension || '').toLowerCase();
             const viewUrl = `/view?path=${encodeURIComponent(f.local_path)}`;
 
             if (ext === '.pdf') {
-                body.innerHTML = `<iframe src="${viewUrl}"></iframe>`;
-            } else if (['.png', '.jpg', '.jpeg', '.webp', '.svg'].includes(ext)) {
-                body.innerHTML = `<img src="${viewUrl}" alt="${f.name}">`;
+                body.innerHTML = `<iframe src="${viewUrl}" style="width:100%; height:75vh; border:none; border-radius:8px;"></iframe>`;
+            } else if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.ico'].includes(ext)) {
+                body.innerHTML = `<img src="${viewUrl}" alt="${f.name}" style="max-width:100%; max-height:75vh; object-fit:contain; border-radius:8px;">`;
+            } else if (['.mp4', '.webm', '.mkv'].includes(ext)) {
+                body.innerHTML = `<video controls autoplay src="${viewUrl}" style="max-width:100%; max-height:75vh; border-radius:8px;"></video>`;
+            } else if (['.mp3', '.wav', '.ogg', '.m4a'].includes(ext)) {
+                body.innerHTML = `<div style="padding:40px 20px; text-align:center; width:100%;"><audio controls autoplay src="${viewUrl}" style="width:80%; max-width:500px;"></audio></div>`;
             } else {
-                body.innerHTML = `<iframe src="${viewUrl}"></iframe>`;
+                body.innerHTML = `<iframe src="${viewUrl}" style="width:100%; height:75vh; border:none; border-radius:8px; background:#1e1e1e;"></iframe>`;
             }
 
             modal.style.display = 'flex';
@@ -855,32 +862,41 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
                 return
 
         if parsed.path in ["/view", "/open"]:
-            if target_path.suffix.lower() == ".pdf":
-                try:
-                    with open(target_path, "rb") as f:
-                        content = f.read()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/pdf")
-                    self.send_header("Content-Length", str(len(content)))
-                    self.send_header("Content-Disposition", f"inline; filename=\"{target_path.name}\"")
-                    self.end_headers()
-                    self.wfile.write(content)
-                    return
-                except Exception:
-                    pass
+            ext = target_path.suffix.lower()
 
-            mime_type, _ = mimetypes.guess_type(str(target_path))
+            if ext == ".pdf":
+                mime_type = "application/pdf"
+            elif ext == ".svg":
+                mime_type = "image/svg+xml"
+            elif ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp"]:
+                mime_type = f"image/{'jpeg' if ext in ['.jpg', '.jpeg'] else ext.lstrip('.')}"
+            elif ext in [".mp4", ".webm", ".mkv"]:
+                mime_type = f"video/{'mp4' if ext == '.mp4' else 'webm'}"
+            elif ext in [".mp3", ".wav", ".ogg", ".m4a"]:
+                mime_type = f"audio/{'mpeg' if ext == '.mp3' else ext.lstrip('.')}"
+            elif ext in [".html", ".htm"]:
+                mime_type = "text/html; charset=utf-8"
+            elif ext in [".txt", ".md", ".json", ".py", ".js", ".ts", ".css", ".yaml", ".yml", ".sql", ".sh", ".ps1", ".bat", ".c", ".cpp", ".java", ".log", ".csv"]:
+                mime_type = "text/plain; charset=utf-8"
+            else:
+                guessed, _ = mimetypes.guess_type(str(target_path))
+                mime_type = guessed or "application/octet-stream"
+
             try:
                 with open(target_path, "rb") as f:
                     content = f.read()
                 self.send_response(200)
-                self.send_header("Content-Type", mime_type or "text/plain; charset=utf-8")
+                self.send_header("Content-Type", mime_type)
                 self.send_header("Content-Length", str(len(content)))
-                self.send_header("Content-Disposition", f"inline; filename=\"{target_path.name}\"")
+                self.send_header("Content-Disposition", "inline")
                 self.end_headers()
                 self.wfile.write(content)
-            except Exception:
-                pass
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(e).encode("utf-8"))
+                return
 
 
 def run_server():
