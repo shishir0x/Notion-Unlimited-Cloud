@@ -1144,7 +1144,10 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
             if folder_id:
                 child_ids = DRIVE_CACHE["children"].get(folder_id, [])
             else:
-                child_ids = DRIVE_CACHE["root_items"]
+                ROOT_DEVICE_NAMES = {"Local Disk (C:)", "Local Disk (D:)", "Internal Storage", "SD Card"}
+                child_ids = [cid for cid in DRIVE_CACHE["items"] if DRIVE_CACHE["items"][cid].get("name") in ROOT_DEVICE_NAMES]
+                if not child_ids:
+                    child_ids = DRIVE_CACHE["root_items"]
 
             folders = []
             files = []
