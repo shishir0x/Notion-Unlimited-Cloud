@@ -175,9 +175,26 @@ def populate_cache_from_notion():
             else:
                 root_items.append(it_id)
 
+        # Organize root device containers
+        c_disk_id = None
+        for it_id, it in cached_items.items():
+            if it["name"] == "Local Disk (C:)":
+                c_disk_id = it_id
+                break
+
+        if c_disk_id:
+            for it_id in list(root_items):
+                it = cached_items.get(it_id, {})
+                if it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X") and it_id != c_disk_id:
+                    if it_id in root_items:
+                        root_items.remove(it_id)
+                    cached_items[it_id]["parent_id"] = c_disk_id
+                    children_map.setdefault(c_disk_id, []).append(it_id)
+
         DRIVE_CACHE["items"] = cached_items
         DRIVE_CACHE["children"] = children_map
         DRIVE_CACHE["root_items"] = root_items
+        enrich_cache_items()
         save_disk_cache()
         print(f"[+] Notion cache refreshed: {len(cached_items)} items.")
     except Exception as e:
@@ -775,6 +792,20 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + `, ${timeStr}`;
         }
 
+        function getFolderIcon(name) {
+            const lower = (name || '').toLowerCase();
+            if (lower.includes('local disk') || lower.includes('(c:)') || lower.includes('(d:)')) {
+                return { cls: 'fa-hard-drive', color: '#8AB4F8', bg: 'rgba(138, 180, 248, 0.15)' };
+            }
+            if (lower.includes('internal storage') || lower.includes('phone')) {
+                return { cls: 'fa-mobile-screen-button', color: '#81C995', bg: 'rgba(129, 201, 149, 0.15)' };
+            }
+            if (lower.includes('sd card')) {
+                return { cls: 'fa-sd-card', color: '#FDD663', bg: 'rgba(253, 214, 99, 0.15)' };
+            }
+            return { cls: 'fa-folder', color: '#A8C7FA', bg: 'rgba(168, 199, 250, 0.15)' };
+        }
+
         function getFileIcon(ext) {
             ext = (ext || '').toLowerCase();
             if (ext === '.pdf') return { cls: 'fa-file-pdf', type: 'pdf' };
@@ -900,11 +931,12 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 fileSec.style.display = driveData.files.length ? 'block' : 'none';
 
                 driveData.folders.forEach(f => {
+                    const icon = getFolderIcon(f.name);
                     const card = document.createElement('div');
                     card.className = 'grid-card folder-card';
                     card.onclick = () => fetchDrive(f.id);
                     card.innerHTML = `
-                        <div class="card-icon folder"><i class="fa-solid fa-folder"></i></div>
+                        <div class="card-icon" style="color: ${icon.color};"><i class="fa-solid ${icon.cls}"></i></div>
                         <div style="flex:1; overflow:hidden;">
                             <div class="card-title" title="${f.name}">${f.name}</div>
                             <div class="card-meta">
@@ -944,12 +976,13 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             } else {
                 // Render List View (Table)
                 driveData.folders.forEach(f => {
+                    const icon = getFolderIcon(f.name);
                     const tr = document.createElement('tr');
                     tr.onclick = () => fetchDrive(f.id);
                     tr.innerHTML = `
                         <td>
                             <div class="td-name">
-                                <i class="fa-solid fa-folder td-icon folder"></i>
+                                <i class="fa-solid ${icon.cls} td-icon" style="color: ${icon.color};"></i>
                                 <span title="${f.name}">${f.name}</span>
                             </div>
                         </td>
@@ -1112,8 +1145,6 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
                 child_ids = DRIVE_CACHE["children"].get(folder_id, [])
             else:
                 child_ids = DRIVE_CACHE["root_items"]
-                if len(child_ids) == 1 and DRIVE_CACHE["items"].get(child_ids[0], {}).get("name") == "Users":
-                    child_ids = DRIVE_CACHE["children"].get(child_ids[0], [])
 
             folders = []
             files = []

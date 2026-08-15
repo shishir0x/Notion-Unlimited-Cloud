@@ -309,21 +309,57 @@ class NotionGitSyncEngine:
             has_more = res.get("has_more", False)
             start_cursor = res.get("next_cursor")
 
-    def ensure_notion_folder_path(self, local_folder_path: Path) -> str:
-        try:
-            rel = local_folder_path.relative_to(self.root_dir.parent)
-        except ValueError:
-            rel = local_folder_path
+    def ensure_root_container(self, container_name: str, emoji: str = "💽") -> str:
+        """Finds or creates a root device container in Notion."""
+        if (container_name, None) in self.folder_cache:
+            return self.folder_cache[(container_name, None)]
 
-        parts = rel.parts
-        current_parent_id = None
+        payload = {
+            "parent": {"database_id": self.db_id},
+            "icon": {"type": "emoji", "emoji": emoji},
+            "properties": {
+                "Name": {"title": [{"text": {"content": container_name}}]},
+                "Type": {"select": {"name": "Folder"}},
+                "Favorite": {"checkbox": True}
+            }
+        }
+        res = self.requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload)
+        if res.status_code == 200:
+            new_id = res.json()["id"].replace("-", "")
+            self.folder_cache[(container_name, None)] = new_id
+            return new_id
+        return None
 
-        for part in parts:
+    def ensure_notion_folder_path(self, folder_path_str: Any) -> str:
+        """Creates hierarchy rooted in Local Disk (C:), Local Disk (D:), Internal Storage, or SD Card."""
+        folder_str = str(folder_path_str).replace("\\", "/")
+        is_android = folder_str.startswith("/") or folder_str.startswith("Internal Storage") or folder_str.startswith("SD Card")
+        
+        if not is_android:
+            path_obj = Path(folder_path_str).resolve()
+            drive_letter = path_obj.drive.upper().rstrip(":")
+            root_container_name = f"Local Disk ({drive_letter}:)" if drive_letter else "Local Disk (C:)"
+            container_id = self.ensure_root_container(root_container_name, "💽")
+            rel_parts = [p for p in path_obj.parts[1:] if p] # Skip C:\
+        else:
+            if folder_str.startswith("/storage/4A21-0000") or folder_str.startswith("/storage/sdcard1") or folder_str.startswith("SD Card"):
+                root_container_name = "SD Card"
+                container_id = self.ensure_root_container(root_container_name, "💾")
+                clean = folder_str.replace("/storage/4A21-0000", "").replace("/storage/sdcard1", "").replace("SD Card", "")
+                rel_parts = [p for p in clean.split("/") if p]
+            else:
+                root_container_name = "Internal Storage"
+                container_id = self.ensure_root_container(root_container_name, "📱")
+                clean = folder_str.replace("/storage/emulated/0", "").replace("/sdcard", "").replace("Internal Storage", "")
+                rel_parts = [p for p in clean.split("/") if p]
+
+        current_parent_id = container_id
+        for part in rel_parts:
             cache_key = (part, current_parent_id)
             if cache_key in self.folder_cache:
                 current_parent_id = self.folder_cache[cache_key]
             else:
-                encoded_folder = urllib.parse.quote(str(local_folder_path))
+                encoded_folder = urllib.parse.quote(str(folder_path_str))
                 open_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/view?path={encoded_folder}"
                 payload = {
                     "parent": {"database_id": self.db_id},
@@ -344,8 +380,139 @@ class NotionGitSyncEngine:
                     self.folder_cache[cache_key] = new_id
                     current_parent_id = new_id
                 else:
-                    return None
+                    if "Sub-item hierarchy" in res.text:
+                        del payload["properties"]["Parent Folder"]
+                        res2 = self.requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload)
+                        if res2.status_code == 200:
+                            new_id = res2.json()["id"].replace("-", "")
+                            self.folder_cache[cache_key] = new_id
+                            current_parent_id = new_id
+                        else:
+                            return current_parent_id
+                    else:
+                        return current_parent_id
         return current_parent_id
+
+    def sync_android(self, target: str = "both", folder_filter: str = None):
+        """Streams Android files directly into Notion over USB without saving to PC disk."""
+        import subprocess
+        print("\n📱 Checking connected Android device via ADB...")
+        try:
+            out = subprocess.check_output(["adb", "devices"]).decode("utf-8")
+        except Exception as e:
+            print(f"❌ ADB error: {e}")
+            return
+
+        lines = [line.strip() for line in out.splitlines() if line.strip() and not line.startswith("List of")]
+        if not lines:
+            print("⚠️  No Android phone detected over USB.")
+            print("   1. Connect phone with a USB cable.")
+            print("   2. Enable 'USB Debugging' in Settings > Developer Options.")
+            print("   3. Tap 'Allow' on your phone screen when prompted.")
+            return
+
+        device_id = lines[0].split()[0]
+        print(f"✅ Found Connected Android Device: {device_id}")
+
+        storage_targets = []
+        if target in ("internal", "both"):
+            storage_targets.append(("Internal Storage", "/sdcard"))
+        if target in ("sdcard", "both"):
+            try:
+                stor_out = subprocess.check_output(["adb", "-s", device_id, "shell", "ls", "/storage"]).decode("utf-8")
+                for s in stor_out.split():
+                    if s not in ("emulated", "self", "persist", "sdcard0"):
+                        storage_targets.append(("SD Card", f"/storage/{s}"))
+                        break
+            except Exception:
+                pass
+
+        android_tracked = self.state.setdefault("android_files", {})
+        self.load_notion_folders()
+
+        items_to_sync = []
+        for storage_label, base_path in storage_targets:
+            scan_path = f"{base_path}/{folder_filter}" if folder_filter else base_path
+            print(f"🔍 Scanning {storage_label} ({scan_path}) directly on phone...")
+            
+            cmd = f"find '{scan_path}' -type f -not -path '*/.*' -not -path '*/Android/data*' -not -path '*/Android/obb*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+            try:
+                find_out = subprocess.check_output(["adb", "-s", device_id, "shell", cmd]).decode("utf-8", errors="ignore")
+                for line in find_out.splitlines():
+                    if "|" in line:
+                        parts = line.strip().split("|")
+                        if len(parts) == 3:
+                            fpath, fsize, fmtime = parts[0], int(parts[1]), float(parts[2])
+                            fname = fpath.split("/")[-1]
+                            ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
+                            
+                            if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
+                                continue
+                            if ext in IGNORED_FILE_EXTENSIONS:
+                                continue
+
+                            rel_display = fpath.replace(base_path, storage_label)
+                            prev = android_tracked.get(fpath)
+                            if not prev or abs(prev.get("mtime", 0) - fmtime) > 1.0 or prev.get("size", 0) != fsize:
+                                items_to_sync.append({
+                                    "fpath": fpath,
+                                    "display_path": rel_display,
+                                    "name": fname,
+                                    "size": fsize,
+                                    "mtime": fmtime,
+                                    "ext": ext,
+                                    "storage_label": storage_label
+                                })
+            except Exception as e:
+                print(f"   [!] Error scanning {storage_label}: {e}")
+
+        total = len(items_to_sync)
+        if total == 0:
+            print("✨ All Android phone files are 100% up to date in Notion!")
+            return
+
+        print(f"\n🚀 Direct USB Streaming: Uploading {total} items to Notion (0 PC disk bytes used)...\n")
+
+        for idx, it in enumerate(items_to_sync, 1):
+            render_progress_bar(idx - 1, total, prefix="Syncing Phone", current_file=it["name"])
+
+            parent_folder_str = "/".join(it["display_path"].split("/")[:-1])
+            parent_notion_id = self.ensure_notion_folder_path(parent_folder_str)
+
+            file_type = FILE_TYPE_MAP.get(it["ext"], "Other")
+            emoji = EMOJI_MAP.get(file_type, "📄")
+            size_mb = round(it["size"] / (1024 * 1024), 2)
+
+            payload = {
+                "parent": {"database_id": self.db_id},
+                "icon": {"type": "emoji", "emoji": emoji},
+                "properties": {
+                    "Name": {"title": [{"text": {"content": it["name"]}}]},
+                    "Type": {"select": {"name": "File"}},
+                    "File Type": {"select": {"name": file_type}},
+                    "File Extension": {"rich_text": [{"text": {"content": it["ext"]}}]},
+                    "File Size": {"number": size_mb},
+                    "Description": {"rich_text": [{"text": {"content": f"Path: {it['display_path']}"}}]},
+                    "Favorite": {"checkbox": False}
+                }
+            }
+            if parent_notion_id:
+                payload["properties"]["Parent Folder"] = {"relation": [{"id": parent_notion_id}]}
+
+            res = self.requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload)
+            if res.status_code == 200:
+                notion_id = res.json()["id"].replace("-", "")
+                android_tracked[it["fpath"]] = {
+                    "notion_id": notion_id,
+                    "mtime": it["mtime"],
+                    "size": it["size"],
+                    "display_path": it["display_path"]
+                }
+
+            self.save_state()
+            render_progress_bar(idx, total, prefix="Syncing Phone", current_file=it["name"])
+
+        print("\n✅ Android phone direct sync finished successfully!")
 
     def rebuild_index(self):
         """Pulls all pages from Notion and rebuilds local sync state & drive cache."""
@@ -428,7 +595,6 @@ class NotionGitSyncEngine:
             emoji = EMOJI_MAP.get(file_type, "📄")
             size_mb = round(meta["size"] / (1024 * 1024), 2)
             
-            # Browser View URL for Microsoft Edge & Google Drive Web GUI
             encoded_path = urllib.parse.quote(file_path_str)
             edge_view_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/view?path={encoded_path}"
 
@@ -519,52 +685,69 @@ class NotionGitSyncEngine:
 
 def run_interactive_menu():
     """Interactive CLI menu when launched directly."""
-    # Ensure server is running
     start_background_file_server(LOCAL_SERVER_PORT)
-    engine = NotionGitSyncEngine(DEFAULT_API_KEY, DEFAULT_DB_ID, root_dir=r"C:\Users", include_hidden=True)
+    engine_c = NotionGitSyncEngine(DEFAULT_API_KEY, DEFAULT_DB_ID, root_dir=r"C:\Users", include_hidden=True)
+    engine_d = NotionGitSyncEngine(DEFAULT_API_KEY, DEFAULT_DB_ID, root_dir=r"D:\\", include_hidden=True)
 
     while True:
         try:
-            print("\n" + "="*68)
+            print("\n" + "="*70)
             print("        ☁️ NOTION UNLIMITED CLOUD & WEB DRIVE DASHBOARD")
-            print("="*68)
-            print("  [1] ⚡ Upload Only Changed & New Files (Smart Incremental Sync)")
-            print("  [2] 🚀 Upload All Files (Force Full Cloud Sync)")
-            print("  [3] 👀 Start Real-Time Auto-Sync Watcher (Live Background Monitor)")
-            print("  [4] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)")
-            print("  [5] 📊 Check Storage Status & File Integrity (Git-Style Inspect)")
-            print("  [6] 🔄 Rebuild & Refresh Local Cloud Index (Sync state from Notion)")
-            print("  [7] 📝 Open Notion Database in Browser")
-            print("  [8] ❌ Exit")
-            print("="*68)
+            print("="*70)
+            print("  [1] ⚡ Sync Local Disk (C:) - Changed & New Files (Incremental)")
+            print("  [2] 🚀 Sync Local Disk (C:) - Force Upload All Files")
+            print("  [3] 💾 Sync Local Disk (D:) - Incremental Sync")
+            print("  [4] 📱 Direct Android USB Sync (Internal Storage & SD Card)")
+            print("  [5] 👀 Start Real-Time Auto-Sync Watcher (C: Drive Monitor)")
+            print("  [6] 🌐 Launch Web Drive File Manager GUI (Google Drive in Browser)")
+            print("  [7] 📊 Check Storage Status & File Integrity (Git-Style Inspect)")
+            print("  [8] 🔄 Rebuild & Refresh Local Cloud Index (Sync state from Notion)")
+            print("  [9] 📝 Open Notion Database in Browser")
+            print("  [10] ❌ Exit")
+            print("="*70)
             
-            choice = input("Select an option [1-8]: ").strip()
+            choice = input("Select an option [1-10]: ").strip()
             if choice == "1":
-                engine.sync(force_all=False)
+                engine_c.sync(force_all=False)
             elif choice == "2":
-                confirm = input("⚠️  Upload ALL files in directory tree to Notion? [y/N]: ").strip().lower()
+                confirm = input("⚠️  Upload ALL files on C: drive tree to Notion? [y/N]: ").strip().lower()
                 if confirm in ("y", "yes"):
-                    engine.sync(force_all=True)
-                else:
-                    print("Canceled.")
+                    engine_c.sync(force_all=True)
             elif choice == "3":
-                engine.watch()
+                engine_d.sync(force_all=False)
             elif choice == "4":
+                print("\n📱 Android USB Direct Sync:")
+                print("   [1] Full Sync (Both Internal Storage & SD Card)")
+                print("   [2] Photos & Camera (DCIM)")
+                print("   [3] Documents Folder")
+                print("   [4] Downloads Folder")
+                sub = input("Select Android option [1-4]: ").strip()
+                if sub == "1":
+                    engine_c.sync_android(target="both")
+                elif sub == "2":
+                    engine_c.sync_android(target="both", folder_filter="DCIM")
+                elif sub == "3":
+                    engine_c.sync_android(target="both", folder_filter="Documents")
+                elif sub == "4":
+                    engine_c.sync_android(target="both", folder_filter="Download")
+            elif choice == "5":
+                engine_c.watch()
+            elif choice == "6":
                 print("🌐 Opening Google Drive GUI on http://127.0.0.1:8765 ...")
                 start_background_file_server(LOCAL_SERVER_PORT)
                 webbrowser.open("http://127.0.0.1:8765")
-            elif choice == "5":
-                engine.status()
-            elif choice == "6":
-                engine.rebuild_index()
             elif choice == "7":
+                engine_c.status()
+            elif choice == "8":
+                engine_c.rebuild_index()
+            elif choice == "9":
                 print("🌐 Opening Notion in your default browser...")
                 webbrowser.open(f"https://app.notion.com/p/{DEFAULT_DB_ID}")
-            elif choice in ("8", "exit", "q", "quit"):
+            elif choice in ("10", "exit", "q", "quit"):
                 print("👋 Exiting Notion Cloud Sync Engine. Goodbye!")
                 sys.exit(0)
             else:
-                print("❌ Invalid selection. Please enter a number between 1 and 8.")
+                print("❌ Invalid selection. Please enter a number between 1 and 10.")
         except (EOFError, KeyboardInterrupt):
             print("\n👋 Exiting Notion Cloud Sync Engine. Goodbye!")
             sys.exit(0)
@@ -577,7 +760,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Notion Unlimited Cloud & Web Drive Engine")
     parser.add_argument("command", nargs="?", default="menu", 
-                        choices=["menu", "status", "sync", "sync-all", "watch", "rebuild", "gui"], 
+                        choices=["menu", "status", "sync", "sync-all", "sync-d", "android", "watch", "rebuild", "gui"], 
                         help="Command to run")
     parser.add_argument("--path", type=str, default=r"C:\Users", help="Root directory to sync")
     parser.add_argument("--hidden", action="store_true", default=True, help="Include hidden folders & files")
@@ -600,6 +783,11 @@ def main():
         engine.sync(force_all=False)
     elif args.command == "sync-all":
         engine.sync(force_all=True)
+    elif args.command == "sync-d":
+        engine_d = NotionGitSyncEngine(args.token, args.db, root_dir=r"D:\\", include_hidden=args.hidden)
+        engine_d.sync(force_all=False)
+    elif args.command == "android":
+        engine.sync_android(target="both")
     elif args.command == "watch":
         engine.watch(interval=args.interval)
     elif args.command == "rebuild":
