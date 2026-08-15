@@ -29,6 +29,9 @@ import time
 import json
 import zipfile
 import mimetypes
+import hmac
+import hashlib
+import secrets
 import urllib.parse
 import html
 import threading
@@ -75,6 +78,37 @@ UPLOADS_DIR = Path.home() / "NotionDrive_Uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 CACHE_FILE = Path.home() / ".notion_drive_cache.json"
 STATE_FILE = Path(__file__).parent / ".notion_sync_state.json"
+
+
+SESSION_SECRET = secrets.token_hex(32)
+
+def compute_auth_token(password: str) -> str:
+    return hmac.new(SESSION_SECRET.encode("utf-8"), f"auth_token:{password}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+def check_authenticated(headers) -> bool:
+    drive_pw = os.environ.get("DRIVE_PASSWORD", getattr(config, "DRIVE_PASSWORD", "")).strip()
+    if not drive_pw:
+        return True # Open access if no password configured
+    expected_token = compute_auth_token(drive_pw)
+    
+    # 1. Check Cookie header
+    cookie_str = headers.get("Cookie", "")
+    if "notion_session=" in cookie_str:
+        for c in cookie_str.split(";"):
+            c = c.strip()
+            if c.startswith("notion_session="):
+                token = c.split("=", 1)[1].strip()
+                if hmac.compare_digest(token, expected_token):
+                    return True
+    
+    # 2. Check Authorization header
+    auth_header = headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        if hmac.compare_digest(token, expected_token):
+            return True
+
+    return False
 
 DRIVE_CACHE = {
     "items": {},
@@ -915,6 +949,209 @@ def populate_cache_from_notion():
 # ==============================================================================
 # HTML & JS FRONTEND TEMPLATE
 # ==============================================================================
+
+LOCK_SCREEN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notion Drive — Protected Access</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg-body: #131314;
+            --bg-card: #1E1F20;
+            --accent-blue: #8AB4F8;
+            --accent-blue-hover: #A8C7FA;
+            --text-main: #E3E3E3;
+            --text-muted: #9AA0A6;
+            --border-color: #3C4043;
+            --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: var(--font-family); }
+        body {
+            background: radial-gradient(circle at top right, #1A2744 0%, #131314 60%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: var(--text-main);
+        }
+        .lock-card {
+            background: rgba(30, 31, 32, 0.85);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 40px;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            text-align: center;
+            animation: fadeIn 0.4s ease-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .lock-logo {
+            width: 64px;
+            height: 64px;
+            background: rgba(138, 180, 248, 0.12);
+            border: 1px solid rgba(138, 180, 248, 0.3);
+            border-radius: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            color: var(--accent-blue);
+            margin-bottom: 20px;
+            box-shadow: 0 0 30px rgba(138, 180, 248, 0.2);
+        }
+        h1 { font-size: 22px; font-weight: 600; margin-bottom: 8px; }
+        p { font-size: 13px; color: var(--text-muted); margin-bottom: 28px; line-height: 1.5; }
+        .input-group {
+            position: relative;
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        .input-group input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px 44px 14px 16px;
+            font-size: 15px;
+            color: #fff;
+            outline: none;
+            transition: all 0.2s;
+        }
+        .input-group input:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 0 3px rgba(138, 180, 248, 0.2);
+        }
+        .toggle-pw {
+            position: absolute;
+            right: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .btn-unlock {
+            width: 100%;
+            background: var(--accent-blue);
+            color: #041E49;
+            border: none;
+            border-radius: 12px;
+            padding: 14px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: all 0.2s;
+        }
+        .btn-unlock:hover {
+            background: var(--accent-blue-hover);
+            transform: translateY(-1px);
+        }
+        .err-msg {
+            color: #F28B82;
+            font-size: 13px;
+            margin-top: 14px;
+            display: none;
+            background: rgba(234, 67, 53, 0.1);
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(234, 67, 53, 0.2);
+        }
+        .shake {
+            animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both;
+        }
+        @keyframes shake {
+            10%, 90% { transform: translate3d(-1px, 0, 0); }
+            20%, 80% { transform: translate3d(2px, 0, 0); }
+            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+            40%, 60% { transform: translate3d(4px, 0, 0); }
+        }
+    </style>
+</head>
+<body>
+    <div class="lock-card" id="lockCard">
+        <div class="lock-logo">
+            <i class="fa-solid fa-lock"></i>
+        </div>
+        <h1>Notion Cloud Drive</h1>
+        <p>This private storage is protected. Enter your password or PIN to unlock your files.</p>
+        <form onsubmit="handleUnlock(event)">
+            <div class="input-group">
+                <input type="password" id="pwInput" placeholder="Enter access password" autofocus autocomplete="current-password" required>
+                <i class="fa-solid fa-eye toggle-pw" id="eyeIcon" onclick="togglePasswordVisibility()"></i>
+            </div>
+            <button type="submit" class="btn-unlock" id="btnUnlock">
+                <i class="fa-solid fa-lock-open"></i> Unlock Drive
+            </button>
+            <div class="err-msg" id="errMsg"></div>
+        </form>
+    </div>
+    <script>
+        function togglePasswordVisibility() {
+            const input = document.getElementById('pwInput');
+            const eye = document.getElementById('eyeIcon');
+            if (input.type === 'password') {
+                input.type = 'text';
+                eye.className = 'fa-solid fa-eye-slash toggle-pw';
+            } else {
+                input.type = 'password';
+                eye.className = 'fa-solid fa-eye toggle-pw';
+            }
+        }
+        async function handleUnlock(e) {
+            e.preventDefault();
+            const pw = document.getElementById('pwInput').value;
+            const btn = document.getElementById('btnUnlock');
+            const err = document.getElementById('errMsg');
+            const card = document.getElementById('lockCard');
+            
+            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Verifying...';
+            btn.disabled = true;
+            err.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({password: pw})
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    btn.innerHTML = '<i class="fa-solid fa-check"></i> Unlocked!';
+                    setTimeout(() => { window.location.reload(); }, 300);
+                } else {
+                    card.classList.add('shake');
+                    setTimeout(() => card.classList.remove('shake'), 500);
+                    err.innerText = data.error || 'Incorrect password. Access denied.';
+                    err.style.display = 'block';
+                    btn.innerHTML = '<i class="fa-solid fa-lock-open"></i> Unlock Drive';
+                    btn.disabled = false;
+                }
+            } catch (errExp) {
+                err.innerText = 'Network error. Please try again.';
+                err.style.display = 'block';
+                btn.innerHTML = '<i class="fa-solid fa-lock-open"></i> Unlock Drive';
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
 DRIVE_GUI_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1683,10 +1920,14 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 <i class="fa-solid fa-magnifying-glass"></i>
                 <input type="text" id="searchInput" placeholder="Search files and folders in My Drive..." oninput="handleSearch()">
             </div>
-            <div class="top-actions">
+                        <div class="top-actions" style="display: flex; align-items: center; gap: 10px;">
                 <button class="btn-sync" onclick="refreshDrive()">
                     <i class="fa-solid fa-arrows-rotate"></i>
                     <span>Sync Notion</span>
+                </button>
+                <button class="btn-tool" id="btnLockDrive" onclick="lockDrive()" title="Lock Drive / Logout" style="display: none; background: rgba(234,67,53,0.1); color: #F28B82; border: 1px solid rgba(234,67,53,0.2); padding: 8px 12px; border-radius: 20px; font-size: 13px; cursor: pointer; align-items: center; gap: 6px;">
+                    <i class="fa-solid fa-lock"></i>
+                    <span>Lock</span>
                 </button>
             </div>
         </div>
@@ -2472,7 +2713,28 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             });
         }
 
+        
+        async function checkAuthStatus() {
+            try {
+                const r = await fetch('/api/auth/status');
+                const d = await r.json();
+                if (d.protected) {
+                    const btn = document.getElementById('btnLockDrive');
+                    if (btn) btn.style.display = 'flex';
+                }
+            } catch(e) {}
+        }
+
+        async function lockDrive() {
+            if (confirm("Lock Notion Drive and sign out?")) {
+                await fetch('/api/auth/logout', {method: 'POST'});
+                window.location.reload();
+            }
+        }
+
+        checkAuthStatus();
         fetchDrive();
+
         fetchStorageStats();
         setInterval(fetchStorageStats, 15000);
         setInterval(pollSyncStatus, 1000);
@@ -2564,6 +2826,58 @@ class NotionServerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+
+        # ── Auth Endpoints (Always Public) ──────────────────────────────────
+        if parsed.path == "/api/auth/login":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                entered_pw = data.get("password", "")
+                drive_pw = os.environ.get("DRIVE_PASSWORD", getattr(config, "DRIVE_PASSWORD", "")).strip()
+                if not drive_pw or entered_pw == drive_pw:
+                    token = compute_auth_token(drive_pw if drive_pw else "open")
+                    resp = json.dumps({"success": True, "token": token}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.send_header("Set-Cookie", f"notion_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                    self.end_headers()
+                    self.wfile.write(resp)
+                    return
+                else:
+                    resp = json.dumps({"success": False, "error": "Incorrect password. Access denied."}).encode("utf-8")
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers()
+                    self.wfile.write(resp)
+                    return
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                return
+
+        if parsed.path == "/api/auth/logout":
+            resp = json.dumps({"success": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.send_header("Set-Cookie", "notion_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
+        # ── Security Gate: Require Auth for all other actions ───────────────
+        if parsed.path.startswith("/api/") and parsed.path != "/api/sync/update":
+            if not check_authenticated(self.headers):
+                resp = json.dumps({"error": "Unauthorized. Please enter password."}).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+                return
 
         if parsed.path == "/api/sync/start":
             target = params.get("target", ["all"])[0].lower()
@@ -2705,12 +3019,43 @@ class NotionServerHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
+        if parsed.path == "/api/auth/status":
+            drive_pw = os.environ.get("DRIVE_PASSWORD", getattr(config, "DRIVE_PASSWORD", "")).strip()
+            is_auth = check_authenticated(self.headers)
+            resp = json.dumps({"protected": bool(drive_pw), "authenticated": is_auth}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
+
         if parsed.path == "/" or parsed.path == "/index.html":
+            is_auth = check_authenticated(self.headers)
+            html_to_serve = DRIVE_GUI_HTML if is_auth else LOCK_SCREEN_HTML
+            body = html_to_serve.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(DRIVE_GUI_HTML.encode("utf-8"))
+            self.wfile.write(body)
             return
+
+        # ── Security Gate: Require Auth for all data routes ─────────────────
+        if not check_authenticated(self.headers):
+            if parsed.path.startswith("/api/"):
+                resp = json.dumps({"error": "Unauthorized"}).encode("utf-8")
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+                return
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
 
         if parsed.path == "/api/sync/status":
             with SYNC_LOCK:

@@ -9,3 +9,5 @@ services:
         sync: false
       - key: NOTION_DATABASE_ID
         sync: false
+      - key: DRIVE_PASSWORD
+        sync: false

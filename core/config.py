@@ -42,6 +42,7 @@ load_env()
 # ─── Exported constants (all other modules import from here) ──────────────────
 NOTION_TOKEN: str = os.getenv("NOTION_TOKEN", "")
 NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "").replace("-", "")
+DRIVE_PASSWORD: str = os.getenv("DRIVE_PASSWORD", "")
 LOCAL_SERVER_PORT: int = int(os.getenv("LOCAL_SERVER_PORT", "8765"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL_SECONDS", "4"))
 NOTION_VERSION: str = "2022-06-28"
@@ -57,12 +58,15 @@ def has_credentials() -> bool:
     return bool(NOTION_TOKEN and NOTION_DATABASE_ID)
 
 
-def save_credentials(token: str, db_id: str):
+def save_credentials(token: str, db_id: str, password: str = ""):
     """Persist credentials to the project .env file."""
     content = (
         f"# Notion API Credentials\n"
         f"NOTION_TOKEN={token}\n"
         f"NOTION_DATABASE_ID={db_id}\n"
+        f"\n"
+        f"# Security (Optional web password for cloud deployment)\n"
+        f"DRIVE_PASSWORD={password}\n"
         f"\n"
         f"# Local Sync Settings\n"
         f"LOCAL_SERVER_PORT={LOCAL_SERVER_PORT}\n"
@@ -72,11 +76,13 @@ def save_credentials(token: str, db_id: str):
     # Update in-memory values for this session
     os.environ["NOTION_TOKEN"] = token
     os.environ["NOTION_DATABASE_ID"] = db_id.replace("-", "")
+    os.environ["DRIVE_PASSWORD"] = password
 
 
 def reload():
     """Reload credentials from .env into module-level constants."""
-    global NOTION_TOKEN, NOTION_DATABASE_ID
+    global NOTION_TOKEN, NOTION_DATABASE_ID, DRIVE_PASSWORD
     load_env()
     NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
     NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "").replace("-", "")
+    DRIVE_PASSWORD = os.getenv("DRIVE_PASSWORD", "")
