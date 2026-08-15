@@ -19,7 +19,7 @@ import threading
 import argparse
 import webbrowser
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Any, List
 
 # Windows UTF-8 console output fix
@@ -95,114 +95,25 @@ IGNORED_FILE_EXTENSIONS = {
 # ==============================================================================
 # Local File Server & Edge Tab Preview Bridge
 # ==============================================================================
-class NotionFileServerHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # Suppress console clutter for background requests
-
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        params = urllib.parse.parse_qs(parsed.query)
-        file_path_str = (params.get("path", [None])[0] or 
-                         params.get("file", [None])[0] or 
-                         params.get("p", [None])[0] or 
-                         params.get("url", [None])[0] or 
-                         params.get("target", [None])[0])
-
-        if not file_path_str:
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
-        target_path = Path(clean_path_str).resolve()
-        if not target_path.exists():
-            self.send_response(404)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"<h3>File not found on local drive.</h3>")
-            return
-
-        # Route 1: View in Edge Tab
-        if parsed.path == "/view":
-            if target_path.is_dir():
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                html = f"<h2>📁 Folder: {target_path.name}</h2><p>Path: {target_path}</p><a href='/download_folder?path={urllib.parse.quote(str(target_path))}'>⬇️ Download Entire Folder as ZIP</a><hr><ul>"
-                for item in target_path.iterdir():
-                    action = "view" if item.is_file() else "view"
-                    html += f"<li><a href='/{action}?path={urllib.parse.quote(str(item))}'>{'📄' if item.is_file() else '📁'} {item.name}</a></li>"
-                html += "</ul>"
-                self.wfile.write(html.encode("utf-8"))
-                return
-
-            mime_type, _ = mimetypes.guess_type(str(target_path))
-            if not mime_type:
-                mime_type = "text/plain" if target_path.suffix in [".py", ".json", ".yaml", ".md", ".txt", ".js", ".ts"] else "application/octet-stream"
-
-            try:
-                with open(target_path, "rb") as f:
-                    content = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", mime_type)
-                self.send_header("Content-Length", str(len(content)))
-                self.send_header("Content-Disposition", f"inline; filename=\"{target_path.name}\"")
-                self.end_headers()
-                self.wfile.write(content)
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(f"Error reading file: {e}".encode("utf-8"))
-
-        # Route 2: Direct Download Single File
-        elif parsed.path == "/download":
-            if target_path.is_file():
-                try:
-                    with open(target_path, "rb") as f:
-                        content = f.read()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(content)))
-                    self.send_header("Content-Disposition", f"attachment; filename=\"{target_path.name}\"")
-                    self.end_headers()
-                    self.wfile.write(content)
-                except Exception as e:
-                    self.send_response(500)
-                    self.end_headers()
-                    self.wfile.write(f"Download error: {e}".encode("utf-8"))
-
-        # Route 3: Download Entire Folder as ZIP
-        elif parsed.path == "/download_folder":
-            if target_path.is_dir():
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for root, _, files in os.walk(target_path):
-                        for file in files:
-                            full_f = Path(root) / file
-                            try:
-                                rel_f = full_f.relative_to(target_path)
-                                zf.write(full_f, arcname=str(rel_f))
-                            except Exception:
-                                pass
-                zip_buffer.seek(0)
-                zip_data = zip_buffer.getvalue()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Length", str(len(zip_data)))
-                self.send_header("Content-Disposition", f"attachment; filename=\"{target_path.name}.zip\"")
-                self.end_headers()
-                self.wfile.write(zip_data)
-
-
 def start_background_file_server(port: int = LOCAL_SERVER_PORT):
-    """Starts the local HTTP bridge in a background daemon thread."""
+    """Ensures the full Google Drive Web Server is running."""
+    import urllib.request
     try:
-        server = HTTPServer(("127.0.0.1", port), NotionFileServerHandler)
+        req = urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=0.5)
+        if req.status == 200:
+            return None
+    except Exception:
+        pass
+
+    try:
+        import notion_server
+        notion_server.load_disk_cache()
+        server = ThreadingHTTPServer(("0.0.0.0", port), notion_server.NotionFileServerHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        print(f"🚀 Google Drive Web GUI active on http://127.0.0.1:{port}")
         return server
-    except Exception as e:
+    except Exception:
         return None
 
 
