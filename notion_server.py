@@ -6,7 +6,7 @@ Features:
 - Full Google Drive UI (Grid/List views, breadcrumbs, search, multi-column sorting)
 - In-browser file preview (PDF, Images, Video, Audio, Code)
 - Live ADB streaming for connected Android phone files & SD card (0 PC disk bytes)
-- Real-time Sync Activity & Live Queue Control Center (Left sidebar tab)
+- Real-time Sync Activity & Dynamic Sliding Window Live Queue Control Center (Left sidebar tab)
 """
 
 import os
@@ -79,9 +79,9 @@ SYNC_STATE = {
     "start_time": None,
     "speed_str": "-",
     "status_message": "Ready to sync",
-    "queue": [],      # list of dicts: {"id": int, "name": str, "path": str, "size_str": str, "status": str}
-    "history": [],    # list of dicts: {"name": str, "path": str, "size_str": str, "time": str, "status": str}
-    "logs": []        # list of strings
+    "queue": [],      # Dynamic sliding window: active file + next upcoming queued files
+    "history": [],    # Full completed history: {"name": str, "path": str, "size_str": str, "time": str, "status": str}
+    "logs": []        # Live console logs
 }
 
 CANCEL_SYNC_FLAG = False
@@ -377,22 +377,39 @@ class BackgroundSyncRunner:
         total = len(files_to_sync)
         add_sync_log(f"Found {total} files queued for sync.")
 
-        queue_items = []
-        for i, item in enumerate(files_to_sync[:100], 1):
-            mb = round(item["size"] / (1024 * 1024), 2)
-            sz_str = f"{mb} MB" if mb >= 0.1 else f"{round(item['size']/1024, 1)} KB"
-            queue_items.append({
-                "id": i,
-                "name": item["name"],
-                "path": item["display_path"],
-                "size_str": sz_str,
-                "status": "queued"
-            })
+        def build_live_window(current_idx: int, active_item: dict, active_status: str) -> list:
+            """Builds a dynamic sliding window: active file at top + upcoming pending files."""
+            window = []
+            if active_item:
+                mb = round(active_item["size"] / (1024 * 1024), 2)
+                sz_str = f"{mb} MB" if mb >= 0.1 else f"{round(active_item['size']/1024, 1)} KB"
+                window.append({
+                    "id": current_idx,
+                    "name": active_item["name"],
+                    "path": active_item["display_path"],
+                    "size_str": sz_str,
+                    "status": active_status
+                })
+            # Add up to 15 next queued files
+            next_items = files_to_sync[current_idx:current_idx + 15]
+            for offset, n_it in enumerate(next_items, start=current_idx + 1):
+                n_mb = round(n_it["size"] / (1024 * 1024), 2)
+                n_sz_str = f"{n_mb} MB" if n_mb >= 0.1 else f"{round(n_it['size']/1024, 1)} KB"
+                window.append({
+                    "id": offset,
+                    "name": n_it["name"],
+                    "path": n_it["display_path"],
+                    "size_str": n_sz_str,
+                    "status": "queued"
+                })
+            return window
+
+        initial_window = build_live_window(0, files_to_sync[0] if files_to_sync else None, "queued")
 
         with SYNC_LOCK:
             SYNC_STATE["total_files"] = total
             SYNC_STATE["remaining_files"] = total
-            SYNC_STATE["queue"] = queue_items
+            SYNC_STATE["queue"] = initial_window
             SYNC_STATE["status_message"] = f"Uploading {total} files to Notion Cloud..."
 
         start_t = time.time()
@@ -402,6 +419,7 @@ class BackgroundSyncRunner:
                 with SYNC_LOCK:
                     SYNC_STATE["status_message"] = "Sync Cancelled"
                     SYNC_STATE["is_running"] = False
+                    SYNC_STATE["queue"] = []
                 return
 
             mb = round(it["size"] / (1024 * 1024), 2)
@@ -419,9 +437,8 @@ class BackgroundSyncRunner:
                 rate = round((idx / elapsed) * 60, 1)
                 SYNC_STATE["speed_str"] = f"{rate} files/min"
 
-                for q in SYNC_STATE["queue"]:
-                    if q["name"] == it["name"] and q["path"] == it["display_path"]:
-                        q["status"] = "uploading"
+                # Active item is set to "uploading" in live sliding queue
+                SYNC_STATE["queue"] = build_live_window(idx, it, "uploading")
 
             if it["is_android"]:
                 parent_folder_str = "/".join(it["display_path"].split("/")[:-1])
@@ -458,11 +475,8 @@ class BackgroundSyncRunner:
             except Exception:
                 status_ok = False
 
+            # Add completed file to Completed History & slide the queue window
             with SYNC_LOCK:
-                for q in SYNC_STATE["queue"]:
-                    if q["name"] == it["name"] and q["path"] == it["display_path"]:
-                        q["status"] = "synced" if status_ok else "failed"
-
                 SYNC_STATE["history"].insert(0, {
                     "name": it["name"],
                     "path": it["display_path"],
@@ -470,8 +484,12 @@ class BackgroundSyncRunner:
                     "time": time.strftime("%H:%M:%S"),
                     "status": "success" if status_ok else "failed"
                 })
-                if len(SYNC_STATE["history"]) > 100:
+                if len(SYNC_STATE["history"]) > 200:
                     SYNC_STATE["history"].pop()
+
+                # Dynamic slide: completed file is removed, next pending files pulled in
+                next_active = files_to_sync[idx] if idx < total else None
+                SYNC_STATE["queue"] = build_live_window(idx + 1, next_active, "uploading" if next_active else "synced")
 
             add_sync_log(f"Synced ({idx}/{total}): {it['name']} ({sz_str}) -> {'OK (200)' if status_ok else 'Failed'}")
 
@@ -482,6 +500,7 @@ class BackgroundSyncRunner:
             SYNC_STATE["is_running"] = False
             SYNC_STATE["current_file"] = "Completed"
             SYNC_STATE["status_message"] = "All files successfully synchronized!"
+            SYNC_STATE["queue"] = []  # Clear live queue when finished
 
         add_sync_log("✨ Sync operation completed successfully! Refreshing drive cache...")
         populate_cache_from_notion()
@@ -1186,10 +1205,19 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             font-weight: 500;
             cursor: pointer;
             border-bottom: 2px solid transparent;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
         .sync-tab-btn.active {
             color: var(--accent-blue);
             border-bottom-color: var(--accent-blue);
+        }
+        .tab-counter {
+            background: rgba(255,255,255,0.1);
+            padding: 1px 7px;
+            border-radius: 10px;
+            font-size: 11px;
         }
 
         .sync-table {
@@ -1220,7 +1248,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             text-transform: uppercase;
         }
         .status-pill.queued { background: rgba(255,255,255,0.08); color: var(--text-muted); }
-        .status-pill.uploading { background: #004A77; color: var(--accent-blue); }
+        .status-pill.uploading { background: #004A77; color: var(--accent-blue); animation: pulse 1.2s infinite; }
         .status-pill.synced { background: rgba(52,168,83,0.15); color: #81C995; }
         .status-pill.failed { background: rgba(234,67,53,0.15); color: #F28B82; }
 
@@ -1406,7 +1434,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                         <div class="stat-value" id="statUploaded">0</div>
                     </div>
                     <div class="stat-box">
-                        <div class="stat-label">Remaining</div>
+                        <div class="stat-label">Remaining in Queue</div>
                         <div class="stat-value" id="statRemaining">0</div>
                     </div>
                     <div class="stat-box">
@@ -1428,12 +1456,18 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 
             <!-- Sub Tabs: Live Queue, History, Logs -->
             <div class="sync-tabs-header">
-                <button class="sync-tab-btn active" id="tabBtnQueue" onclick="switchSyncSubTab('queue')"><i class="fa-solid fa-list-check"></i> Live Queue</button>
-                <button class="sync-tab-btn" id="tabBtnHistory" onclick="switchSyncSubTab('history')"><i class="fa-solid fa-clock-rotate-left"></i> Completed History</button>
-                <button class="sync-tab-btn" id="tabBtnLogs" onclick="switchSyncSubTab('logs')"><i class="fa-solid fa-terminal"></i> Console Logs</button>
+                <button class="sync-tab-btn active" id="tabBtnQueue" onclick="switchSyncSubTab('queue')">
+                    <i class="fa-solid fa-list-check"></i> Live Queue <span class="tab-counter" id="badgeQueueCount">0</span>
+                </button>
+                <button class="sync-tab-btn" id="tabBtnHistory" onclick="switchSyncSubTab('history')">
+                    <i class="fa-solid fa-clock-rotate-left"></i> Completed History <span class="tab-counter" id="badgeHistoryCount">0</span>
+                </button>
+                <button class="sync-tab-btn" id="tabBtnLogs" onclick="switchSyncSubTab('logs')">
+                    <i class="fa-solid fa-terminal"></i> Console Logs
+                </button>
             </div>
 
-            <!-- 1. Live Queue Table -->
+            <!-- 1. Live Queue Table (Dynamic Sliding Window) -->
             <div id="syncSubViewQueue">
                 <table class="sync-table">
                     <thead>
@@ -1838,6 +1872,10 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 document.getElementById('statRemaining').innerText = st.remaining_files;
                 document.getElementById('statSpeed').innerText = st.speed_str;
 
+                // Sub-tab counter badges
+                document.getElementById('badgeQueueCount').innerText = st.remaining_files || (st.queue ? st.queue.length : 0);
+                document.getElementById('badgeHistoryCount').innerText = st.history ? st.history.length : 0;
+
                 if (st.is_running && st.current_file !== 'None') {
                     document.getElementById('activeFileName').innerText = st.current_file;
                     document.getElementById('activeFilePath').innerText = st.current_path;
@@ -1862,6 +1900,15 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                             </tr>
                         `;
                     });
+                } else {
+                    if (!st.is_running && st.synced_files > 0) {
+                        qBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #81C995; padding: 24px; font-weight: 500;">
+                            <i class="fa-solid fa-circle-check" style="font-size: 20px; display: block; margin-bottom: 6px;"></i>
+                            All files have finished syncing! View completed items in the 'Completed History' tab.
+                        </td></tr>`;
+                    } else {
+                        qBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 24px;">No files currently in queue.</td></tr>`;
+                    }
                 }
 
                 const hBody = document.getElementById('syncHistoryTableBody');
