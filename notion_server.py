@@ -17,6 +17,13 @@ Features:
 
 import os
 import sys
+# Ensure UTF-8 output — prevents UnicodeEncodeError on Windows
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 import io
 import time
 import json
@@ -640,7 +647,7 @@ class BackgroundSyncRunner:
                     status_ok = False
 
             if status_ok and new_page_id:
-                # 1. Update persistent Git-style state immediately
+                # 1. Save to Git-style persistent state after every file
                 if it["is_android"]:
                     android_tracked[it["fpath"]] = {
                         "notion_id": new_page_id,
@@ -657,7 +664,10 @@ class BackgroundSyncRunner:
                     }
                 save_sync_state(state)
 
-                # 2. Update live in-memory browser cache
+                # 2. Register into live browser cache.
+                # IMPORTANT: always store ADB path (it["fpath"]) for Android files,
+                # NOT the Windows display path. The /view endpoint uses local_path
+                # directly in `adb exec-out cat <local_path>` to stream the file.
                 register_drive_cache_item(
                     new_page_id,
                     it["name"],
@@ -666,7 +676,7 @@ class BackgroundSyncRunner:
                     mb,
                     int(it["size"]),
                     parent_notion_id,
-                    it["display_path"] if it["is_android"] else it["fpath"],
+                    it["fpath"],   # ADB path for Android; Windows path for PC
                     it.get("mtime", 0)
                 )
 
@@ -680,7 +690,6 @@ class BackgroundSyncRunner:
                 })
                 if len(SYNC_STATE["history"]) > 200:
                     SYNC_STATE["history"].pop()
-
                 next_active = files_to_sync[idx] if idx < total else None
                 SYNC_STATE["queue"] = build_live_window(idx + 1, next_active, "uploading" if next_active else "synced")
 
@@ -2198,6 +2207,35 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 # HTTP SERVER ROUTING
 # ==============================================================================
 class NotionServerHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Suppress standard HTTP request logs to avoid Unicode/BrokenPipe errors
+        # on Windows when filenames contain emojis or non-Latin characters.
+        pass
+
+    def log_request(self, code='-', size='-'):
+        pass
+
+    def log_error(self, fmt, *args):
+        # Log errors but safely, stripping non-ASCII characters
+        try:
+            msg = (fmt % args) if args else str(fmt)
+            msg_safe = msg.encode('ascii', errors='replace').decode('ascii')
+            print(f"[!] Server: {msg_safe}", file=sys.stderr)
+        except Exception:
+            pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected — normal during browser tab switches
+        except UnicodeEncodeError:
+            pass  # Emoji in path — suppress silently
+        except Exception as e:
+            err_str = str(e).encode('ascii', errors='replace').decode('ascii')
+            print(f"[!] Request handler error: {err_str}", file=sys.stderr)
+
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
