@@ -56,6 +56,25 @@ DRIVE_CACHE = {
     "root_items": []
 }
 
+def enrich_cache_items():
+    for item_id, item in DRIVE_CACHE["items"].items():
+        lp = item.get("local_path", "")
+        if lp and Path(lp).exists():
+            try:
+                st = Path(lp).stat()
+                item["mtime"] = st.st_mtime
+                item["ctime"] = st.st_ctime
+                item["size_bytes"] = st.st_size
+                item["size_mb"] = round(st.st_size / (1024 * 1024), 2)
+            except Exception:
+                pass
+        if "size_bytes" not in item:
+            item["size_bytes"] = int(item.get("size_mb", 0) * 1024 * 1024)
+        if "mtime" not in item:
+            item["mtime"] = 0
+        if "ctime" not in item:
+            item["ctime"] = 0
+
 def load_disk_cache():
     if CACHE_FILE.exists():
         try:
@@ -64,6 +83,7 @@ def load_disk_cache():
                 DRIVE_CACHE["items"] = data.get("items", {})
                 DRIVE_CACHE["children"] = data.get("children", {})
                 DRIVE_CACHE["root_items"] = data.get("root_items", [])
+                enrich_cache_items()
                 print(f"[+] Loaded {len(DRIVE_CACHE['items'])} items from disk cache!")
         except Exception:
             pass
@@ -119,12 +139,33 @@ def populate_cache_from_notion():
             desc = desc_list[0].get("plain_text", "") if desc_list else ""
             local_p = desc.replace("Path: ", "").replace("Local: ", "").replace(" (Updated)", "").replace(" (Modified)", "").strip()
 
+            created_iso = it.get("created_time", "")
+            edited_iso = it.get("last_edited_time", "")
+            mtime = 0
+            ctime = 0
+            size_bytes = int(size_mb * 1024 * 1024)
+
+            if local_p and Path(local_p).exists():
+                try:
+                    stat = Path(local_p).stat()
+                    mtime = stat.st_mtime
+                    ctime = stat.st_ctime
+                    size_bytes = stat.st_size
+                    size_mb = round(size_bytes / (1024 * 1024), 2)
+                except Exception:
+                    pass
+
             cached_items[it_id] = {
                 "id": it_id,
                 "name": clean_name,
                 "type": item_type,
                 "extension": ext,
                 "size_mb": size_mb,
+                "size_bytes": size_bytes,
+                "mtime": mtime,
+                "ctime": ctime,
+                "created_time": created_iso,
+                "last_edited_time": edited_iso,
                 "parent_id": parent_id,
                 "local_path": local_p
             }
@@ -134,7 +175,6 @@ def populate_cache_from_notion():
             else:
                 root_items.append(it_id)
 
-        # Only update global cache after all pages are collected!
         DRIVE_CACHE["items"] = cached_items
         DRIVE_CACHE["children"] = children_map
         DRIVE_CACHE["root_items"] = root_items
@@ -283,12 +323,15 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         }
         .btn-sync:hover { opacity: 0.9; }
 
-        /* Breadcrumb & Sub-header */
+        /* Breadcrumb & Sub-header Toolbar */
         .content-header {
-            padding: 16px 24px 8px;
+            padding: 14px 24px 10px;
             display: flex;
             align-items: center;
             justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
         }
         .breadcrumbs {
             display: flex;
@@ -313,9 +356,79 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         .breadcrumb-item.active { color: var(--text-main); font-weight: 600; }
         .breadcrumb-sep { color: #5F6368; font-size: 12px; }
 
+        /* Toolbar Controls (Sort & View) */
+        .toolbar-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .control-pill {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            padding: 4px 10px;
+            gap: 6px;
+        }
+        .control-pill span { font-size: 13px; color: var(--text-muted); }
+        .control-pill select {
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            font-size: 13px;
+            font-weight: 500;
+            outline: none;
+            cursor: pointer;
+        }
+        .control-pill select option {
+            background: var(--bg-sidebar);
+            color: var(--text-main);
+        }
+        .btn-tool {
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            cursor: pointer;
+            padding: 4px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: color 0.15s;
+        }
+        .btn-tool:hover { color: var(--accent-blue); }
+
+        .view-switcher {
+            display: flex;
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 2px;
+        }
+        .view-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            width: 32px;
+            height: 30px;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .view-btn.active {
+            background-color: var(--bg-selected);
+            color: var(--accent-blue);
+        }
+
         .workspace-scroll {
             flex: 1;
-            padding: 12px 24px 24px;
+            padding: 16px 24px 32px;
             overflow-y: auto;
         }
 
@@ -328,9 +441,10 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             margin: 16px 0 12px;
         }
 
+        /* Grid View */
         .grid-view {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
             gap: 16px;
         }
 
@@ -357,11 +471,13 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             gap: 12px;
             padding: 14px 16px;
         }
-        .card-icon { font-size: 28px; display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 8px; }
+        .card-icon { font-size: 26px; display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 8px; }
         .card-icon.folder { color: #A8C7FA; }
         .card-icon.pdf { color: #EA4335; }
         .card-icon.image { color: #34A853; }
         .card-icon.code { color: #FBBC04; }
+        .card-icon.video { color: #A142F4; }
+        .card-icon.audio { color: #FA7B17; }
         .card-icon.other { color: #9AA0A6; }
 
         .card-title {
@@ -374,7 +490,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             margin-top: 8px;
         }
         .folder-card .card-title { margin-top: 0; }
-        .card-meta { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+        .card-meta { font-size: 12px; color: var(--text-muted); margin-top: 4px; display: flex; justify-content: space-between; }
 
         .card-actions {
             position: absolute;
@@ -397,9 +513,76 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             font-size: 12px;
             cursor: pointer;
             transition: all 0.15s;
+            text-decoration: none;
         }
         .action-btn:hover { background: var(--accent-primary); color: white; border-color: transparent; }
 
+        /* List View (Table) */
+        .list-view-container {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .drive-table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+        .drive-table th {
+            color: var(--text-muted);
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border-color);
+            cursor: pointer;
+            user-select: none;
+        }
+        .drive-table th:hover { color: var(--text-main); }
+        .drive-table th i { margin-left: 4px; font-size: 11px; }
+        .drive-table td {
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            color: var(--text-main);
+            vertical-align: middle;
+        }
+        .drive-table tbody tr {
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .drive-table tbody tr:hover {
+            background-color: var(--bg-card-hover);
+        }
+        .td-name {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 500;
+            max-width: 380px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .td-icon { font-size: 18px; width: 24px; text-align: center; }
+        .td-icon.folder { color: #A8C7FA; }
+        .td-icon.pdf { color: #EA4335; }
+        .td-icon.image { color: #34A853; }
+        .td-icon.code { color: #FBBC04; }
+        .td-icon.video { color: #A142F4; }
+        .td-icon.audio { color: #FA7B17; }
+        .td-icon.other { color: #9AA0A6; }
+
+        .td-meta { color: var(--text-muted); font-size: 12px; }
+        .table-actions {
+            display: flex;
+            gap: 6px;
+            opacity: 0;
+            transition: opacity 0.15s;
+        }
+        .drive-table tr:hover .table-actions { opacity: 1; }
+
+        /* Modal Overlay */
         .modal-overlay {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -429,7 +612,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             align-items: center;
             justify-content: space-between;
         }
-        .modal-body { flex: 1; padding: 20px; overflow-y: auto; display: flex; justify-content: center; }
+        .modal-body { flex: 1; padding: 20px; overflow-y: auto; display: flex; justify-content: center; align-items: center; }
         .modal-body iframe { width: 100%; height: 60vh; border: none; border-radius: 8px; }
         .modal-body img { max-width: 100%; max-height: 60vh; object-fit: contain; border-radius: 8px; }
     </style>
@@ -484,20 +667,72 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     <i class="fa-solid fa-hard-drive"></i> My Drive
                 </span>
             </div>
+
+            <!-- Google Drive Style Sort and View Mode Controls -->
+            <div class="toolbar-controls">
+                <div class="control-pill">
+                    <span>Sort:</span>
+                    <select id="sortSelect" onchange="changeSort(this.value)">
+                        <option value="name">Name</option>
+                        <option value="mtime">Last modified</option>
+                        <option value="ctime">Date created</option>
+                        <option value="size_bytes">File size</option>
+                        <option value="type">File type</option>
+                    </select>
+                    <button class="btn-tool" id="btnSortDir" onclick="toggleSortDir()" title="Reverse sort direction">
+                        <i class="fa-solid fa-arrow-down-short-wide" id="sortDirIcon"></i>
+                    </button>
+                </div>
+
+                <div class="view-switcher">
+                    <button class="view-btn active" id="btnViewGrid" onclick="setViewMode('grid')" title="Grid view">
+                        <i class="fa-solid fa-table-cells-large"></i>
+                    </button>
+                    <button class="view-btn" id="btnViewList" onclick="setViewMode('list')" title="List view">
+                        <i class="fa-solid fa-list-ul"></i>
+                    </button>
+                </div>
+            </div>
         </div>
 
         <div class="workspace-scroll" id="workspaceContainer">
-            <div id="foldersSection">
-                <div class="section-label">Folders</div>
-                <div class="grid-view" id="foldersGrid"></div>
+            <!-- Grid View Container -->
+            <div id="gridViewWrapper">
+                <div id="foldersSection">
+                    <div class="section-label">Folders</div>
+                    <div class="grid-view" id="foldersGrid"></div>
+                </div>
+                <div id="filesSection">
+                    <div class="section-label">Files</div>
+                    <div class="grid-view" id="filesGrid"></div>
+                </div>
             </div>
-            <div id="filesSection">
-                <div class="section-label">Files</div>
-                <div class="grid-view" id="filesGrid"></div>
+
+            <!-- List View Table Container -->
+            <div id="listViewWrapper" style="display: none;">
+                <table class="drive-table">
+                    <thead>
+                        <tr>
+                            <th onclick="tableHeaderSort('name')">Name <i id="th-icon-name" class="fa-solid fa-sort"></i></th>
+                            <th onclick="tableHeaderSort('type')">Type <i id="th-icon-type" class="fa-solid fa-sort"></i></th>
+                            <th onclick="tableHeaderSort('mtime')">Last modified <i id="th-icon-mtime" class="fa-solid fa-sort"></i></th>
+                            <th onclick="tableHeaderSort('size_bytes')">File size <i id="th-icon-size_bytes" class="fa-solid fa-sort"></i></th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="driveTableBody"></tbody>
+                </table>
+            </div>
+
+            <!-- Empty Folder Message -->
+            <div id="emptyMessage" style="display:none; color: var(--text-muted); padding: 48px 0; text-align: center; font-size: 15px;">
+                <i class="fa-regular fa-folder-open" style="font-size: 36px; margin-bottom: 12px; display: block; opacity: 0.6;"></i>
+                This folder is empty.
             </div>
         </div>
     </div>
 
+    <!-- Interactive File Preview Modal -->
     <div class="modal-overlay" id="previewModal" onclick="closeModal(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
             <div class="modal-header">
@@ -515,12 +750,122 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
     <script>
         let currentFolderId = null;
         let driveData = { folders: [], files: [], breadcrumbs: [] };
+        let viewMode = localStorage.getItem('notion_drive_view_mode') || 'grid';
+        let sortBy = localStorage.getItem('notion_drive_sort_by') || 'name';
+        let sortDir = localStorage.getItem('notion_drive_sort_dir') || 'asc';
+
+        // Helpers
+        function formatBytes(bytes) {
+            if (!bytes || bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function formatDate(timestamp) {
+            if (!timestamp) return '--';
+            const date = new Date(timestamp * 1000 || timestamp);
+            if (isNaN(date.getTime())) return '--';
+            const now = new Date();
+            const isToday = date.toDateString() === now.toDateString();
+            const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            if (isToday) return `Today, ${timeStr}`;
+            return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' }) + `, ${timeStr}`;
+        }
+
+        function getFileIcon(ext) {
+            ext = (ext || '').toLowerCase();
+            if (ext === '.pdf') return { cls: 'fa-file-pdf', type: 'pdf' };
+            if (['.jpg','.png','.jpeg','.webp','.svg','.gif','.ico','.bmp'].includes(ext)) return { cls: 'fa-file-image', type: 'image' };
+            if (['.py','.js','.ts','.html','.json','.yaml','.yml','.sql','.c','.cpp','.java','.css','.sh','.bat'].includes(ext)) return { cls: 'fa-file-code', type: 'code' };
+            if (['.mp4','.mkv','.webm','.mov','.avi'].includes(ext)) return { cls: 'fa-file-video', type: 'video' };
+            if (['.mp3','.wav','.ogg','.m4a','.flac'].includes(ext)) return { cls: 'fa-file-audio', type: 'audio' };
+            return { cls: 'fa-file', type: 'other' };
+        }
+
+        function setViewMode(mode) {
+            viewMode = mode;
+            localStorage.setItem('notion_drive_view_mode', mode);
+            document.getElementById('btnViewGrid').classList.toggle('active', mode === 'grid');
+            document.getElementById('btnViewList').classList.toggle('active', mode === 'list');
+            document.getElementById('gridViewWrapper').style.display = mode === 'grid' ? 'block' : 'none';
+            document.getElementById('listViewWrapper').style.display = mode === 'list' ? 'block' : 'none';
+            renderView();
+        }
+
+        function changeSort(field) {
+            sortBy = field;
+            localStorage.setItem('notion_drive_sort_by', field);
+            document.getElementById('sortSelect').value = field;
+            sortItems();
+            renderView();
+            updateSortHeaders();
+        }
+
+        function toggleSortDir() {
+            sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+            localStorage.setItem('notion_drive_sort_dir', sortDir);
+            updateSortDirIcon();
+            sortItems();
+            renderView();
+            updateSortHeaders();
+        }
+
+        function tableHeaderSort(field) {
+            if (sortBy === field) {
+                toggleSortDir();
+            } else {
+                sortDir = 'asc';
+                changeSort(field);
+            }
+        }
+
+        function updateSortDirIcon() {
+            const icon = document.getElementById('sortDirIcon');
+            icon.className = sortDir === 'asc' ? 'fa-solid fa-arrow-down-short-wide' : 'fa-solid fa-arrow-up-wide-short';
+        }
+
+        function updateSortHeaders() {
+            ['name', 'type', 'mtime', 'size_bytes'].forEach(col => {
+                const icon = document.getElementById(`th-icon-${col}`);
+                if (!icon) return;
+                if (sortBy === col) {
+                    icon.className = sortDir === 'asc' ? 'fa-solid fa-arrow-up' : 'fa-solid fa-arrow-down';
+                    icon.style.color = 'var(--accent-blue)';
+                } else {
+                    icon.className = 'fa-solid fa-sort';
+                    icon.style.color = 'var(--text-muted)';
+                }
+            });
+        }
+
+        function sortItems() {
+            const comparator = (a, b) => {
+                let valA = a[sortBy];
+                let valB = b[sortBy];
+
+                if (sortBy === 'name' || sortBy === 'type') {
+                    valA = (valA || '').toString().toLowerCase();
+                    valB = (valB || '').toString().toLowerCase();
+                    return sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                } else {
+                    valA = Number(valA) || 0;
+                    valB = Number(valB) || 0;
+                    return sortDir === 'asc' ? valA - valB : valB - valA;
+                }
+            };
+
+            driveData.folders.sort(comparator);
+            driveData.files.sort(comparator);
+        }
 
         async function fetchDrive(folderId = null) {
             currentFolderId = folderId;
             const url = folderId ? `/api/drive?folder_id=${encodeURIComponent(folderId)}` : '/api/drive';
             const res = await fetch(url);
             driveData = await res.json();
+            sortItems();
             renderView();
             updateBreadcrumbs();
             fetchStorageStats();
@@ -540,62 +885,110 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             const fileGrid = document.getElementById('filesGrid');
             const fSec = document.getElementById('foldersSection');
             const fileSec = document.getElementById('filesSection');
+            const tableBody = document.getElementById('driveTableBody');
+            const emptyMsg = document.getElementById('emptyMessage');
 
             fGrid.innerHTML = '';
             fileGrid.innerHTML = '';
+            tableBody.innerHTML = '';
 
-            fSec.style.display = driveData.folders.length ? 'block' : 'none';
-            fileSec.style.display = driveData.files.length ? 'block' : 'none';
+            const hasItems = driveData.folders.length > 0 || driveData.files.length > 0;
+            emptyMsg.style.display = hasItems ? 'none' : 'block';
 
-            if (!driveData.folders.length && !driveData.files.length) {
-                fileGrid.innerHTML = '<div style="color: var(--text-muted); padding: 40px 0; font-size: 15px;">📁 This folder is empty.</div>';
-                fileSec.style.display = 'block';
-                return;
+            if (viewMode === 'grid') {
+                fSec.style.display = driveData.folders.length ? 'block' : 'none';
+                fileSec.style.display = driveData.files.length ? 'block' : 'none';
+
+                driveData.folders.forEach(f => {
+                    const card = document.createElement('div');
+                    card.className = 'grid-card folder-card';
+                    card.onclick = () => fetchDrive(f.id);
+                    card.innerHTML = `
+                        <div class="card-icon folder"><i class="fa-solid fa-folder"></i></div>
+                        <div style="flex:1; overflow:hidden;">
+                            <div class="card-title" title="${f.name}">${f.name}</div>
+                            <div class="card-meta">
+                                <span>${f.item_count || 0} items</span>
+                                <span>${formatDate(f.mtime)}</span>
+                            </div>
+                        </div>
+                        <div class="card-actions" onclick="event.stopPropagation()">
+                            <a class="action-btn" title="Download Folder ZIP" href="/download_folder?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
+                        </div>
+                    `;
+                    fGrid.appendChild(card);
+                });
+
+                driveData.files.forEach(f => {
+                    const card = document.createElement('div');
+                    card.className = 'grid-card';
+                    card.onclick = () => previewFile(f);
+
+                    const icon = getFileIcon(f.extension);
+                    card.innerHTML = `
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div class="card-icon ${icon.type}"><i class="fa-solid ${icon.cls}"></i></div>
+                        </div>
+                        <div class="card-title" title="${f.name}">${f.name}</div>
+                        <div class="card-meta">
+                            <span>${formatBytes(f.size_bytes || f.size_mb * 1024 * 1024)}</span>
+                            <span>${formatDate(f.mtime)}</span>
+                        </div>
+                        <div class="card-actions" onclick="event.stopPropagation()">
+                            <a class="action-btn" title="Download File" href="/download?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
+                            <a class="action-btn" title="Open in New Tab" href="/view?path=${encodeURIComponent(f.local_path)}" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                        </div>
+                    `;
+                    fileGrid.appendChild(card);
+                });
+            } else {
+                // Render List View (Table)
+                driveData.folders.forEach(f => {
+                    const tr = document.createElement('tr');
+                    tr.onclick = () => fetchDrive(f.id);
+                    tr.innerHTML = `
+                        <td>
+                            <div class="td-name">
+                                <i class="fa-solid fa-folder td-icon folder"></i>
+                                <span title="${f.name}">${f.name}</span>
+                            </div>
+                        </td>
+                        <td class="td-meta">Folder</td>
+                        <td class="td-meta">${formatDate(f.mtime)}</td>
+                        <td class="td-meta">${f.item_count || 0} items</td>
+                        <td onclick="event.stopPropagation()">
+                            <div class="table-actions">
+                                <a class="action-btn" title="Download Folder ZIP" href="/download_folder?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
+                            </div>
+                        </td>
+                    `;
+                    tableBody.appendChild(tr);
+                });
+
+                driveData.files.forEach(f => {
+                    const tr = document.createElement('tr');
+                    tr.onclick = () => previewFile(f);
+                    const icon = getFileIcon(f.extension);
+                    tr.innerHTML = `
+                        <td>
+                            <div class="td-name">
+                                <i class="fa-solid ${icon.cls} td-icon ${icon.type}"></i>
+                                <span title="${f.name}">${f.name}</span>
+                            </div>
+                        </td>
+                        <td class="td-meta">${(f.extension || 'File').toUpperCase().replace('.', '')}</td>
+                        <td class="td-meta">${formatDate(f.mtime)}</td>
+                        <td class="td-meta">${formatBytes(f.size_bytes || f.size_mb * 1024 * 1024)}</td>
+                        <td onclick="event.stopPropagation()">
+                            <div class="table-actions">
+                                <a class="action-btn" title="Download File" href="/download?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
+                                <a class="action-btn" title="Open in New Tab" href="/view?path=${encodeURIComponent(f.local_path)}" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                            </div>
+                        </td>
+                    `;
+                    tableBody.appendChild(tr);
+                });
             }
-
-            driveData.folders.forEach(f => {
-                const card = document.createElement('div');
-                card.className = 'grid-card folder-card';
-                card.onclick = () => fetchDrive(f.id);
-                card.innerHTML = `
-                    <div class="card-icon folder"><i class="fa-solid fa-folder"></i></div>
-                    <div style="flex:1; overflow:hidden;">
-                        <div class="card-title">${f.name}</div>
-                        <div class="card-meta">${f.item_count || 0} items</div>
-                    </div>
-                    <div class="card-actions" onclick="event.stopPropagation()">
-                        <a class="action-btn" title="Download Folder ZIP" href="/download_folder?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
-                    </div>
-                `;
-                fGrid.appendChild(card);
-            });
-
-            driveData.files.forEach(f => {
-                const card = document.createElement('div');
-                card.className = 'grid-card';
-                card.onclick = () => previewFile(f);
-
-                let iconClass = 'fa-file other';
-                let iconType = 'other';
-                const ext = (f.extension || '').toLowerCase();
-
-                if (ext === '.pdf') { iconClass = 'fa-file-pdf'; iconType = 'pdf'; }
-                else if (['.jpg','.png','.jpeg','.webp','.svg'].includes(ext)) { iconClass = 'fa-file-image'; iconType = 'image'; }
-                else if (['.py','.js','.ts','.html','.json','.yaml','.sql'].includes(ext)) { iconClass = 'fa-file-code'; iconType = 'code'; }
-
-                card.innerHTML = `
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div class="card-icon ${iconType}"><i class="fa-solid ${iconClass}"></i></div>
-                    </div>
-                    <div class="card-title" title="${f.name}">${f.name}</div>
-                    <div class="card-meta">${f.size_mb || 0} MB • ${f.type || 'File'}</div>
-                    <div class="card-actions" onclick="event.stopPropagation()">
-                        <a class="action-btn" title="Download File" href="/download?path=${encodeURIComponent(f.local_path)}"><i class="fa-solid fa-download"></i></a>
-                        <a class="action-btn" title="Open in Edge Tab" href="/view?path=${encodeURIComponent(f.local_path)}" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
-                    </div>
-                `;
-                fileGrid.appendChild(card);
-            });
         }
 
         function updateBreadcrumbs() {
@@ -634,7 +1027,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 
             if (ext === '.pdf') {
                 body.innerHTML = `<iframe src="${viewUrl}" style="width:100%; height:75vh; border:none; border-radius:8px;"></iframe>`;
-            } else if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.ico'].includes(ext)) {
+            } else if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.ico', '.bmp'].includes(ext)) {
                 body.innerHTML = `<img src="${viewUrl}" alt="${f.name}" style="max-width:100%; max-height:75vh; object-fit:contain; border-radius:8px;">`;
             } else if (['.mp4', '.webm', '.mkv'].includes(ext)) {
                 body.innerHTML = `<video controls autoplay src="${viewUrl}" style="max-width:100%; max-height:75vh; border-radius:8px;"></video>`;
@@ -660,6 +1053,7 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             if (!query) { fetchDrive(currentFolderId); return; }
             const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
             driveData = await res.json();
+            sortItems();
             renderView();
         }
 
@@ -671,6 +1065,11 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
             btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Sync Notion';
         }
 
+        // Init
+        document.getElementById('sortSelect').value = sortBy;
+        updateSortDirIcon();
+        updateSortHeaders();
+        setViewMode(viewMode);
         fetchDrive();
     </script>
 </body>
