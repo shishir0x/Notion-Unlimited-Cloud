@@ -638,12 +638,13 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         <div class="storage-card">
             <div class="storage-title">
                 <span>Storage</span>
-                <span id="storage-percent">0%</span>
+                <span style="background: rgba(168,199,250,0.15); color: #A8C7FA; padding: 2px 8px; border-radius: 12px; font-weight: 600; font-size: 11px;"><i class="fa-solid fa-infinity"></i> Unlimited</span>
             </div>
-            <div class="storage-bar-bg">
-                <div class="storage-bar-fill" id="storage-bar"></div>
+            <div class="storage-bar-bg" style="background: rgba(255,255,255,0.08);">
+                <div class="storage-bar-fill" style="width: 100%; background: linear-gradient(90deg, #1A73E8, #34A853);"></div>
             </div>
-            <div class="storage-text" id="storage-detail">Loading storage...</div>
+            <div class="storage-text" id="storage-detail" style="font-weight: 500; font-size: 12px;">Loading storage...</div>
+            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;"><i class="fa-solid fa-graduation-cap"></i> Student / Plus Unlimited Plan</div>
         </div>
     </div>
 
@@ -874,10 +875,9 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         async function fetchStorageStats() {
             const res = await fetch('/api/stats');
             const stats = await res.json();
-            document.getElementById('storage-detail').innerText = `${stats.total_mb} MB of 100 GB used (${stats.total_files} files)`;
-            const pct = Math.min(100, Math.round((stats.total_mb / (100 * 1024)) * 100));
-            document.getElementById('storage-percent').innerText = `${pct}%`;
-            document.getElementById('storage-bar').style.width = `${Math.max(5, pct)}%`;
+            const usedStr = formatBytes(stats.total_mb * 1024 * 1024);
+            const filesStr = (stats.total_files || 0).toLocaleString();
+            document.getElementById('storage-detail').innerText = `${usedStr} Used (${filesStr} files)`;
         }
 
         function renderView() {
