@@ -76,11 +76,20 @@ EMOJI_MAP = {
 
 SYSTEM_CRITICAL_IGNORE = {
     "appdata", "application data", "local settings", "$recycle.bin", "system volume information",
-    "__pycache__", "node_modules", ".gemini"
+    "__pycache__", "node_modules", ".gemini", ".git", "extensions", ".cache", ".gradle",
+    ".m2", ".npm", ".rustup", ".cargo", ".nuget", ".venv", "venv", "env", "site-packages",
+    "dist-info", ".android", ".jdks", ".antigravity", "crossdevice", "scoop", "microsoft",
+    "saved games", "searches", "contacts", "links", "favorites", ".bun", ".cline", ".config",
+    ".copilot", ".dotnet", ".expo", ".installer", ".ipython", ".lmstudio", ".local",
+    ".sbx-denybin", ".semantic_search", ".ssh", ".virtualbox", ".vscode-shared", "onedrive",
+    ".notion drive"
 }
 
-IGNORED_FILE_PREFIXES = ("ntuser.dat", "ntuser.rhk", "desktop.ini", "~$", "sti_trace.log")
-IGNORED_FILE_EXTENSIONS = {".tmp", ".log", ".blf", ".regtrans-ms", ".dat", ".search-ms"}
+IGNORED_FILE_PREFIXES = ("ntuser.dat", "ntuser.rhk", "desktop.ini", "~$", "sti_trace.log", "2026-", "_viminfo", ".notion_")
+IGNORED_FILE_EXTENSIONS = {
+    ".tmp", ".log", ".blf", ".regtrans-ms", ".dat", ".search-ms", ".lock", ".dll",
+    ".pyd", ".pyc", ".pyo", ".idx", ".pack", ".sys", ".lnk", ".url", ".exe", ".iso"
+}
 
 
 # ==============================================================================
@@ -93,19 +102,25 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
-        file_path_str = params.get("path", [None])[0]
+        file_path_str = (params.get("path", [None])[0] or 
+                         params.get("file", [None])[0] or 
+                         params.get("p", [None])[0] or 
+                         params.get("url", [None])[0] or 
+                         params.get("target", [None])[0])
 
         if not file_path_str:
-            self.send_response(400)
+            self.send_response(302)
+            self.send_header("Location", "/")
             self.end_headers()
-            self.wfile.write(b"Missing 'path' parameter.")
             return
 
-        target_path = Path(urllib.parse.unquote(file_path_str)).resolve()
+        clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
+        target_path = Path(clean_path_str).resolve()
         if not target_path.exists():
             self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(f"File not found: {target_path}".encode("utf-8"))
+            self.wfile.write(b"<h3>File not found on local drive.</h3>")
             return
 
         # Route 1: View in Edge Tab
@@ -231,17 +246,34 @@ class NotionGitSyncEngine:
         start_background_file_server(LOCAL_SERVER_PORT)
 
     def load_state(self) -> Dict[str, Any]:
-        if STATE_FILE.exists():
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return {"files": {}, "folders": {}}
+        state_paths = [
+            STATE_FILE,
+            Path(__file__).parent / ".notion_sync_state.json",
+            Path.home() / ".notion_sync_state.json"
+        ]
+        for sp in state_paths:
+            if sp.exists():
+                try:
+                    with open(sp, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if data.get("files"):
+                            return data
+                except Exception:
+                    pass
         return {"files": {}, "folders": {}}
 
     def save_state(self):
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, indent=2)
+        state_paths = [
+            STATE_FILE,
+            Path(__file__).parent / ".notion_sync_state.json",
+            Path.home() / ".notion_sync_state.json"
+        ]
+        for sp in state_paths:
+            try:
+                with open(sp, "w", encoding="utf-8") as f:
+                    json.dump(self.state, f, indent=2)
+            except Exception:
+                pass
 
     def should_ignore(self, path: Path) -> bool:
         parts = [p.lower() for p in path.parts]

@@ -783,16 +783,35 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"status":"ok"}')
             return
 
-        file_path_str = params.get("path", [None])[0]
+        # Extract file path from various parameter names (path, file, p, url, target)
+        file_path_str = (params.get("path", [None])[0] or 
+                         params.get("file", [None])[0] or 
+                         params.get("p", [None])[0] or 
+                         params.get("url", [None])[0] or 
+                         params.get("target", [None])[0])
+
         if not file_path_str:
-            self.send_response(400)
+            # If no path parameter provided, redirect gracefully to Web GUI
+            self.send_response(302)
+            self.send_header("Location", "/")
             self.end_headers()
             return
 
-        target_path = Path(urllib.parse.unquote(file_path_str)).resolve()
+        # Clean parameter
+        clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
+        target_path = Path(clean_path_str).resolve()
+
         if not target_path.exists():
+            # Show friendly 404 page with drive link
             self.send_response(404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
+            err_html = f"""<!DOCTYPE html><html><head><title>File Not Found</title>
+            <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
+            .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
+            a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
+            <body><div class="box"><h2>📄 File Not Found</h2><p style="color:#9E9E9E;word-break:break-all;">{html.escape(str(target_path))}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
+            self.wfile.write(err_html.encode("utf-8"))
             return
 
         if parsed.path == "/download":
@@ -835,7 +854,7 @@ class NotionFileServerHandler(BaseHTTPRequestHandler):
                 self.wfile.write(zip_data)
                 return
 
-        if parsed.path == "/view":
+        if parsed.path in ["/view", "/open"]:
             if target_path.suffix.lower() == ".pdf":
                 try:
                     with open(target_path, "rb") as f:
