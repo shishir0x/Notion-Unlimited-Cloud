@@ -1768,18 +1768,15 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                     <div class="sync-title-area">
                         <div class="sync-pulse-dot" id="syncPulseDot"></div>
                         <div>
-                            <h2 style="font-size: 18px; font-weight: 600;" id="syncMainStatus">Git-Style Differential Sync</h2>
-                            <div style="font-size: 12px; color: var(--text-muted);" id="syncSubStatus">Tracks .notion_sync_state.json • Skips unchanged files automatically</div>
+                            <h2 style="font-size: 18px; font-weight: 600;" id="syncMainStatus">Live Terminal Sync Activity</h2>
+                            <div style="font-size: 12px; color: var(--text-muted);" id="syncSubStatus">Run <code>Notion_Sync.bat</code> or <code>python notion_sync.py</code> in terminal • Live progress mirrors here automatically</div>
                         </div>
                     </div>
 
                     <div class="sync-controls-row">
-                        <button class="btn-sync-action primary" onclick="startSync('all')"><i class="fa-solid fa-bolt"></i> Sync All</button>
-                        <button class="btn-sync-action" onclick="startSync('c')"><i class="fa-solid fa-hard-drive"></i> PC (C:)</button>
-                        <button class="btn-sync-action" onclick="startSync('d')"><i class="fa-solid fa-hard-drive"></i> PC (D:)</button>
-                        <button class="btn-sync-action" onclick="startSync('phone')"><i class="fa-solid fa-mobile-screen"></i> Phone</button>
-                        <button class="btn-sync-action" onclick="startSync('sdcard')"><i class="fa-solid fa-sd-card"></i> SD Card</button>
-                        <button class="btn-sync-action danger" onclick="cancelSync()"><i class="fa-solid fa-stop"></i> Stop</button>
+                        <span style="font-size: 12px; color: #A8C7FA; background: rgba(168,199,250,0.1); padding: 6px 14px; border-radius: 20px; border: 1px solid rgba(168,199,250,0.2); display: flex; align-items: center; gap: 8px;">
+                            <i class="fa-solid fa-terminal"></i> Terminal Sync Monitor
+                        </span>
                     </div>
                 </div>
 
@@ -1818,8 +1815,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
                 <div class="active-file-card" id="activeFileBox">
                     <i class="fa-solid fa-cloud-arrow-up fa-fade"></i>
                     <div class="active-file-details">
-                        <div class="active-file-name" id="activeFileName">Waiting for sync to start...</div>
-                        <div class="active-file-path" id="activeFilePath">Persistent state loaded. Click a sync button above to calculate differential changes.</div>
+                        <div class="active-file-name" id="activeFileName">Waiting for terminal sync to start...</div>
+                        <div class="active-file-path" id="activeFilePath">Run Notion_Sync.bat or python notion_sync.py in your terminal. Live sync progress and files will stream here in real-time.</div>
                     </div>
                     <div id="activeFileSize" style="font-weight: 600; font-size: 13px; color: var(--accent-blue);">-</div>
                 </div>
@@ -2196,27 +2193,8 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
         }
 
         // =====================================================================
-        // SYNC CENTER LOGIC & REAL-TIME POLLING
+        // SYNC CENTER LOGIC & REAL-TIME POLLING (DRIVEN BY TERMINAL CLI)
         // =====================================================================
-        async function startSync(target) {
-            try {
-                const res = await fetch(`/api/sync/start?target=${target}`, { method: 'POST' });
-                const d = await res.json();
-                switchMainTab('sync');
-                pollSyncStatus();
-            } catch (e) {
-                alert("Error starting sync: " + e);
-            }
-        }
-
-        async function cancelSync() {
-            try {
-                await fetch('/api/sync/cancel', { method: 'POST' });
-            } catch (e) {
-                console.error(e);
-            }
-        }
-
         async function pollSyncStatus() {
             try {
                 const res = await fetch('/api/sync/status');
