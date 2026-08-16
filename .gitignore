@@ -12,7 +12,23 @@ __pycache__/
 .env
 .env.local
 
+# Database & SQLite files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Node & Next.js
+node_modules/
+.next/
+notion-drive-app/node_modules/
+notion-drive-app/.next/
+notion-drive-app/notion_drive.db
+notion-drive-app/notion_drive.db-*
+
 # Operating System Files
 desktop.ini
 Thumbs.db
 .DS_Store
+

@@ -7,12 +7,108 @@ never has to deal with raw requests, pagination, or retry logic.
 
 import json
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 
 from core.config import NOTION_VERSION
+
+
+class NotionRateLimiter:
+    """
+    Centralized rate limiter for Notion API calls.
+    
+    Implements:
+    - Token bucket algorithm for smooth rate limiting
+    - Exponential backoff on 429 responses
+    - Request deduplication
+    - Concurrency control
+    """
+    
+    def __init__(self, rate: float = 1.0, burst: int = 3):
+        """
+        Args:
+            rate: Requests per second (default 1.0 = 1 req/sec)
+            burst: Max burst size (allows short bursts up to this many requests)
+        """
+        self.rate = rate
+        self.burst = burst
+        self.tokens = burst
+        self.last_update = time.time()
+        self._lock = threading.Lock()
+        self._pending_429: Dict[str, float] = {}  # url -> retry_after timestamp
+        self._global_backoff = 0.0
+        self._request_count = 0
+        self._success_count = 0
+        self._fail_count = 0
+        self._rate_limit_count = 0
+    
+    def _refill_tokens(self):
+        """Refill tokens based on elapsed time."""
+        now = time.time()
+        elapsed = now - self.last_update
+        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+        self.last_update = now
+    
+    def acquire(self, url: str) -> bool:
+        """
+        Acquire permission to make a request.
+        Returns True if allowed, False if rate limited.
+        """
+        with self._lock:
+            # Check if we're in global backoff
+            if self._global_backoff > 0:
+                if time.time() < self._global_backoff:
+                    return False
+                self._global_backoff = 0.0
+            
+            # Check pending 429s
+            if url in self._pending_429:
+                retry_after = self._pending_429[url]
+                if time.time() < retry_after:
+                    return False
+                del self._pending_429[url]
+            
+            self._refill_tokens()
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                self._request_count += 1
+                return True
+            return False
+    
+    def record_success(self):
+        """Record a successful request."""
+        with self._lock:
+            self._success_count += 1
+    
+    def record_failure(self, is_rate_limit: bool = False, retry_after: Optional[float] = None, url: Optional[str] = None):
+        """Record a failed request."""
+        with self._lock:
+            self._fail_count += 1
+            if is_rate_limit:
+                self._rate_limit_count += 1
+                # Exponential backoff: 2s, 4s, 8s, 16s, max 60s
+                backoff = min(60.0, 2.0 ** min(5, self._rate_limit_count))
+                self._global_backoff = time.time() + backoff
+                
+                if retry_after and url:
+                    self._pending_429[url] = time.time() + retry_after
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get rate limiter statistics."""
+        with self._lock:
+            return {
+                "total_requests": self._request_count,
+                "successes": self._success_count,
+                "failures": self._fail_count,
+                "rate_limits": self._rate_limit_count,
+            }
+
+
+# Global rate limiter instance
+_rate_limiter = NotionRateLimiter(rate=1.0, burst=3)
 
 
 class NotionAPI:
@@ -28,35 +124,82 @@ class NotionAPI:
         # In-memory cache: (folder_name, parent_notion_id) → notion_page_id
         # parent_notion_id is None for root-level folders.
         self._folder_cache: Dict[Tuple[str, Optional[str]], str] = {}
+        self._request_cache: Dict[str, Tuple[Any, float]] = {}  # url -> (response, timestamp)
+        self._cache_ttl = 5.0  # Cache responses for 5 seconds
 
     # ──────────────────────────────────────────────────────────────────────────
     # Low-level helpers
     # ──────────────────────────────────────────────────────────────────────────
 
     def _post(self, url: str, payload: Dict) -> Optional[Dict]:
-        """POST with simple retry (network blips are common during large syncs)."""
+        """POST with rate limiting, retry, and caching."""
+        # Check cache first
+        cache_key = f"POST:{url}:{json.dumps(payload, sort_keys=True)}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+        
         for attempt in range(3):
             try:
+                # Wait for rate limiter
+                while not _rate_limiter.acquire(url):
+                    time.sleep(0.5)
+                
                 r = requests.post(url, headers=self.headers, json=payload, timeout=25)
-                if r.status_code == 429:           # rate-limited
-                    time.sleep(float(r.headers.get("Retry-After", 2)))
+                
+                if r.status_code == 429:  # rate-limited
+                    retry_after = float(r.headers.get("Retry-After", 2))
+                    _rate_limiter.record_failure(is_rate_limit=True, retry_after=retry_after, url=url)
+                    time.sleep(retry_after)
                     continue
-                return r.json() if r.ok else None
+                
+                _rate_limiter.record_success()
+                result = r.json() if r.ok else None
+                self._set_cached(cache_key, result)
+                return result
             except requests.RequestException:
+                _rate_limiter.record_failure()
                 time.sleep(1.5 * (attempt + 1))
         return None
 
     def _patch(self, url: str, payload: Dict) -> Optional[Dict]:
+        """PATCH with rate limiting and retry."""
         for attempt in range(3):
             try:
+                while not _rate_limiter.acquire(url):
+                    time.sleep(0.5)
+                
                 r = requests.patch(url, headers=self.headers, json=payload, timeout=25)
+                
                 if r.status_code == 429:
-                    time.sleep(float(r.headers.get("Retry-After", 2)))
+                    retry_after = float(r.headers.get("Retry-After", 2))
+                    _rate_limiter.record_failure(is_rate_limit=True, retry_after=retry_after, url=url)
+                    time.sleep(retry_after)
                     continue
+                
+                _rate_limiter.record_success()
                 return r.json() if r.ok else None
             except requests.RequestException:
+                _rate_limiter.record_failure()
                 time.sleep(1.5 * (attempt + 1))
         return None
+    
+    def _get_cached(self, key: str) -> Optional[Any]:
+        """Get cached response if not expired."""
+        if key in self._request_cache:
+            result, timestamp = self._request_cache[key]
+            if time.time() - timestamp < self._cache_ttl:
+                return result
+            del self._request_cache[key]
+        return None
+    
+    def _set_cached(self, key: str, value: Any):
+        """Cache a response."""
+        self._request_cache[key] = (value, time.time())
+        # Limit cache size
+        if len(self._request_cache) > 1000:
+            oldest = min(self._request_cache.items(), key=lambda x: x[1][1])
+            del self._request_cache[oldest[0]]
 
     # ──────────────────────────────────────────────────────────────────────────
     # Database queries
@@ -209,6 +352,25 @@ class NotionAPI:
         cache_key = (name, parent_id)
         if cache_key in self._folder_cache:
             return self._folder_cache[cache_key]
+
+        # Double-check Notion database before creating to prevent duplicate folder creation
+        try:
+            filter_payload = {
+                "and": [
+                    {"property": "Name", "title": {"equals": name}},
+                    {"property": "Type", "select": {"equals": "Folder"}},
+                ]
+            }
+            for existing in self.query_all(filter_payload):
+                props = existing.get("properties", {})
+                parents = props.get("Parent Folder", {}).get("relation", [])
+                existing_pid = parents[0]["id"].replace("-", "") if parents else None
+                if existing_pid == parent_id or (not existing_pid and not parent_id):
+                    ex_id = existing["id"].replace("-", "")
+                    self._folder_cache[cache_key] = ex_id
+                    return ex_id
+        except Exception:
+            pass
 
         props: Dict[str, Any] = {
             "Name": {"title": [{"text": {"content": name}}]},

@@ -79,7 +79,13 @@ def start_web_server(port: int = None) -> bool:
         # Load disk cache first (populates from Notion if needed)
         if hasattr(notion_server, "load_disk_cache"):
             notion_server.load_disk_cache()
-        # Use the correct handler class name from notion_server.py
+        if hasattr(notion_server, "_load_recent_files"):
+            notion_server._load_recent_files()
+        if hasattr(notion_server, "_build_allowed_roots"):
+            notion_server._build_allowed_roots()
+        if hasattr(notion_server, "start_notion_watcher"):
+            notion_server.start_notion_watcher()
+            
         handler_cls = getattr(
             notion_server,
             "NotionServerHandler",        # current name
@@ -88,7 +94,8 @@ def start_web_server(port: int = None) -> bool:
         if handler_cls is None:
             raise AttributeError("Cannot find request handler class in notion_server.py")
         srv = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        srv.daemon_threads = True
+        t = threading.Thread(target=srv.serve_forever, daemon=True, name="WebDriveServer")
         t.start()
         global _server_instance
         _server_instance = srv

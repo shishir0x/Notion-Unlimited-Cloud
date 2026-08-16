@@ -38,9 +38,18 @@ import html
 import threading
 import subprocess
 import requests
+import logging
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Any, List
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("notion_server")
 
 if sys.platform.startswith("win"):
     try:
@@ -69,6 +78,7 @@ def _load_env_credentials():
 _load_env_credentials()
 
 from core import config
+from core import filters as F
 
 PORT = int(os.environ.get("PORT", config.LOCAL_SERVER_PORT))
 NOTION_VERSION = config.NOTION_VERSION
@@ -119,10 +129,61 @@ DRIVE_CACHE = {
 }
 CACHE_LOCK = threading.RLock()
 
+# ── Recent Files Ring Buffer ──────────────────────────────────────────────────
+RECENT_FILES: List[Dict[str, Any]] = []  # max 100 entries, newest first
+RECENT_LOCK = threading.Lock()
+RECENT_FILE_PATH = Path.home() / ".notion_recent.json"
+
+def _load_recent_files():
+    global RECENT_FILES
+    try:
+        if RECENT_FILE_PATH.exists():
+            with open(RECENT_FILE_PATH, "r", encoding="utf-8") as f:
+                RECENT_FILES = json.load(f)
+    except Exception:
+        RECENT_FILES = []
+
+def _save_recent_files():
+    try:
+        with open(RECENT_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(RECENT_FILES[:100], f)
+    except Exception:
+        pass
+
+def _push_recent(item: dict):
+    """Add a file to the recent ring buffer; dedup by id."""
+    with RECENT_LOCK:
+        global RECENT_FILES
+        RECENT_FILES = [r for r in RECENT_FILES if r.get("id") != item.get("id")]
+        RECENT_FILES.insert(0, item)
+        if len(RECENT_FILES) > 100:
+            RECENT_FILES.pop()
+        _save_recent_files()
+
+# ── SSE Event Queue ───────────────────────────────────────────────────────────
+import queue as _queue
+_SSE_CLIENTS: List[_queue.SimpleQueue] = []
+_SSE_LOCK = threading.Lock()
+
+def _broadcast_sse(event_type: str, data: dict):
+    """Push a server-sent event to all subscribed clients."""
+    msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    with _SSE_LOCK:
+        dead = []
+        for q in _SSE_CLIENTS:
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            _SSE_CLIENTS.remove(q)
+
 def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0):
-    """Instantly registers a file or folder in the in-memory cache and bumps version so browser GUI live updates."""
+    """Instantly registers a file or folder in the in-memory cache AND SQLite index, bumps version for live updates."""
+    is_new = False
     with CACHE_LOCK:
         existing = DRIVE_CACHE["items"].get(item_id)
+        is_new = existing is None
         if existing:
             old_parent = existing.get("parent_id")
             if old_parent != parent_id:
@@ -134,7 +195,7 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
                     if item_id in DRIVE_CACHE["root_items"]:
                         DRIVE_CACHE["root_items"].remove(item_id)
 
-        DRIVE_CACHE["items"][item_id] = {
+        entry = {
             "id": item_id,
             "name": name,
             "type": item_type,
@@ -148,6 +209,7 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
             "parent_id": parent_id,
             "local_path": local_path
         }
+        DRIVE_CACHE["items"][item_id] = entry
         if parent_id:
             children_list = DRIVE_CACHE["children"].setdefault(parent_id, [])
             if item_id not in children_list:
@@ -156,6 +218,78 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
             if item_id not in DRIVE_CACHE["root_items"]:
                 DRIVE_CACHE["root_items"].append(item_id)
         DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+
+    # Track recents (files only)
+    if item_type == "File":
+        _push_recent({
+            "id": item_id, "name": name, "extension": ext,
+            "size_mb": size_mb, "size_bytes": size_bytes,
+            "mtime": mtime or time.time(), "parent_id": parent_id,
+            "local_path": local_path, "type": item_type
+        })
+
+    # Update SQLite index asynchronously (non-blocking)
+    def _update_index():
+        try:
+            from core.local_index import upsert_item
+            index_entry = {
+                'id': item_id,
+                'name': name,
+                'type': item_type,
+                'extension': ext,
+                'size_mb': size_mb,
+                'size_bytes': size_bytes,
+                'mtime': mtime or time.time(),
+                'ctime': mtime or time.time(),
+                'created_time': time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                'last_edited_time': time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                'parent_id': parent_id,
+                'local_path': local_path,
+                'storage_root': 'Notion Cloud',
+                'notion_id': item_id,
+                'sync_status': 'synced',
+                'last_seen': time.time()
+            }
+            upsert_item(index_entry)
+        except Exception as e:
+            logger.debug(f"Index update skipped: {e}")
+    
+    t = threading.Thread(target=_update_index, daemon=True)
+    t.start()
+
+    # Broadcast SSE
+    _broadcast_sse("file_added" if is_new else "file_updated", {
+        "id": item_id, "name": name, "type": item_type,
+        "parent_id": parent_id, "version": DRIVE_CACHE.get("version", 0)
+    })
+
+
+# ── Path Safety ───────────────────────────────────────────────────────────────
+ALLOWED_ROOT_PREFIXES: tuple = ()
+
+def _build_allowed_roots():
+    """Collect permitted root prefixes from detected storage."""
+    global ALLOWED_ROOT_PREFIXES
+    roots = []
+    for letter in ("C", "D", "E", "F"):
+        p = Path(f"{letter}:/")
+        if p.exists():
+            roots.append(str(p).lower())
+    roots.append(str(UPLOADS_DIR).lower())
+    roots.append(str(Path.home()).lower())
+    ALLOWED_ROOT_PREFIXES = tuple(roots)
+
+def _safe_resolve_path(requested: str) -> Path:
+    """Resolve requested path and reject traversal outside allowed roots."""
+    try:
+        resolved = Path(requested).resolve()
+    except Exception:
+        raise PermissionError("Invalid path")
+    if ALLOWED_ROOT_PREFIXES:
+        low = str(resolved).lower()
+        if not any(low.startswith(pfx) for pfx in ALLOWED_ROOT_PREFIXES):
+            raise PermissionError(f"Path outside allowed roots: {resolved}")
+    return resolved
 
 # ==============================================================================
 # GIT-STYLE PERSISTENT STATE MANAGEMENT (.notion_sync_state.json)
@@ -838,6 +972,54 @@ def relink_local_disk_folders(cached_items, children_map, root_items):
             root_items.append(it_id)
 
 
+def _populate_sqlite_from_cache():
+    """Bulk-populate the SQLite index from the in-memory DRIVE_CACHE.
+    Called after loading the disk cache so the UI works immediately without
+    waiting for a Notion API round-trip.
+    """
+    try:
+        from core.local_index import upsert_many
+        with CACHE_LOCK:
+            items_snapshot = dict(DRIVE_CACHE["items"])
+        if not items_snapshot:
+            return
+        index_items = []
+        seen_paths: set = set()
+        for it_id, it in items_snapshot.items():
+            raw_path = it.get('local_path', '') or ''
+            # Normalize empty local_path to None so SQLite UNIQUE index allows
+            # multiple items without a local file (NULL != NULL in SQLite UNIQUE)
+            local_path = raw_path.strip() if raw_path.strip() else None
+            # Skip duplicate non-null paths (keeps first occurrence)
+            if local_path and local_path in seen_paths:
+                local_path = None  # demote to NULL to avoid constraint failure
+            if local_path:
+                seen_paths.add(local_path)
+            index_items.append({
+                'id': it_id,
+                'name': it.get('name', ''),
+                'type': it.get('type', 'File'),
+                'extension': it.get('extension', ''),
+                'size_mb': it.get('size_mb', 0),
+                'size_bytes': it.get('size_bytes', 0),
+                'mtime': it.get('mtime', 0),
+                'ctime': it.get('ctime', 0),
+                'created_time': it.get('created_time', ''),
+                'last_edited_time': it.get('last_edited_time', ''),
+                'parent_id': it.get('parent_id'),
+                'local_path': local_path,
+                'storage_root': 'Notion Cloud',
+                'notion_id': it_id,
+                'sync_status': 'synced',
+                'last_seen': time.time()
+            })
+        if index_items:
+            upsert_many(index_items)
+            logger.info(f"[+] SQLite index populated with {len(index_items)} items from disk cache.")
+    except Exception as e:
+        logger.error(f"SQLite populate from cache error: {e}")
+
+
 def load_disk_cache():
     global DRIVE_CACHE
     cache_paths = [
@@ -862,12 +1044,90 @@ def load_disk_cache():
                         enrich_cache_items()
                         save_disk_cache()
                         print(f"[+] Loaded {len(DRIVE_CACHE['items'])} items from disk cache!")
+                        # Populate SQLite in background so server starts immediately
+                        _sqlite_pop_thread = threading.Thread(target=_populate_sqlite_from_cache, daemon=True)
+                        _sqlite_pop_thread.start()
                         return True
             except Exception as e:
                 print(f"[!] Error loading disk cache: {e}")
     return False
 
-def populate_cache_from_notion():
+_NOTION_PAGE_CONTENT_CACHE = {}
+_NOTION_CONTENT_LOCK = threading.Lock()
+
+def fetch_notion_page_content(page_id: str):
+    """
+    Fetch Notion page blocks / properties and return (text_content, binary_bytes, redirect_url).
+    Caches results for 5 minutes to avoid redundant Notion API roundtrips.
+    """
+    token = DEFAULT_API_KEY or os.environ.get("NOTION_TOKEN")
+    if not token or not page_id:
+        return None, None, None
+
+    now = time.time()
+    with _NOTION_CONTENT_LOCK:
+        if page_id in _NOTION_PAGE_CONTENT_CACHE:
+            cached_res, ts = _NOTION_PAGE_CONTENT_CACHE[page_id]
+            if now - ts < 300:
+                return cached_res
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION
+    }
+    res = (None, None, None)
+    try:
+        # 1. Check page properties for Files property
+        r_page = requests.get(f"https://api.notion.com/v1/pages/{page_id}", headers=headers, timeout=4)
+        if r_page.status_code == 200:
+            pdata = r_page.json()
+            for prop in pdata.get("properties", {}).values():
+                if prop.get("type") == "files":
+                    files_list = prop.get("files", [])
+                    if files_list:
+                        f_item = files_list[0]
+                        f_url = f_item.get("file", {}).get("url") or f_item.get("external", {}).get("url")
+                        if f_url:
+                            res = (None, None, f_url)
+                            with _NOTION_CONTENT_LOCK:
+                                _NOTION_PAGE_CONTENT_CACHE[page_id] = (res, now)
+                            return res
+
+        # 2. Check blocks for file / image / video / code
+        r = requests.get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100", headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            text_chunks = []
+            for b in data.get("results", []):
+                btype = b.get("type")
+                if btype in ("code", "paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item", "quote"):
+                    rich_texts = b.get(btype, {}).get("rich_text", [])
+                    for rt in rich_texts:
+                        text_chunks.append(rt.get("plain_text", ""))
+                    text_chunks.append("\n")
+                elif btype in ("image", "file", "pdf", "video"):
+                    file_obj = b.get(btype, {})
+                    file_url = None
+                    if file_obj.get("type") == "file":
+                        file_url = file_obj.get("file", {}).get("url")
+                    elif file_obj.get("type") == "external":
+                        file_url = file_obj.get("external", {}).get("url")
+                    if file_url:
+                        res = (None, None, file_url)
+                        with _NOTION_CONTENT_LOCK:
+                            _NOTION_PAGE_CONTENT_CACHE[page_id] = (res, now)
+                        return res
+            if text_chunks:
+                res = ("".join(text_chunks), None, None)
+    except Exception:
+        pass
+
+    with _NOTION_CONTENT_LOCK:
+        _NOTION_PAGE_CONTENT_CACHE[page_id] = (res, now)
+    return res
+
+
+def populate_cache_from_notion(is_background: bool = False):
     global DRIVE_CACHE
     headers = {
         "Authorization": f"Bearer {DEFAULT_API_KEY}",
@@ -883,6 +1143,7 @@ def populate_cache_from_notion():
         cached_items = {}
         children_map = {}
         root_items = []
+        index_items = []  # For SQLite batch insert
 
         # 1. Fetch ALL Folders first to guarantee 100% accurate hierarchy
         folder_payload = {
@@ -921,6 +1182,17 @@ def populate_cache_from_notion():
                         "parent_id": parent_id,
                         "local_path": ""
                     }
+                    
+                    # Add to SQLite index
+                    index_items.append({
+                        'id': it_id,
+                        'name': clean_name,
+                        'type': 'Folder',
+                        'parent_id': parent_id,
+                        'created_time': it.get("created_time", ""),
+                        'last_edited_time': it.get("last_edited_time", ""),
+                        'storage_root': 'Notion Cloud'
+                    })
                 has_more_folders = data.get("has_more", False)
                 folder_cursor = data.get("next_cursor")
             else:
@@ -969,9 +1241,12 @@ def populate_cache_from_notion():
 
                 created_iso = it.get("created_time", "")
                 edited_iso = it.get("last_edited_time", "")
-                mtime = 0
-                ctime = 0
-                size_bytes = int(size_mb * 1024 * 1024)
+                
+                # Check existing cache to preserve exact local metadata if available
+                existing = DRIVE_CACHE["items"].get(it_id)
+                mtime = existing.get("mtime", 0) if existing else 0
+                ctime = existing.get("ctime", 0) if existing else 0
+                size_bytes = existing.get("size_bytes", int(size_mb * 1024 * 1024)) if existing else int(size_mb * 1024 * 1024)
 
                 if local_p:
                     if "This PC\\OnePlus Nord CE4" in local_p or local_p.startswith("/storage") or local_p.startswith("/sdcard"):
@@ -1011,37 +1286,67 @@ def populate_cache_from_notion():
                     "parent_id": parent_id,
                     "local_path": local_p
                 }
+                
+                # Add to SQLite index
+                index_items.append({
+                    'id': it_id,
+                    'name': clean_name,
+                    'type': 'File',
+                    'extension': ext,
+                    'size_mb': size_mb,
+                    'size_bytes': size_bytes,
+                    'mtime': mtime,
+                    'ctime': ctime,
+                    'created_time': created_iso,
+                    'last_edited_time': edited_iso,
+                    'parent_id': parent_id,
+                    'local_path': local_p,
+                    'storage_root': 'Notion Cloud',
+                    'notion_id': it_id
+                })
 
             has_more_files = res.get("has_more", False)
             file_cursor = res.get("next_cursor")
 
         if not cached_items:
-            print("[!] Notion query returned 0 items; retaining existing cache.")
             return
 
-        save_sync_state(state)
-
-        # Re-link Local Disk (C:) and Users if needed
-        c_disk_id = None
-        for it_id, it in cached_items.items():
-            if it["name"] == "Local Disk (C:)":
-                c_disk_id = it_id
-                break
-
-        if c_disk_id:
-            for it_id, it in cached_items.items():
-                if it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X") and not it.get("parent_id") and it_id != c_disk_id:
-                    it["parent_id"] = c_disk_id
-
-        # Rebuild children_map and root_items
-        for it_id, it in cached_items.items():
-            pid = it.get("parent_id")
-            if pid and pid in cached_items:
-                children_map.setdefault(pid, []).append(it_id)
-            else:
-                root_items.append(it_id)
+        # Batch update SQLite index (much faster than individual inserts)
+        if index_items:
+            try:
+                from core.local_index import upsert_many
+                upsert_many(index_items)
+            except Exception as e:
+                logger.error(f"Failed to update SQLite index: {e}")
 
         with CACHE_LOCK:
+            old_item_ids = set(DRIVE_CACHE["items"].keys())
+            new_item_ids = set(cached_items.keys())
+            deleted_ids = old_item_ids - new_item_ids
+            added_ids = new_item_ids - old_item_ids
+
+            has_changes = bool(deleted_ids or added_ids)
+
+            # Re-link Local Disk (C:) and Users if needed
+            c_disk_id = None
+            for it_id, it in cached_items.items():
+                if it["name"] == "Local Disk (C:)":
+                    c_disk_id = it_id
+                    break
+
+            if c_disk_id:
+                for it_id, it in cached_items.items():
+                    if it.get("name") in ("Users", "Default", "nitro", "TEMP", "TEMP.SHISHIR0X") and not it.get("parent_id") and it_id != c_disk_id:
+                        it["parent_id"] = c_disk_id
+
+            # Rebuild children_map and root_items
+            for it_id, it in cached_items.items():
+                pid = it.get("parent_id")
+                if pid and pid in cached_items:
+                    children_map.setdefault(pid, []).append(it_id)
+                else:
+                    root_items.append(it_id)
+
             DRIVE_CACHE["items"] = cached_items
             DRIVE_CACHE["children"] = children_map
             DRIVE_CACHE["root_items"] = root_items
@@ -1049,9 +1354,74 @@ def populate_cache_from_notion():
 
         enrich_cache_items()
         save_disk_cache()
-        print(f"[+] Notion cache refreshed: {len(cached_items)} items.")
+
+        # Handle Real-Time Deletions in Sync State & Recent Files
+        if deleted_ids:
+            state_changed = False
+            for bucket in ("files", "android_files", "folders"):
+                bdict = state.get(bucket, {})
+                for path, info in list(bdict.items()):
+                    if info.get("notion_id") in deleted_ids:
+                        bdict.pop(path, None)
+                        state_changed = True
+            if state_changed:
+                save_sync_state(state)
+
+            with RECENT_LOCK:
+                global RECENT_FILES
+                RECENT_FILES = [r for r in RECENT_FILES if r.get("id") not in deleted_ids]
+                _save_recent_files()
+            
+            # Remove deleted items from SQLite index
+            try:
+                from core.local_index import delete_items_by_notion_id
+                for nid in deleted_ids:
+                    delete_items_by_notion_id(nid)
+            except Exception as e:
+                logger.error(f"Failed to clean index: {e}")
+
+            _broadcast_sse("cache_updated", {
+                "version": DRIVE_CACHE["version"],
+                "deleted_count": len(deleted_ids),
+                "deleted_ids": list(deleted_ids)
+            })
+            logger.info(f"[⚡ Real-time Sync] Detected {len(deleted_ids)} deleted item(s) in Notion DB. Reflected in browser!")
+        elif added_ids and is_background:
+            _broadcast_sse("cache_updated", {
+                "version": DRIVE_CACHE["version"],
+                "added_count": len(added_ids)
+            })
+            logger.info(f"[⚡ Real-time Sync] Detected {len(added_ids)} new item(s) in Notion DB. Reflected in browser!")
+        elif not is_background:
+            logger.info(f"[+] Notion cache refreshed: {len(cached_items)} items.")
+
     except Exception as e:
-        print(f"[!] Notion sync error: {e}")
+        if not is_background:
+            logger.error(f"[!] Notion sync error: {e}")
+
+
+_WATCHER_THREAD = None
+_WATCHER_STOP = False
+
+def start_notion_watcher():
+    """Start background watcher thread that auto-syncs Notion database changes every 8 seconds."""
+    global _WATCHER_THREAD
+    if _WATCHER_THREAD and _WATCHER_THREAD.is_alive():
+        return
+    
+    def _run():
+        time.sleep(3)
+        while not _WATCHER_STOP:
+            try:
+                populate_cache_from_notion(is_background=True)
+            except Exception:
+                pass
+            time.sleep(8)
+
+    _WATCHER_THREAD = threading.Thread(target=_run, daemon=True, name="NotionDBWatcher")
+    _WATCHER_THREAD.start()
+    print("[+] Real-time Notion Database Watcher active (8s auto-sync)")
+
 
 # ==============================================================================
 # HTML & JS FRONTEND TEMPLATE
@@ -1242,8 +1612,6 @@ LOCK_SCREEN_HTML = """<!DOCTYPE html>
                 } else {
                     card.classList.add('shake');
                     setTimeout(() => card.classList.remove('shake'), 500);
-                    err.innerText = data.error || 'Incorrect password. Access denied.';
-                    err.style.display = 'block';
                     btn.innerHTML = '<i class="fa-solid fa-lock-open"></i> Unlock Drive';
                     btn.disabled = false;
                 }
@@ -1263,1653 +1631,2291 @@ DRIVE_GUI_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>My Drive - Notion Cloud Manager</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Notion Drive — My Drive</title>
+    <meta name="description" content="Notion Cloud File Manager — unified drive for Windows, Android, and Notion Cloud.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root {
-            --bg-main: #131314;
-            --bg-sidebar: #1E1F20;
-            --bg-card: #28292A;
-            --bg-card-hover: #333537;
-            --bg-selected: #004A77;
-            --text-main: #E3E3E3;
-            --text-muted: #9E9E9E;
+            --bg-main: #111213;
+            --bg-sidebar: #181A1B;
+            --bg-card: #222426;
+            --bg-card-hover: #2C2F31;
+            --bg-selected: #1A3660;
+            --text-main: #E8EAED;
+            --text-muted: #9AA0A6;
             --accent-blue: #A8C7FA;
             --accent-primary: #1A73E8;
             --accent-green: #34A853;
             --accent-orange: #FBBC04;
             --accent-red: #EA4335;
-            --border-color: #3C4043;
+            --border-color: #303234;
             --item-radius: 12px;
+            --sidebar-width: 240px;
+            --bottom-nav-height: 60px;
         }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
+        body { background: var(--bg-main); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Google Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-        body { background-color: var(--bg-main); color: var(--text-main); display: flex; height: 100vh; overflow: hidden; }
-
-        /* Sidebar */
+        /* ── Sidebar ──────────────────────────────────────────────────────── */
         .sidebar {
-            width: 256px;
-            background-color: var(--bg-sidebar);
+            width: var(--sidebar-width);
+            background: var(--bg-sidebar);
             display: flex;
             flex-direction: column;
             border-right: 1px solid var(--border-color);
-            padding: 16px 12px;
+            padding: 12px 8px;
             flex-shrink: 0;
+            overflow-y: auto;
+            z-index: 1200;
         }
-
         .logo {
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 8px 12px 24px;
-            font-size: 18px;
-            font-weight: 600;
+            gap: 10px;
+            padding: 8px 10px 18px;
+            font-size: 17px;
+            font-weight: 700;
             color: var(--text-main);
+            letter-spacing: -0.3px;
         }
-        .logo i { color: #4285F4; font-size: 24px; }
+        .logo i { color: #4285F4; font-size: 22px; }
 
-        .nav-section { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+        .nav-group { margin-bottom: 6px; }
+        .nav-group-label {
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            color: var(--text-muted);
+            padding: 6px 14px 4px;
+        }
         .nav-item {
             display: flex;
             align-items: center;
-            gap: 14px;
-            padding: 10px 16px;
+            gap: 12px;
+            padding: 9px 14px;
             border-radius: 24px;
-            font-size: 14px;
+            font-size: 13.5px;
             font-weight: 500;
             color: var(--text-main);
-            text-decoration: none;
             cursor: pointer;
-            transition: background 0.15s;
+            transition: background 0.12s;
             position: relative;
+            user-select: none;
         }
-        .nav-item:hover { background-color: var(--bg-card-hover); }
-        .nav-item.active { background-color: var(--bg-selected); color: var(--accent-blue); }
-        .nav-item i { font-size: 16px; width: 20px; text-align: center; }
-
-        .sync-badge {
+        .nav-item:hover { background: var(--bg-card); }
+        .nav-item.active { background: var(--bg-selected); color: var(--accent-blue); }
+        .nav-item i { font-size: 15px; width: 18px; text-align: center; opacity: 0.85; }
+        .nav-badge {
             margin-left: auto;
-            font-size: 11px;
-            font-weight: 600;
-            padding: 2px 8px;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 1px 7px;
             border-radius: 10px;
             text-transform: uppercase;
         }
-        .sync-badge.idle { background: rgba(255,255,255,0.08); color: var(--text-muted); }
-        .sync-badge.running { background: #004A77; color: var(--accent-blue); animation: pulse 1.5s infinite; }
+        .nav-badge.idle { background: rgba(255,255,255,0.07); color: var(--text-muted); }
+        .nav-badge.running { background: var(--bg-selected); color: var(--accent-blue); animation: pulse 1.5s infinite; }
 
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.6; }
-            100% { opacity: 1; }
-        }
-
-        .storage-card {
-            background-color: var(--bg-card);
-            border-radius: var(--item-radius);
-            padding: 16px;
+        .sidebar-bottom {
             margin-top: auto;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+        }
+        .storage-info {
+            padding: 14px;
+            background: var(--bg-card);
             border: 1px solid var(--border-color);
+            border-radius: var(--item-radius);
+            margin: 6px;
         }
-        .storage-title { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; display: flex; justify-content: space-between; }
-        .storage-bar-bg { background: #3C4043; height: 6px; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
-        .storage-bar-fill { background: var(--accent-blue); height: 100%; width: 100%; border-radius: 3px; transition: width 0.3s; }
-        .storage-text { font-size: 12px; color: var(--text-main); }
+        .storage-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 12px; }
+        .storage-label { color: var(--text-muted); font-weight: 500; }
+        .storage-badge { background: rgba(168,199,250,0.12); color: var(--accent-blue); padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+        .storage-bar { background: rgba(255,255,255,0.06); height: 5px; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
+        .storage-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #1A73E8, #34A853); border-radius: 3px; transition: width 0.4s; }
+        .storage-text { font-size: 11.5px; color: var(--text-main); font-weight: 500; }
+        .storage-sub { font-size: 10.5px; color: var(--text-muted); margin-top: 2px; }
 
-        /* Main Container */
-        .main-container {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
+        /* ── Main Container ───────────────────────────────────────────────── */
+        .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 
-        /* Top Header */
+        /* ── Topbar ───────────────────────────────────────────────────────── */
         .topbar {
-            height: 64px;
+            height: 60px;
             border-bottom: 1px solid var(--border-color);
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            padding: 0 24px;
-            gap: 20px;
-        }
-
-        .search-box {
-            flex: 1;
-            max-width: 680px;
-            background-color: var(--bg-card);
-            border-radius: 28px;
-            display: flex;
-            align-items: center;
-            padding: 8px 18px;
+            padding: 0 16px;
             gap: 12px;
-            border: 1px solid transparent;
-            transition: all 0.2s;
+            flex-shrink: 0;
+            background: var(--bg-sidebar);
+            z-index: 10;
         }
-        .search-box:focus-within {
-            background-color: #1E1F20;
-            border-color: var(--accent-blue);
-            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+        .search-wrap {
+            flex: 1;
+            max-width: 640px;
+            position: relative;
         }
-        .search-box input {
-            background: transparent;
-            border: none;
-            outline: none;
-            color: var(--text-main);
-            font-size: 15px;
+        .search-wrap i { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; pointer-events: none; }
+        .search-input {
             width: 100%;
+            background: var(--bg-card);
+            border: 1px solid transparent;
+            border-radius: 28px;
+            padding: 9px 18px 9px 40px;
+            font-size: 13.5px;
+            color: var(--text-main);
+            outline: none;
+            transition: all 0.2s;
+            font-family: inherit;
         }
-        .search-box i { color: var(--text-muted); }
+        .search-input:focus { background: #1E2022; border-color: var(--accent-blue); box-shadow: 0 0 0 3px rgba(168,199,250,0.12); }
+        .search-input::placeholder { color: var(--text-muted); }
 
-        .top-actions { display: flex; align-items: center; gap: 10px; }
-        .btn-sync {
-            background-color: var(--accent-primary);
-            color: white;
-            padding: 8px 16px;
-            border-radius: 20px;
+        .topbar-actions { display: flex; align-items: center; gap: 8px; }
+        .btn-primary {
+            background: var(--accent-primary);
+            color: #fff;
             border: none;
+            border-radius: 20px;
+            padding: 8px 16px;
             font-size: 13px;
             font-weight: 500;
+            cursor: pointer;
             display: flex;
             align-items: center;
-            gap: 8px;
-            cursor: pointer;
-            transition: opacity 0.2s;
+            gap: 7px;
+            transition: opacity 0.15s;
+            font-family: inherit;
+            white-space: nowrap;
         }
-        .btn-sync:hover { opacity: 0.9; }
+        .btn-primary:hover { opacity: 0.88; }
+        .btn-icon {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 7px 10px;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            font-family: inherit;
+            transition: all 0.12s;
+        }
+        .btn-icon:hover { background: var(--bg-card); color: var(--text-main); }
+        .btn-danger { background: rgba(234,67,53,0.1); color: #F28B82; border: 1px solid rgba(234,67,53,0.2); border-radius: 20px; padding: 7px 12px; }
 
-        /* Breadcrumb & Toolbar */
+        /* ── Search Category Filters ─────────────────────────────────────── */
+        .search-filters {
+            display: none;
+            gap: 8px;
+            padding: 8px 16px;
+            background: var(--bg-sidebar);
+            border-bottom: 1px solid var(--border-color);
+            overflow-x: auto;
+            flex-shrink: 0;
+        }
+        .search-filters::-webkit-scrollbar { display: none; }
+        .filter-chip {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 5px 12px;
+            border-radius: 16px;
+            font-size: 12px;
+            cursor: pointer;
+            white-space: nowrap;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.12s;
+        }
+        .filter-chip:hover { color: var(--text-main); border-color: #5F6368; }
+        .filter-chip.active { background: var(--bg-selected); color: var(--accent-blue); border-color: var(--accent-blue); }
+
+        /* ── View panel ───────────────────────────────────────────────────── */
+        .view-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .view-panel-inner { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+        .view-panel-inner.active { display: flex; }
+
+        /* ── Content Header (breadcrumbs + controls) ──────────────────────── */
         .content-header {
-            padding: 14px 24px 10px;
+            padding: 12px 16px 8px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 16px;
+            gap: 12px;
             flex-wrap: wrap;
+            flex-shrink: 0;
         }
-        .breadcrumbs {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 16px;
-            font-weight: 500;
-            flex: 1;
-        }
-        .breadcrumb-item { color: var(--text-muted); cursor: pointer; display: flex; align-items: center; gap: 6px; }
-        .breadcrumb-item:hover { color: var(--text-main); }
-        .breadcrumb-item.active { color: var(--text-main); font-weight: 600; cursor: default; }
-        .breadcrumb-sep { color: var(--text-muted); font-size: 11px; }
+        .breadcrumbs { display: flex; align-items: center; gap: 6px; font-size: 14.5px; font-weight: 600; flex: 1; flex-wrap: wrap; }
+        .bc-item { color: var(--text-muted); cursor: pointer; display: flex; align-items: center; gap: 5px; border-radius: 6px; padding: 2px 4px; transition: color 0.12s; }
+        .bc-item:hover { color: var(--text-main); }
+        .bc-item.active { color: var(--text-main); cursor: default; }
+        .bc-sep { color: var(--text-muted); font-size: 10px; }
 
-        .toolbar-controls { display: flex; align-items: center; gap: 12px; }
-        .control-pill {
+        .toolbar { display: flex; align-items: center; gap: 10px; }
+        .sort-pill {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: 20px;
-            padding: 4px 12px;
+            padding: 4px 10px;
             display: flex;
             align-items: center;
-            gap: 8px;
-            font-size: 13px;
+            gap: 6px;
+            font-size: 12px;
             color: var(--text-main);
         }
-        .control-pill select {
+        .sort-pill select {
             background: transparent;
             border: none;
             color: var(--text-main);
-            font-size: 13px;
+            font-size: 12px;
             outline: none;
             cursor: pointer;
+            font-family: inherit;
         }
-        .control-pill select option { background: #1E1F20; color: #E3E3E3; }
-        
-        .btn-tool {
-            background: transparent;
-            border: none;
-            color: var(--text-muted);
-            cursor: pointer;
-            font-size: 14px;
-            padding: 4px;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .btn-tool:hover { color: var(--text-main); background: rgba(255,255,255,0.08); }
-
-        .view-switcher {
-            display: flex;
-            background: var(--bg-card);
-            border-radius: 20px;
-            border: 1px solid var(--border-color);
-            overflow: hidden;
-        }
-        .view-btn {
-            background: transparent;
-            border: none;
-            color: var(--text-muted);
-            padding: 6px 12px;
-            cursor: pointer;
-            font-size: 13px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
+        .sort-pill select option { background: #222426; }
+        .view-switch { display: flex; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 20px; overflow: hidden; }
+        .view-btn { background: transparent; border: none; color: var(--text-muted); padding: 5px 10px; cursor: pointer; font-size: 13px; display: flex; align-items: center; transition: all 0.12s; }
         .view-btn.active { background: var(--bg-selected); color: var(--accent-blue); }
 
-        /* Workspaces */
-        .workspace-scroll {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px 24px;
-        }
+        /* ── Scroll area ──────────────────────────────────────────────────── */
+        .scroll-area { flex: 1; overflow-y: auto; padding: 10px 16px 20px; }
+        .scroll-area::-webkit-scrollbar { width: 6px; }
+        .scroll-area::-webkit-scrollbar-track { background: transparent; }
+        .scroll-area::-webkit-scrollbar-thumb { background: #3C4043; border-radius: 3px; }
 
-        .section-label {
-            font-size: 12px;
+        /* ── Dashboard (My Drive root) ────────────────────────────────────── */
+        .section-title {
+            font-size: 11px;
             font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.6px;
             color: var(--text-muted);
-            margin: 16px 0 10px;
+            margin: 18px 0 10px;
         }
 
-        .grid-view {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 14px;
-        }
-
-        .folder-card {
-            background-color: var(--bg-card);
-            border-radius: var(--item-radius);
-            padding: 14px 16px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            cursor: pointer;
+        /* Device cards */
+        .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+        .device-card {
+            background: var(--bg-card);
             border: 1px solid var(--border-color);
-            transition: all 0.15s;
-            user-select: none;
-        }
-        .folder-card:hover {
-            background-color: var(--bg-card-hover);
-            border-color: #5F6368;
-            transform: translateY(-1px);
-        }
-        .folder-card i { font-size: 20px; color: var(--accent-blue); flex-shrink: 0; }
-        .folder-card .title {
-            font-size: 14px;
-            font-weight: 500;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .folder-card .count { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-
-        .file-card {
-            background-color: var(--bg-card);
-            border-radius: var(--item-radius);
-            padding: 12px;
-            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 16px;
             cursor: pointer;
             transition: all 0.15s;
             display: flex;
             flex-direction: column;
+            gap: 12px;
+        }
+        .device-card:hover { background: var(--bg-card-hover); border-color: #5F6368; transform: translateY(-1px); box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
+        .device-icon-wrap { width: 44px; height: 44px; background: rgba(168,199,250,0.1); border-radius: 12px; display: flex; align-items: center; justify-content: center; }
+        .device-icon-wrap i { font-size: 20px; color: var(--accent-blue); }
+        .device-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .device-meta { font-size: 11.5px; color: var(--text-muted); display: flex; justify-content: space-between; }
+
+        /* Quick Access / Recent items */
+        .recent-scroller { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+        .recent-scroller::-webkit-scrollbar { height: 4px; }
+        .recent-scroller::-webkit-scrollbar-thumb { background: #3C4043; border-radius: 2px; }
+        .recent-chip {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 10px 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all 0.12s;
+            min-width: 180px;
+            max-width: 230px;
+        }
+        .recent-chip:hover { background: var(--bg-card-hover); border-color: #5F6368; }
+        .recent-chip i { font-size: 18px; color: var(--accent-blue); flex-shrink: 0; }
+        .recent-chip-info { overflow: hidden; flex: 1; }
+        .recent-chip-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+        .recent-chip-meta { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+        /* ── Folder/File grids (browse view) ──────────────────────────────── */
+        .grid-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+
+        .folder-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--item-radius);
+            padding: 12px 14px;
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            cursor: pointer;
+            transition: all 0.12s;
+            user-select: none;
+        }
+        .folder-card:hover { background: var(--bg-card-hover); border-color: #5F6368; transform: translateY(-1px); }
+        .folder-card i { font-size: 19px; color: var(--accent-blue); flex-shrink: 0; }
+        .folder-card-info { overflow: hidden; flex: 1; }
+        .folder-card-name { font-size: 13.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .folder-card-count { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+        .file-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--item-radius);
+            padding: 10px;
+            cursor: pointer;
+            transition: all 0.12s;
+            display: flex;
+            flex-direction: column;
             gap: 8px;
+            position: relative;
         }
-        .file-card:hover {
-            background-color: var(--bg-card-hover);
-            border-color: #5F6368;
-            transform: translateY(-1px);
-        }
-        .file-thumb {
-            height: 110px;
-            background: #1E1F20;
+        .file-card:hover { background: var(--bg-card-hover); border-color: #5F6368; transform: translateY(-1px); }
+        .thumb {
+            height: 108px;
+            background: #1A1C1E;
             border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 36px;
+            font-size: 32px;
             color: var(--text-muted);
             overflow: hidden;
+            position: relative;
         }
-        .file-thumb img { width: 100%; height: 100%; object-fit: cover; }
-        .file-info { display: flex; align-items: center; gap: 8px; }
-        .file-info i { font-size: 16px; color: var(--accent-blue); }
-        .file-name {
-            font-size: 13px;
-            font-weight: 500;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            flex: 1;
-        }
-        .file-meta { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; }
+        .thumb img { width: 100%; height: 100%; object-fit: cover; transition: opacity 0.25s; }
+        .thumb .skeleton { position: absolute; inset: 0; background: linear-gradient(90deg,#222426 25%,#2c2f31 50%,#222426 75%); background-size: 200%; animation: shimmer 1.4s infinite; border-radius: 8px; }
+        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        
+        /* Rich Thumbnails */
+        .thumb-pdf { background: radial-gradient(circle, #2A1717 0%, #161010 100%); border: 1px solid rgba(234,67,53,0.25); }
+        .thumb-pdf .pdf-icon { font-size: 38px; color: #EA4335; }
+        .thumb-pdf .pdf-tag { position: absolute; bottom: 8px; left: 8px; background: rgba(234,67,53,0.25); color: #F28B82; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 4px; }
 
-        /* Table List View */
-        .drive-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-            text-align: left;
-        }
-        .drive-table th {
-            padding: 10px 14px;
+        .thumb-video { background: radial-gradient(circle, #1A2234 0%, #10141D 100%); border: 1px solid rgba(138,180,248,0.25); }
+        .thumb-video .play-btn { width: 42px; height: 42px; border-radius: 50%; background: rgba(138,180,248,0.25); display: flex; align-items: center; justify-content: center; color: #A8C7FA; font-size: 17px; transition: all 0.15s; }
+        .file-card:hover .thumb-video .play-btn { transform: scale(1.15); background: var(--accent-blue); color: #041E49; }
+
+        .thumb-code { background: radial-gradient(circle, #1A271E 0%, #0F1612 100%); border: 1px solid rgba(52,168,83,0.25); font-family: monospace; }
+        .thumb-code .code-badge { font-size: 18px; font-weight: 700; color: #81C995; letter-spacing: 0.5px; }
+
+        .thumb-audio { background: radial-gradient(circle, #2B2114 0%, #15110B 100%); border: 1px solid rgba(251,188,4,0.25); }
+        .thumb-audio i { font-size: 36px; color: #FDD663; }
+
+        .file-card-footer { display: flex; align-items: center; gap: 8px; }
+        .file-card-footer i { font-size: 14px; color: var(--accent-blue); flex-shrink: 0; }
+        .file-card-name { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+        .file-card-meta { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
+        .card-more-btn {
+            background: transparent;
+            border: none;
             color: var(--text-muted);
+            padding: 4px 6px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .card-more-btn:hover { color: var(--text-main); background: rgba(255,255,255,0.1); }
+
+        /* ── List View ────────────────────────────────────────────────────── */
+        .drive-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .drive-table th { padding: 9px 14px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); font-weight: 500; font-size: 11.5px; cursor: pointer; user-select: none; text-align: left; }
+        .drive-table th:hover { color: var(--text-main); }
+        .drive-table td { padding: 11px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+        .drive-table tr:hover td { background: var(--bg-card-hover); }
+        .drive-table tr { cursor: pointer; }
+        .tname { display: flex; align-items: center; gap: 11px; font-weight: 500; }
+        .tname i { font-size: 15px; color: var(--accent-blue); width: 16px; text-align: center; }
+
+        /* Mobile list item */
+        .mobile-list-item {
+            display: none;
+            padding: 12px 14px;
             border-bottom: 1px solid var(--border-color);
-            font-weight: 500;
-            font-size: 12px;
-            user-select: none;
+            align-items: center;
+            gap: 12px;
             cursor: pointer;
         }
-        .drive-table th:hover { color: var(--text-main); }
-        .drive-table td {
-            padding: 12px 14px;
-            border-bottom: 1px solid rgba(255,255,255,0.04);
-            color: var(--text-main);
-        }
-        .drive-table tr:hover td { background-color: var(--bg-card-hover); }
-        .drive-table tr { cursor: pointer; }
+        .mobile-list-item:hover { background: var(--bg-card-hover); }
+        .mli-icon { font-size: 20px; color: var(--accent-blue); width: 24px; text-align: center; }
+        .mli-content { flex: 1; min-width: 0; }
+        .mli-name { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .mli-meta { font-size: 11px; color: var(--text-muted); margin-top: 3px; }
 
-        .table-item-name { display: flex; align-items: center; gap: 12px; font-weight: 500; }
-        .table-item-name i { font-size: 16px; color: var(--accent-blue); width: 18px; text-align: center; }
+        /* ── Load-more sentinel ───────────────────────────────────────────── */
+        .load-sentinel { height: 60px; display: flex; align-items: center; justify-content: center; }
+        .load-spinner { font-size: 20px; color: var(--text-muted); animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* Modal Preview */
+        /* ── File Preview Modal ───────────────────────────────────────────── */
         .modal-overlay {
             position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.75);
+            inset: 0;
+            background: rgba(0,0,0,0.85);
             display: none;
             align-items: center;
             justify-content: center;
-            z-index: 1000;
-            backdrop-filter: blur(4px);
+            z-index: 3000;
+            backdrop-filter: blur(8px);
         }
-        .modal-content {
+        .modal-overlay.open { display: flex; }
+        .modal-box {
             background: var(--bg-sidebar);
             border: 1px solid var(--border-color);
             border-radius: 16px;
-            width: 90%;
-            max-width: 900px;
-            max-height: 88vh;
+            width: 94%;
+            max-width: 950px;
+            max-height: 90vh;
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.7);
+            animation: fadeUp 0.22s ease-out;
+            position: relative;
         }
-        .modal-header {
-            padding: 14px 20px;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .modal-body {
-            padding: 16px;
-            flex: 1;
-            overflow: auto;
+        @keyframes fadeUp { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
+        .modal-hdr { padding: 13px 18px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+        .modal-title { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+        .modal-actions { display: flex; gap: 8px; flex-shrink: 0; align-items: center; }
+        .modal-counter { font-size: 12px; color: var(--text-muted); padding: 2px 8px; border-radius: 10px; background: rgba(255,255,255,0.06); font-weight: 500; }
+        .modal-body { flex: 1; overflow: auto; display: flex; align-items: center; justify-content: center; background: #0D0E0F; min-height: 300px; }
+
+        .modal-nav-btn {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            background: rgba(30, 31, 32, 0.88);
+            border: 1px solid var(--border-color);
+            color: #E8EAED;
             display: flex;
             align-items: center;
             justify-content: center;
-            background: #111;
+            cursor: pointer;
+            z-index: 100;
+            backdrop-filter: blur(6px);
+            transition: all 0.15s;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.6);
         }
+        .modal-nav-btn:hover {
+            background: rgba(50, 54, 58, 0.98);
+            color: var(--accent-blue);
+            transform: translateY(-50%) scale(1.1);
+        }
+        .modal-prev-btn { left: 16px; }
+        .modal-next-btn { right: 16px; }
+
         .action-btn {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             color: var(--text-main);
-            padding: 6px 12px;
-            border-radius: 16px;
+            padding: 5px 11px;
+            border-radius: 14px;
             cursor: pointer;
             font-size: 12px;
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 5px;
             text-decoration: none;
+            font-family: inherit;
+            transition: all 0.12s;
         }
         .action-btn:hover { background: var(--bg-card-hover); color: var(--accent-blue); }
 
-        /* ===================================================================== */
-        /* SYNC CENTER STYLES                                                    */
-        /* ===================================================================== */
-        .sync-hero-card {
-            background: linear-gradient(135deg, #1E1F20 0%, #28292A 100%);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        /* ── Action Sheet / Context Bottom Sheet ─────────────────────────── */
+        .action-sheet-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: none;
+            align-items: flex-end;
+            justify-content: center;
+            z-index: 4000;
+            backdrop-filter: blur(4px);
         }
-
-        .sync-header-row {
+        .action-sheet-overlay.open { display: flex; }
+        .action-sheet {
+            background: var(--bg-sidebar);
+            border: 1px solid var(--border-color);
+            border-radius: 20px 20px 0 0;
+            width: 100%;
+            max-width: 500px;
+            padding: 16px;
+            box-shadow: 0 -8px 32px rgba(0,0,0,0.6);
+            animation: sheetUp 0.25s cubic-bezier(0.1,0.9,0.2,1);
+        }
+        @keyframes sheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        .as-header { display: flex; align-items: center; gap: 12px; padding-bottom: 14px; border-bottom: 1px solid var(--border-color); margin-bottom: 10px; }
+        .as-icon { font-size: 24px; color: var(--accent-blue); width: 36px; text-align: center; }
+        .as-info { flex: 1; min-width: 0; }
+        .as-title { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .as-subtitle { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+        .as-close { background: transparent; border: none; color: var(--text-muted); font-size: 16px; cursor: pointer; padding: 6px; }
+        .as-body { display: flex; flex-direction: column; gap: 4px; }
+        .as-item {
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-size: 13.5px;
+            font-weight: 500;
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            margin-bottom: 18px;
-            flex-wrap: wrap;
-            gap: 12px;
+            gap: 14px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background 0.1s;
+            text-align: left;
         }
+        .as-item:hover { background: var(--bg-card-hover); }
+        .as-item i { width: 18px; text-align: center; font-size: 15px; color: var(--accent-blue); }
+        .as-item.text-danger { color: #F28B82; }
+        .as-item.text-danger i { color: #F28B82; }
 
-        .sync-title-area { display: flex; align-items: center; gap: 12px; }
-        .sync-pulse-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: var(--accent-green);
-            box-shadow: 0 0 10px var(--accent-green);
+        /* ── Mobile Bottom Navigation ─────────────────────────────────────── */
+        .mobile-bottom-nav {
+            display: none;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: var(--bottom-nav-height);
+            background: var(--bg-sidebar);
+            border-top: 1px solid var(--border-color);
+            align-items: center;
+            justify-content: space-around;
+            z-index: 1100;
+            padding: 0 4px;
         }
-        .sync-pulse-dot.running {
-            background: var(--accent-blue);
-            box-shadow: 0 0 12px var(--accent-blue);
-            animation: pulse 1s infinite;
-        }
-
-        .sync-controls-row {
+        .mbn-item {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
             display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            font-size: 10px;
+            font-weight: 500;
+            cursor: pointer;
+            flex: 1;
+            padding: 6px 0;
+            transition: color 0.12s;
         }
+        .mbn-item i { font-size: 18px; }
+        .mbn-item.active { color: var(--accent-blue); }
+        .mbn-new-circle {
+            width: 38px;
+            height: 38px;
+            background: var(--accent-primary);
+            color: #fff;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            box-shadow: 0 2px 8px rgba(26,115,232,0.4);
+            margin-top: -6px;
+        }
+
+        /* ── Drawer Backdrop ──────────────────────────────────────────────── */
+        .drawer-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.6);
+            display: none;
+            z-index: 1150;
+            backdrop-filter: blur(2px);
+        }
+        .drawer-backdrop.open { display: block; }
+
+        /* ── Empty state ──────────────────────────────────────────────────── */
+        .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+        .empty-state i { font-size: 40px; margin-bottom: 14px; display: block; opacity: 0.5; }
+        .empty-state p { font-size: 14px; }
+
+        /* ── Sync Center ──────────────────────────────────────────────────── */
+        #viewSync { padding: 16px; overflow-y: auto; }
+        .sync-hero {
+            background: linear-gradient(135deg, #1E2022 0%, #222426 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+        }
+        .sync-hdr-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
+        .sync-pulse { width: 11px; height: 11px; border-radius: 50%; background: var(--accent-green); box-shadow: 0 0 10px var(--accent-green); flex-shrink: 0; }
+        .sync-pulse.running { background: var(--accent-blue); box-shadow: 0 0 12px var(--accent-blue); animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+        .sync-title-area { display: flex; align-items: center; gap: 10px; }
+        .sync-controls { display: flex; gap: 8px; flex-wrap: wrap; }
         .btn-sync-action {
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             color: var(--text-main);
-            padding: 8px 16px;
+            padding: 8px 14px;
             border-radius: 20px;
             cursor: pointer;
             font-size: 13px;
             font-weight: 500;
             display: flex;
             align-items: center;
-            gap: 8px;
-            transition: all 0.2s;
+            gap: 7px;
+            transition: all 0.15s;
+            font-family: inherit;
         }
-        .btn-sync-action:hover {
-            background: var(--bg-card-hover);
-            border-color: var(--accent-blue);
-            color: var(--accent-blue);
-        }
-        .btn-sync-action.primary {
-            background: var(--accent-primary);
-            border-color: var(--accent-primary);
-            color: white;
-        }
-        .btn-sync-action.primary:hover { opacity: 0.9; }
-        .btn-sync-action.danger {
-            background: rgba(234,67,53,0.15);
-            border-color: rgba(234,67,53,0.3);
-            color: #F28B82;
-        }
-        .btn-sync-action.danger:hover { background: rgba(234,67,53,0.3); }
+        .btn-sync-action:hover { background: var(--bg-card-hover); border-color: var(--accent-blue); color: var(--accent-blue); }
+        .btn-sync-action.primary { background: var(--accent-primary); border-color: var(--accent-primary); color: #fff; }
+        .btn-sync-action.primary:hover { opacity: 0.88; }
+        .btn-sync-action.danger { background: rgba(234,67,53,0.12); border-color: rgba(234,67,53,0.3); color: #F28B82; }
+        .btn-sync-action.danger:hover { background: rgba(234,67,53,0.25); }
 
-        .progress-container { margin-bottom: 20px; }
-        .progress-labels {
-            display: flex;
-            justify-content: space-between;
-            font-size: 13px;
-            margin-bottom: 8px;
-            font-weight: 500;
-        }
-        .progress-bar-outer {
-            background: rgba(255,255,255,0.08);
-            height: 10px;
-            border-radius: 5px;
-            overflow: hidden;
-        }
-        .progress-bar-inner {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #1A73E8, #34A853);
-            border-radius: 5px;
-            transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }
+        .progress-wrap { margin-bottom: 16px; }
+        .progress-labels { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 7px; font-weight: 500; }
+        .progress-track { background: rgba(255,255,255,0.07); height: 8px; border-radius: 4px; overflow: hidden; }
+        .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #1A73E8, #34A853); border-radius: 4px; transition: width 0.35s cubic-bezier(0.4,0,0.2,1); }
 
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin-bottom: 20px;
-        }
-        .stat-box {
-            background: #1E1F20;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 14px 16px;
-        }
-        .stat-label { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
-        .stat-value { font-size: 20px; font-weight: 600; color: var(--text-main); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+        .stat-box { background: #1A1C1E; border: 1px solid var(--border-color); border-radius: 12px; padding: 12px 14px; }
+        .stat-lbl { font-size: 10.5px; color: var(--text-muted); margin-bottom: 4px; }
+        .stat-val { font-size: 17px; font-weight: 700; }
 
-        .active-file-card {
-            background: rgba(0, 74, 119, 0.25);
-            border: 1px solid rgba(168, 199, 250, 0.3);
-            border-radius: 12px;
-            padding: 16px 20px;
+        .active-file-box {
+            background: rgba(0,74,119,0.2);
+            border: 1px solid rgba(168,199,250,0.25);
+            border-radius: 11px;
+            padding: 12px 16px;
             display: flex;
             align-items: center;
-            gap: 16px;
-            margin-bottom: 24px;
+            gap: 12px;
         }
-        .active-file-card i { font-size: 24px; color: var(--accent-blue); }
-        .active-file-details { flex: 1; }
-        .active-file-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
-        .active-file-path { font-size: 12px; color: var(--text-muted); word-break: break-all; }
+        .active-file-box i { font-size: 20px; color: var(--accent-blue); flex-shrink: 0; }
+        .afb-details { flex: 1; min-width: 0; }
+        .afb-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .afb-path { font-size: 11px; color: var(--text-muted); word-break: break-all; margin-top: 2px; }
+        .afb-size { font-size: 12.5px; font-weight: 600; color: var(--accent-blue); flex-shrink: 0; }
 
-        .sync-tabs-header {
-            display: flex;
-            gap: 8px;
-            border-bottom: 1px solid var(--border-color);
-            margin-bottom: 16px;
+        .sync-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border-color); margin: 16px 0 12px; }
+        .sync-tab-btn { background: transparent; border: none; color: var(--text-muted); padding: 8px 12px; font-size: 12.5px; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 7px; font-family: inherit; transition: all 0.12s; }
+        .sync-tab-btn.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); }
+        .tab-count { background: rgba(255,255,255,0.09); padding: 1px 6px; border-radius: 9px; font-size: 10px; }
+
+        .sync-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        .sync-table th { padding: 9px 12px; color: var(--text-muted); border-bottom: 1px solid var(--border-color); font-size: 11px; text-align: left; }
+        .sync-table td { padding: 11px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+
+        .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+        .pill.queued { background: rgba(255,255,255,0.07); color: var(--text-muted); }
+        .pill.uploading { background: var(--bg-selected); color: var(--accent-blue); animation: pulse 1.2s infinite; }
+        .pill.synced { background: rgba(52,168,83,0.15); color: #81C995; }
+        .pill.failed { background: rgba(234,67,53,0.15); color: #F28B82; }
+        .tag { padding: 1px 5px; border-radius: 4px; font-size: 9.5px; font-weight: 700; text-transform: uppercase; margin-right: 5px; }
+        .tag.NEW { background: rgba(52,168,83,0.18); color: #81C995; }
+        .tag.MODIFIED { background: rgba(251,188,4,0.18); color: #FDD663; }
+
+        .console-box { background: #0E0F10; border: 1px solid var(--border-color); border-radius: 11px; padding: 13px; font-family: 'Consolas', monospace; font-size: 11.5px; color: #A8C7FA; height: 300px; overflow-y: auto; line-height: 1.7; }
+        .log-line { margin-bottom: 1px; }
+
+        /* ── Responsive Media Queries ────────────────────────────────────── */
+        @media (max-width: 1024px) {
+            .sidebar { width: 210px; }
+            .device-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+            .grid-view { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
         }
-        .sync-tab-btn {
+        
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed; left: -270px; top: 0; bottom: 0; z-index: 1200;
+                transition: left 0.28s cubic-bezier(0.1,0.9,0.2,1);
+            }
+            .sidebar.open { left: 0; box-shadow: 4px 0 24px rgba(0,0,0,0.6); }
+            .main { margin-left: 0; }
+            .topbar { padding: 0 12px; }
+            .search-wrap { max-width: 100%; }
+            .device-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+            .grid-view { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+            .content-header { padding: 10px 12px 6px; }
+            .scroll-area { padding: 8px 12px calc(var(--bottom-nav-height) + 16px); }
+            .mobile-bottom-nav { display: flex; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .sync-controls { flex-direction: column; width: 100%; }
+            .btn-sync-action { width: 100%; justify-content: center; }
+            .drive-table { display: none; }
+            .mobile-list-item { display: flex; }
+            .search-filters { display: flex; }
+        }
+        
+        @media (max-width: 480px) {
+            .grid-view { grid-template-columns: repeat(2, 1fr); gap: 6px; }
+            .file-card { padding: 7px; border-radius: 10px; }
+            .thumb { height: 86px; }
+            .folder-card { padding: 9px 11px; }
+            .topbar-actions { gap: 4px; }
+            .btn-primary span { display: none; }
+            .btn-primary { padding: 8px 11px; }
+            .btn-icon { padding: 6px 8px; }
+        }
+
+        /* Mobile menu toggle button */
+        .mobile-menu-btn {
+            display: none;
             background: transparent;
             border: none;
-            color: var(--text-muted);
-            padding: 10px 16px;
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .sync-tab-btn.active {
-            color: var(--accent-blue);
-            border-bottom-color: var(--accent-blue);
-        }
-        .tab-counter {
-            background: rgba(255,255,255,0.1);
-            padding: 1px 7px;
-            border-radius: 10px;
-            font-size: 11px;
-        }
-
-        .sync-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 13px;
-        }
-        .sync-table th {
-            padding: 10px 14px;
-            color: var(--text-muted);
-            border-bottom: 1px solid var(--border-color);
-            font-size: 12px;
-            text-align: left;
-        }
-        .sync-table td {
-            padding: 12px 14px;
-            border-bottom: 1px solid rgba(255,255,255,0.04);
-        }
-
-        .status-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-        .status-pill.queued { background: rgba(255,255,255,0.08); color: var(--text-muted); }
-        .status-pill.uploading { background: #004A77; color: var(--accent-blue); animation: pulse 1.2s infinite; }
-        .status-pill.synced { background: rgba(52,168,83,0.15); color: #81C995; }
-        .status-pill.failed { background: rgba(234,67,53,0.15); color: #F28B82; }
-
-        .tag-pill {
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-size: 10px;
-            font-weight: 600;
-            text-transform: uppercase;
-            margin-right: 6px;
-        }
-        .tag-pill.NEW { background: rgba(52,168,83,0.2); color: #81C995; }
-        .tag-pill.MODIFIED { background: rgba(251,188,4,0.2); color: #FDD663; }
-
-        .console-logs {
-            background: #111;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 14px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 12px;
-            color: #A8C7FA;
-            height: 320px;
-            overflow-y: auto;
-            line-height: 1.6;
-        }
-        .log-entry { margin-bottom: 2px; }
-    
-        /* New Button & Dropdown */
-        .btn-new {
-            background-color: #37393B;
             color: var(--text-main);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 12px 20px;
-            font-size: 14px;
-            font-weight: 500;
-            display: flex;
-            align-items: center;
-            gap: 12px;
+            font-size: 18px;
             cursor: pointer;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-            margin: 0 4px 16px;
-            transition: all 0.2s;
-            position: relative;
+            padding: 8px 10px 8px 0;
         }
-        .btn-new:hover { background-color: #444746; box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
-        .btn-new i.plus { color: #A8C7FA; font-size: 18px; }
+        @media (max-width: 768px) {
+            .mobile-menu-btn { display: flex; align-items: center; }
+        }
 
-        .dropdown-menu {
-            position: absolute;
-            top: 52px;
-            left: 0;
-            background: #28292A;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-            width: 220px;
-            padding: 8px 0;
-            display: none;
-            flex-direction: column;
-            z-index: 1000;
-        }
-        .dropdown-menu.show { display: flex; }
-        .dropdown-item {
-            padding: 10px 16px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            font-size: 13px;
-            color: var(--text-main);
-            cursor: pointer;
-            transition: background 0.15s;
-        }
-        .dropdown-item:hover { background: #333537; color: var(--accent-blue); }
-        .dropdown-item i { width: 18px; text-align: center; font-size: 15px; }
-        .dropdown-divider { height: 1px; background: var(--border-color); margin: 6px 0; }
-
-        /* Full-screen Drag & Drop Overlay */
+        /* ── Upload & Drop Overlay ────────────────────────────────────────── */
         #dropOverlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100vw;
-            height: 100vh;
-            background: rgba(19, 19, 20, 0.88);
-            border: 3px dashed #A8C7FA;
+            position: fixed; inset: 0;
+            background: rgba(13,14,15,0.9);
+            border: 3px dashed var(--accent-blue);
             border-radius: 16px;
-            display: none;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            gap: 16px;
-            z-index: 9999;
-            pointer-events: none;
-            backdrop-filter: blur(4px);
+            display: none; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+            z-index: 9999; pointer-events: none; backdrop-filter: blur(6px);
         }
-        #dropOverlay.active { display: flex; }
-        #dropOverlay i { font-size: 48px; color: #A8C7FA; animation: bounce 1s infinite alternate; }
-        #dropOverlay h2 { font-size: 22px; color: #E3E3E3; font-weight: 500; }
-        #dropOverlay p { font-size: 14px; color: var(--text-muted); }
+        #dropOverlay.on { display: flex; }
+        #dropOverlay i { font-size: 52px; color: var(--accent-blue); animation: bounce 0.9s infinite alternate; }
+        @keyframes bounce { from{transform:translateY(0)} to{transform:translateY(-12px)} }
+        #dropOverlay h2 { font-size: 20px; color: var(--text-main); }
+        #dropOverlay p { font-size: 13px; color: var(--text-muted); }
 
-        @keyframes bounce {
-            from { transform: translateY(0); }
-            to { transform: translateY(-10px); }
-        }
-
-        /* Floating Upload Toast */
         #uploadToast {
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            background: #28292A;
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 16px 20px;
+            position: fixed; bottom: calc(var(--bottom-nav-height) + 16px); right: 16px;
+            background: var(--bg-card); border: 1px solid var(--border-color);
+            border-radius: 14px; padding: 14px 18px;
             box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-            width: 360px;
-            display: none;
-            flex-direction: column;
-            gap: 10px;
-            z-index: 5000;
+            width: 320px; max-width: calc(100vw - 32px); display: none; flex-direction: column; gap: 9px; z-index: 5000;
         }
-        .upload-header { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; color: #E3E3E3; }
-        .upload-filename { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .upload-progress-bg { background: #3C4043; height: 6px; border-radius: 3px; overflow: hidden; }
-        .upload-progress-bar { background: #34A853; height: 100%; width: 0%; border-radius: 3px; transition: width 0.2s; }
+        .ut-header { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; }
+        .ut-file { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ut-bar-bg { background: #3C4043; height: 5px; border-radius: 3px; overflow: hidden; }
+        .ut-bar { background: var(--accent-green); height: 100%; width: 0%; border-radius: 3px; transition: width 0.2s; }
 
+        /* ── New menu dropdown ────────────────────────────────────────────── */
+        .new-btn-wrap { position: relative; margin: 0 4px 14px; }
+        .btn-new {
+            background: #333537; color: var(--text-main); border: 1px solid var(--border-color);
+            border-radius: 16px; padding: 11px 18px; font-size: 13.5px; font-weight: 500;
+            display: flex; align-items: center; gap: 11px; cursor: pointer; width: 100%;
+            transition: all 0.15s; font-family: inherit; box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+        }
+        .btn-new:hover { background: #3E4042; }
+        .btn-new .plus { color: var(--accent-blue); font-size: 16px; }
+        .dropdown {
+            position: absolute; top: 48px; left: 0;
+            background: #2A2C2E; border: 1px solid var(--border-color);
+            border-radius: 12px; box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+            width: 210px; padding: 6px 0; display: none; flex-direction: column; z-index: 1000;
+        }
+        .dropdown.open { display: flex; }
+        .dd-item { padding: 10px 14px; display: flex; align-items: center; gap: 11px; font-size: 13px; cursor: pointer; transition: background 0.1s; }
+        .dd-item:hover { background: #333537; color: var(--accent-blue); }
+        .dd-item i { width: 16px; text-align: center; font-size: 14px; }
+        .dd-divider { height: 1px; background: var(--border-color); margin: 5px 0; }
+
+        .sse-dot { width: 7px; height: 7px; border-radius: 50%; background: #3C4043; display: inline-block; margin-right: 4px; transition: background 0.3s; }
+        .sse-dot.connected { background: var(--accent-green); box-shadow: 0 0 6px var(--accent-green); }
     </style>
 </head>
 <body>
-    <!-- Left Navigation Sidebar -->
-    <div class="sidebar">
-        <div class="logo">
-            <i class="fa-brands fa-google-drive"></i>
-            <span>Notion Drive</span>
-        </div>
 
-        <div class="nav-section">
-            <div class="nav-item active" id="navItemDrive" onclick="switchMainTab('drive')">
-                <i class="fa-solid fa-folder"></i>
-                <span>My Drive</span>
-            </div>
-            <div class="nav-item" id="navItemSync" onclick="switchMainTab('sync')">
-                <i class="fa-solid fa-arrows-rotate" id="syncNavIcon"></i>
-                <span>Sync Activity</span>
-                <span class="sync-badge idle" id="syncNavBadge">Idle</span>
-            </div>
-            <div class="nav-item" onclick="openNotionWeb()">
-                <i class="fa-solid fa-arrow-up-right-from-square"></i>
-                <span>Open in Notion</span>
-            </div>
-        </div>
+<!-- Mobile Drawer Backdrop -->
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeMobileMenu()"></div>
 
-        <div class="storage-card">
-            <div class="storage-title">
-                <span>Storage</span>
-                <span style="background: rgba(168,199,250,0.15); color: #A8C7FA; padding: 2px 8px; border-radius: 12px; font-weight: 600; font-size: 11px;"><i class="fa-solid fa-infinity"></i> Unlimited</span>
-            </div>
-            <div class="storage-bar-bg" style="background: rgba(255,255,255,0.08);">
-                <div class="storage-bar-fill" style="width: 100%; background: linear-gradient(90deg, #1A73E8, #34A853);"></div>
-            </div>
-            <div class="storage-text" id="storage-detail" style="font-weight: 500; font-size: 12px;">Loading storage...</div>
-            <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;"><i class="fa-solid fa-graduation-cap"></i> Student / Plus Unlimited Plan</div>
+<!-- Left Sidebar (Desktop + Mobile Drawer) -->
+<nav class="sidebar" id="sidebar">
+    <div class="logo"><i class="fa-brands fa-google-drive"></i><span>Notion Drive</span></div>
+
+    <!-- New button -->
+    <div class="new-btn-wrap">
+        <button class="btn-new" id="btnNew" onclick="toggleNewMenu(event)">
+            <i class="fa-solid fa-plus plus"></i> New
+        </button>
+        <div class="dropdown" id="newDropdown">
+            <div class="dd-item" onclick="triggerFileInput()"><i class="fa-solid fa-file-arrow-up"></i> Upload files</div>
+            <div class="dd-item" onclick="triggerFolderInput()"><i class="fa-solid fa-folder-arrow-up"></i> Upload folder</div>
+            <div class="dd-divider"></div>
+            <div class="dd-item" onclick="startSync('all')"><i class="fa-solid fa-arrows-rotate"></i> Sync all devices</div>
+            <div class="dd-item" onclick="startSync('c')"><i class="fa-solid fa-hard-drive"></i> Sync Local Disk (C:)</div>
+            <div class="dd-item" onclick="startSync('phone')"><i class="fa-solid fa-mobile-screen-button"></i> Sync Phone</div>
         </div>
     </div>
 
-    <!-- Main Workspace Container -->
-    <div class="main-container">
-        <!-- Top Search Bar -->
-        <div class="topbar">
-            <div class="search-box">
-                <i class="fa-solid fa-magnifying-glass"></i>
-                <input type="text" id="searchInput" placeholder="Search files and folders in My Drive..." oninput="handleSearch()">
-            </div>
-                        <div class="top-actions" style="display: flex; align-items: center; gap: 10px;">
-                <button class="btn-sync" onclick="refreshDrive()">
-                    <i class="fa-solid fa-arrows-rotate"></i>
-                    <span>Sync Notion</span>
-                </button>
-                <button class="btn-tool" id="btnLockDrive" onclick="lockDrive()" title="Lock Drive / Logout" style="display: none; background: rgba(234,67,53,0.1); color: #F28B82; border: 1px solid rgba(234,67,53,0.2); padding: 8px 12px; border-radius: 20px; font-size: 13px; cursor: pointer; align-items: center; gap: 6px;">
-                    <i class="fa-solid fa-lock"></i>
-                    <span>Lock</span>
-                </button>
-            </div>
+    <div class="nav-group">
+        <div class="nav-item active" id="navDrive" onclick="switchTab('drive'); closeMobileMenu();"><i class="fa-solid fa-folder"></i> My Drive</div>
+        <div class="nav-item" id="navRecent" onclick="switchTab('recent'); closeMobileMenu();"><i class="fa-solid fa-clock-rotate-left"></i> Recent</div>
+        <div class="nav-item" id="navStarred" onclick="switchTab('starred'); closeMobileMenu();"><i class="fa-solid fa-star"></i> Starred</div>
+    </div>
+
+    <div class="nav-group" style="margin-top: 6px;">
+        <div class="nav-group-label">Tools</div>
+        <div class="nav-item" id="navSync" onclick="switchTab('sync'); closeMobileMenu();">
+            <i class="fa-solid fa-arrows-rotate" id="syncNavIcon"></i> Sync Activity
+            <span class="nav-badge idle" id="syncNavBadge">Idle</span>
         </div>
+        <div class="nav-item" onclick="openSettingsModal(); closeMobileMenu();"><i class="fa-solid fa-sliders"></i> Optimization Settings</div>
+        <div class="nav-item" onclick="window.open('https://app.notion.com/p/3bd3d81b2f368055902aeee41736ae89','_blank')"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open in Notion</div>
+    </div>
 
-        <!-- 1. MY DRIVE VIEW -->
-        <div id="viewMyDrive" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
+    <div class="sidebar-bottom">
+        <div class="storage-info">
+            <div class="storage-header">
+                <span class="storage-label">Storage</span>
+                <span class="storage-badge"><i class="fa-solid fa-infinity"></i> Unlimited</span>
+            </div>
+            <div class="storage-bar"><div class="storage-fill" id="storageFill"></div></div>
+            <div class="storage-text" id="storageDetail">Loading...</div>
+            <div class="storage-sub">Student / Plus Unlimited Plan · <span class="sse-dot" id="sseDot"></span><span id="sseLabel">Connecting...</span></div>
+        </div>
+    </div>
+</nav>
+
+<!-- Main Area -->
+<div class="main">
+    <!-- Topbar -->
+    <div class="topbar">
+        <button class="mobile-menu-btn" onclick="toggleMobileMenu()" aria-label="Toggle Navigation"><i class="fa-solid fa-bars"></i></button>
+        <div class="search-wrap">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <input type="text" class="search-input" id="searchInput" placeholder="Search in My Drive..." oninput="handleSearch()">
+        </div>
+        <div class="topbar-actions">
+            <button class="btn-icon" onclick="openSettingsModal()" title="Optimization Settings">
+                <i class="fa-solid fa-sliders"></i>
+            </button>
+            <button class="btn-primary" onclick="refreshDrive()">
+                <i class="fa-solid fa-arrows-rotate" id="refreshIcon"></i> <span>Sync Notion</span>
+            </button>
+            <button class="btn-icon btn-danger" id="btnLock" onclick="lockDrive()" style="display:none;">
+                <i class="fa-solid fa-lock"></i>
+            </button>
+        </div>
+    </div>
+
+    <!-- Search category filters (Visible on search / mobile) -->
+    <div class="search-filters" id="searchFilters">
+        <button class="filter-chip active" onclick="setSearchCategory('all', this)"><i class="fa-solid fa-asterisk"></i> All</button>
+        <button class="filter-chip" onclick="setSearchCategory('image', this)"><i class="fa-solid fa-image"></i> Images</button>
+        <button class="filter-chip" onclick="setSearchCategory('document', this)"><i class="fa-solid fa-file-lines"></i> Docs</button>
+        <button class="filter-chip" onclick="setSearchCategory('video', this)"><i class="fa-solid fa-video"></i> Video</button>
+        <button class="filter-chip" onclick="setSearchCategory('audio', this)"><i class="fa-solid fa-music"></i> Audio</button>
+        <button class="filter-chip" onclick="setSearchCategory('code', this)"><i class="fa-solid fa-code"></i> Code</button>
+        <button class="filter-chip" onclick="setSearchCategory('folder', this)"><i class="fa-solid fa-folder"></i> Folders</button>
+    </div>
+
+    <!-- View panels -->
+    <div class="view-panel">
+
+        <!-- ═══ 1. MY DRIVE VIEW ═══════════════════════════════════════════ -->
+        <div class="view-panel-inner active" id="viewDrive">
+            <!-- Content header -->
             <div class="content-header">
-                <div class="breadcrumbs" id="breadcrumbContainer">
-                    <span class="breadcrumb-item active" onclick="loadDriveRoot()">
-                        <i class="fa-solid fa-hard-drive"></i> My Drive
-                    </span>
+                <div class="breadcrumbs" id="breadcrumbs">
+                    <span class="bc-item active" onclick="goRoot()"><i class="fa-solid fa-hard-drive"></i> My Drive</span>
                 </div>
-
-                <div class="toolbar-controls">
-                    <div class="control-pill">
-                        <span>Sort:</span>
+                <div class="toolbar" id="toolbar" style="display:none;">
+                    <div class="sort-pill">
+                        <span style="color:var(--text-muted);font-size:11px;">Sort:</span>
                         <select id="sortSelect" onchange="changeSort(this.value)">
                             <option value="name">Name</option>
-                            <option value="mtime">Last modified</option>
-                            <option value="ctime">Date created</option>
-                            <option value="size_bytes">File size</option>
-                            <option value="type">File type</option>
+                            <option value="mtime">Modified</option>
+                            <option value="size_bytes">Size</option>
                         </select>
-                        <button class="btn-tool" id="btnSortDir" onclick="toggleSortDir()" title="Reverse sort direction">
+                        <button class="btn-icon" style="padding:2px 4px;" onclick="toggleSortDir()" title="Reverse sort">
                             <i class="fa-solid fa-arrow-down-short-wide" id="sortDirIcon"></i>
                         </button>
                     </div>
-
-                    <div class="view-switcher">
-                        <button class="view-btn active" id="btnViewGrid" onclick="setViewMode('grid')" title="Grid view">
-                            <i class="fa-solid fa-table-cells-large"></i>
-                        </button>
-                        <button class="view-btn" id="btnViewList" onclick="setViewMode('list')" title="List view">
-                            <i class="fa-solid fa-list-ul"></i>
-                        </button>
+                    <div class="view-switch">
+                        <button class="view-btn active" id="btnGrid" onclick="setView('grid')" title="Grid"><i class="fa-solid fa-table-cells-large"></i></button>
+                        <button class="view-btn" id="btnList" onclick="setView('list')" title="List"><i class="fa-solid fa-list-ul"></i></button>
                     </div>
                 </div>
             </div>
 
-            <div class="workspace-scroll" id="workspaceContainer">
-                <div id="gridViewWrapper">
+            <!-- Scroll area -->
+            <div class="scroll-area" id="driveScroll">
+                <!-- Dashboard (shown at root, hidden in subfolders) -->
+                <div id="dashboardView">
+                    <div class="section-title">Storage Devices & Drives</div>
+                    <div class="device-grid" id="deviceGrid"></div>
+
+                    <div class="section-title" id="quickAccessTitle" style="display:none;">Quick Access Folders</div>
+                    <div class="recent-scroller" id="quickAccessRow" style="display:none;"></div>
+                </div>
+
+                <!-- Browser (shown in subfolders) -->
+                <div id="browserView" style="display:none;">
                     <div id="foldersSection">
-                        <div class="section-label">Folders</div>
+                        <div class="section-title" style="margin-top:6px;">Folders</div>
                         <div class="grid-view" id="foldersGrid"></div>
                     </div>
                     <div id="filesSection">
-                        <div class="section-label">Files</div>
+                        <div class="section-title">Files</div>
                         <div class="grid-view" id="filesGrid"></div>
+                        <div id="listView" style="display:none;">
+                            <table class="drive-table">
+                                <thead><tr>
+                                    <th onclick="tableSort('name')">Name <i class="fa-solid fa-sort" id="th-name"></i></th>
+                                    <th onclick="tableSort('type')">Type</th>
+                                    <th onclick="tableSort('mtime')">Modified</th>
+                                    <th onclick="tableSort('size_bytes')">Size</th>
+                                    <th>Actions</th>
+                                </tr></thead>
+                                <tbody id="tableBody"></tbody>
+                            </table>
+                            <div id="mobileListContainer"></div>
+                        </div>
+                    </div>
+                    <div class="empty-state" id="emptyMsg" style="display:none;">
+                        <i class="fa-regular fa-folder-open"></i>
+                        <p>This folder is empty</p>
+                    </div>
+                    <!-- Load-more sentinel for virtual scroll -->
+                    <div class="load-sentinel" id="loadSentinel" style="display:none;">
+                        <i class="fa-solid fa-circle-notch load-spinner"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ 2. RECENT VIEW ════════════════════════════════════════════ -->
+        <div class="view-panel-inner" id="viewRecent">
+            <div class="content-header">
+                <div class="breadcrumbs"><span class="bc-item active"><i class="fa-solid fa-clock-rotate-left"></i> Recent</span></div>
+            </div>
+            <div class="scroll-area">
+                <div class="section-title">Recently synced files</div>
+                <div class="grid-view" id="recentGrid"></div>
+                <div class="empty-state" id="recentEmpty" style="display:none;">
+                    <i class="fa-regular fa-clock"></i>
+                    <p>No recent files yet — sync a device to get started</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ 3. STARRED VIEW ═══════════════════════════════════════════ -->
+        <div class="view-panel-inner" id="viewStarred">
+            <div class="content-header">
+                <div class="breadcrumbs"><span class="bc-item active"><i class="fa-solid fa-star"></i> Starred</span></div>
+            </div>
+            <div class="scroll-area">
+                <div class="section-title">Starred devices &amp; folders</div>
+                <div class="device-grid" id="starredGrid"></div>
+            </div>
+        </div>
+
+        <!-- ═══ 4. SYNC CENTER ════════════════════════════════════════════ -->
+        <div class="view-panel-inner" id="viewSync">
+            <div id="viewSyncInner" style="padding:16px; overflow-y:auto; flex:1;">
+                <div class="sync-hero">
+                    <div class="sync-hdr-row">
+                        <div class="sync-title-area">
+                            <div class="sync-pulse" id="syncPulse"></div>
+                            <div>
+                                <h2 style="font-size:16px;font-weight:700;" id="syncMainTitle">Sync Activity</h2>
+                                <div style="font-size:11.5px;color:var(--text-muted);" id="syncSubtitle">Differential sync active • Live Notion Cloud mirroring</div>
+                            </div>
+                        </div>
+                        <div class="sync-controls">
+                            <button class="btn-sync-action primary" onclick="startSync('all')"><i class="fa-solid fa-arrows-rotate"></i> Sync All</button>
+                            <button class="btn-sync-action" onclick="startSync('c')"><i class="fa-solid fa-hard-drive"></i> C:</button>
+                            <button class="btn-sync-action" onclick="startSync('phone')"><i class="fa-solid fa-mobile-screen-button"></i> Phone</button>
+                            <button class="btn-sync-action danger" id="btnCancel" onclick="cancelSync()" style="display:none;"><i class="fa-solid fa-xmark"></i> Cancel</button>
+                        </div>
+                    </div>
+
+                    <div class="progress-wrap">
+                        <div class="progress-labels">
+                            <span id="progressLabel">Progress: 0%</span>
+                            <span id="progressDetail">0 / 0 files</span>
+                        </div>
+                        <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+                    </div>
+
+                    <div class="stats-grid">
+                        <div class="stat-box"><div class="stat-lbl">Target</div><div class="stat-val" id="statTarget" style="font-size:14px;color:var(--accent-blue);">—</div></div>
+                        <div class="stat-box"><div class="stat-lbl">Uploaded</div><div class="stat-val" id="statUploaded">0</div></div>
+                        <div class="stat-box"><div class="stat-lbl">Remaining</div><div class="stat-val" id="statRemaining">0</div></div>
+                        <div class="stat-box"><div class="stat-lbl">Speed</div><div class="stat-val" id="statSpeed" style="font-size:14px;">—</div></div>
+                    </div>
+
+                    <div class="active-file-box">
+                        <i class="fa-solid fa-cloud-arrow-up fa-fade"></i>
+                        <div class="afb-details">
+                            <div class="afb-name" id="afbName">Waiting for sync to start...</div>
+                            <div class="afb-path" id="afbPath">Run a sync command or tap one of the buttons above.</div>
+                        </div>
+                        <div class="afb-size" id="afbSize">—</div>
                     </div>
                 </div>
 
-                <div id="listViewWrapper" style="display: none;">
-                    <table class="drive-table">
-                        <thead>
-                            <tr>
-                                <th onclick="tableHeaderSort('name')">Name <i id="th-icon-name" class="fa-solid fa-sort"></i></th>
-                                <th onclick="tableHeaderSort('type')">Type <i id="th-icon-type" class="fa-solid fa-sort"></i></th>
-                                <th onclick="tableHeaderSort('mtime')">Last modified <i id="th-icon-mtime" class="fa-solid fa-sort"></i></th>
-                                <th onclick="tableHeaderSort('size_bytes')">File size <i id="th-icon-size_bytes" class="fa-solid fa-sort"></i></th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="driveTableBody"></tbody>
+                <!-- Sub tabs -->
+                <div class="sync-tabs">
+                    <button class="sync-tab-btn active" id="tabQueue" onclick="syncTab('queue')"><i class="fa-solid fa-list-check"></i> Queue <span class="tab-count" id="badgeQueue">0</span></button>
+                    <button class="sync-tab-btn" id="tabHistory" onclick="syncTab('history')"><i class="fa-solid fa-clock-rotate-left"></i> History <span class="tab-count" id="badgeHistory">0</span></button>
+                    <button class="sync-tab-btn" id="tabLogs" onclick="syncTab('logs')"><i class="fa-solid fa-terminal"></i> Logs</button>
+                </div>
+
+                <div id="subQueue">
+                    <table class="sync-table">
+                        <thead><tr><th>Change</th><th>File</th><th>Path</th><th>Size</th><th>Status</th></tr></thead>
+                        <tbody id="queueBody"><tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:22px;">No files in queue.</td></tr></tbody>
                     </table>
                 </div>
-
-                <div id="emptyMessage" style="display:none; color: var(--text-muted); padding: 48px 0; text-align: center; font-size: 15px;">
-                    <i class="fa-regular fa-folder-open" style="font-size: 36px; margin-bottom: 12px; display: block; opacity: 0.6;"></i>
-                    This folder is empty.
+                <div id="subHistory" style="display:none;">
+                    <table class="sync-table">
+                        <thead><tr><th>File</th><th>Path</th><th>Size</th><th>Time</th><th>Result</th></tr></thead>
+                        <tbody id="historyBody"><tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:22px;">No history yet.</td></tr></tbody>
+                    </table>
+                </div>
+                <div id="subLogs" style="display:none;">
+                    <div class="console-box" id="consoleBox"></div>
                 </div>
             </div>
         </div>
 
-        <!-- 2. SYNC CENTER VIEW -->
-        <div id="viewSyncCenter" style="display: none; flex-direction: column; flex: 1; overflow-y: auto; padding: 24px;">
-            <!-- Hero Sync Card -->
-            <div class="sync-hero-card">
-                <div class="sync-header-row">
-                    <div class="sync-title-area">
-                        <div class="sync-pulse-dot" id="syncPulseDot"></div>
-                        <div>
-                            <h2 style="font-size: 18px; font-weight: 600;" id="syncMainStatus">Live Terminal Sync Activity</h2>
-                            <div style="font-size: 12px; color: var(--text-muted);" id="syncSubStatus">Run <code>Notion_Sync.bat</code> or <code>python notion_sync.py</code> in terminal • Live progress mirrors here automatically</div>
-                        </div>
-                    </div>
+    </div><!-- /.view-panel -->
+</div><!-- /.main -->
 
-                    <div class="sync-controls-row">
-                        <span style="font-size: 12px; color: #A8C7FA; background: rgba(168,199,250,0.1); padding: 6px 14px; border-radius: 20px; border: 1px solid rgba(168,199,250,0.2); display: flex; align-items: center; gap: 8px;">
-                            <i class="fa-solid fa-terminal"></i> Terminal Sync Monitor
-                        </span>
-                    </div>
-                </div>
+<!-- Mobile Bottom Navigation -->
+<nav class="mobile-bottom-nav" id="mobileBottomNav">
+    <button class="mbn-item active" id="mbnDrive" onclick="switchTab('drive'); goRoot();">
+        <i class="fa-solid fa-folder"></i>
+        <span>Drive</span>
+    </button>
+    <button class="mbn-item" id="mbnRecent" onclick="switchTab('recent');">
+        <i class="fa-solid fa-clock-rotate-left"></i>
+        <span>Recent</span>
+    </button>
+    <button class="mbn-item" onclick="triggerFileInput();">
+        <div class="mbn-new-circle"><i class="fa-solid fa-plus"></i></div>
+        <span>Upload</span>
+    </button>
+    <button class="mbn-item" id="mbnStarred" onclick="switchTab('starred');">
+        <i class="fa-solid fa-star"></i>
+        <span>Starred</span>
+    </button>
+    <button class="mbn-item" id="mbnSync" onclick="switchTab('sync');">
+        <i class="fa-solid fa-arrows-rotate"></i>
+        <span>Sync</span>
+    </button>
+</nav>
 
-                <!-- Progress Bar -->
-                <div class="progress-container">
-                    <div class="progress-labels">
-                        <span id="syncProgressLabel">Progress: 0%</span>
-                        <span id="syncStatsDetail">0 / 0 files</span>
-                    </div>
-                    <div class="progress-bar-outer">
-                        <div class="progress-bar-inner" id="syncProgressBar"></div>
-                    </div>
-                </div>
+<!-- File Context Action Sheet (Mobile & Desktop) -->
+<div class="action-sheet-overlay" id="actionSheetOverlay" onclick="closeActionSheet(event)">
+    <div class="action-sheet" id="actionSheet" onclick="event.stopPropagation()">
+        <div class="as-header">
+            <div class="as-icon" id="asIcon"><i class="fa-solid fa-file"></i></div>
+            <div class="as-info">
+                <div class="as-title" id="asTitle">filename.ext</div>
+                <div class="as-subtitle" id="asSubtitle">Size • Date</div>
+            </div>
+            <button class="as-close" onclick="closeActionSheet()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="as-body">
+            <button class="as-item" id="asBtnPreview" onclick="handleAction('preview')"><i class="fa-solid fa-eye"></i> Preview</button>
+            <a class="as-item" id="asBtnBrowser" target="_blank"><i class="fa-solid fa-globe"></i> Open via Browser</a>
+            <a class="as-item" id="asBtnNotion" target="_blank"><i class="fa-solid fa-cloud"></i> Open in Notion</a>
+            <a class="as-item" id="asBtnDownload" target="_blank"><i class="fa-solid fa-download"></i> Download</a>
+            <button class="as-item" onclick="handleAction('copy_browser_link')"><i class="fa-solid fa-link"></i> Copy Browser Link</button>
+            <button class="as-item text-danger" onclick="handleAction('delete')"><i class="fa-solid fa-trash"></i> Delete from Cloud &amp; Drive</button>
+        </div>
+    </div>
+</div>
 
-                <!-- Live Metrics Grid -->
-                <div class="stats-grid">
-                    <div class="stat-box">
-                        <div class="stat-label">Target Device</div>
-                        <div class="stat-value" id="statTarget" style="font-size: 16px; color: var(--accent-blue);">-</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">Uploaded</div>
-                        <div class="stat-value" id="statUploaded">0</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">Remaining Changes</div>
-                        <div class="stat-value" id="statRemaining">0</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-label">Sync Speed</div>
-                        <div class="stat-value" id="statSpeed" style="font-size: 16px;">-</div>
-                    </div>
-                </div>
+<!-- Preview Modal -->
+<div class="modal-overlay" id="previewModal" onclick="closeModal(event)">
+    <div class="modal-box" onclick="event.stopPropagation()">
+        <button class="modal-nav-btn modal-prev-btn" id="modalPrevBtn" onclick="navigatePreview(-1)" title="Previous (Left Arrow)"><i class="fa-solid fa-chevron-left"></i></button>
+        <button class="modal-nav-btn modal-next-btn" id="modalNextBtn" onclick="navigatePreview(1)" title="Next (Right Arrow)"><i class="fa-solid fa-chevron-right"></i></button>
+        <div class="modal-hdr">
+            <span class="modal-title" id="modalTitle">Preview</span>
+            <div class="modal-actions">
+                <span class="modal-counter" id="modalCounter">1 / 1</span>
+                <a class="action-btn" id="modalBrowser" target="_blank" title="Open via Browser" style="color:var(--accent-blue);"><i class="fa-solid fa-globe"></i> Open via Browser</a>
+                <a class="action-btn" id="modalNotion" target="_blank" title="Open in Notion Cloud"><i class="fa-solid fa-cloud"></i> Open in Notion</a>
+                <a class="action-btn" id="modalDl" title="Download"><i class="fa-solid fa-download"></i></a>
+                <button class="action-btn" onclick="closeModal(event)"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+        </div>
+        <div class="modal-body" id="modalBody"></div>
+    </div>
+</div>
 
-                <!-- Active Uploading File Spotlight -->
-                <div class="active-file-card" id="activeFileBox">
-                    <i class="fa-solid fa-cloud-arrow-up fa-fade"></i>
-                    <div class="active-file-details">
-                        <div class="active-file-name" id="activeFileName">Waiting for terminal sync to start...</div>
-                        <div class="active-file-path" id="activeFilePath">Run Notion_Sync.bat or python notion_sync.py in your terminal. Live sync progress and files will stream here in real-time.</div>
+<!-- Optimization Settings Modal -->
+<div class="modal-overlay" id="settingsModal" onclick="closeSettingsModal(event)">
+    <div class="modal-box" style="max-width:560px;" onclick="event.stopPropagation()">
+        <div class="modal-hdr">
+            <span class="modal-title"><i class="fa-solid fa-sliders" style="color:var(--accent-blue);margin-right:8px;"></i> Optimization &amp; Performance Settings</span>
+            <button class="action-btn" onclick="closeSettingsModal(event)"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="modal-body" style="flex-direction:column;align-items:stretch;padding:20px;background:var(--bg-sidebar);gap:14px;">
+            <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div style="font-weight:600;font-size:13px;"><i class="fa-solid fa-globe" style="color:var(--accent-blue);margin-right:6px;"></i> Direct Browser Viewing</div>
+                        <div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">Open cloud files directly in browser with 1 click</div>
                     </div>
-                    <div id="activeFileSize" style="font-weight: 600; font-size: 13px; color: var(--accent-blue);">-</div>
+                    <span style="background:rgba(52,168,83,0.15);color:#81C995;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;"><i class="fa-solid fa-circle-check"></i> Active</span>
                 </div>
             </div>
 
-            <!-- Sub Tabs: Live Queue, History, Logs -->
-            <div class="sync-tabs-header">
-                <button class="sync-tab-btn active" id="tabBtnQueue" onclick="switchSyncSubTab('queue')">
-                    <i class="fa-solid fa-list-check"></i> Live Queue <span class="tab-counter" id="badgeQueueCount">0</span>
-                </button>
-                <button class="sync-tab-btn" id="tabBtnHistory" onclick="switchSyncSubTab('history')">
-                    <i class="fa-solid fa-clock-rotate-left"></i> Completed History <span class="tab-counter" id="badgeHistoryCount">0</span>
-                </button>
-                <button class="sync-tab-btn" id="tabBtnLogs" onclick="switchSyncSubTab('logs')">
-                    <i class="fa-solid fa-terminal"></i> Console Logs
-                </button>
+            <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div style="font-weight:600;font-size:13px;"><i class="fa-solid fa-bolt" style="color:var(--accent-orange);margin-right:6px;"></i> 64KB Chunk Buffer Streaming</div>
+                        <div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">Instant streaming playback without RAM buffering</div>
+                    </div>
+                    <span style="background:rgba(52,168,83,0.15);color:#81C995;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;"><i class="fa-solid fa-gauge-high"></i> High Speed</span>
+                </div>
             </div>
 
-            <!-- 1. Live Queue Table (Dynamic Sliding Window) -->
-            <div id="syncSubViewQueue">
-                <table class="sync-table">
-                    <thead>
-                        <tr>
-                            <th>Change</th>
-                            <th>File Name</th>
-                            <th>Target Cloud Path</th>
-                            <th>Size</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="syncQueueTableBody">
-                        <tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No files currently in queue.</td></tr>
-                    </tbody>
-                </table>
+            <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div style="font-weight:600;font-size:13px;"><i class="fa-solid fa-database" style="color:var(--accent-blue);margin-right:6px;"></i> SQLite Index &amp; WAL Cache</div>
+                        <div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">Sub-millisecond queries for 10,000+ items</div>
+                    </div>
+                    <span style="background:rgba(168,199,250,0.15);color:var(--accent-blue);padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;">10,799 Indexed</span>
+                </div>
+                <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
+                    <button class="btn-primary" id="btnOptDb" onclick="optimizeDatabase()" style="font-size:12px;padding:6px 14px;">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i> Vacuum &amp; Optimize DB
+                    </button>
+                    <span id="optDbStatus" style="font-size:11.5px;color:var(--text-muted);"></span>
+                </div>
             </div>
 
-            <!-- 2. History Table -->
-            <div id="syncSubViewHistory" style="display: none;">
-                <table class="sync-table">
-                    <thead>
-                        <tr>
-                            <th>File Name</th>
-                            <th>Cloud Destination</th>
-                            <th>Size</th>
-                            <th>Time</th>
-                            <th>Result</th>
-                        </tr>
-                    </thead>
-                    <tbody id="syncHistoryTableBody">
-                        <tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No upload history yet.</td></tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- 3. Console Logs -->
-            <div id="syncSubViewLogs" style="display: none;">
-                <div class="console-logs" id="consoleLogsBox"></div>
+            <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div style="font-weight:600;font-size:13px;"><i class="fa-solid fa-arrows-rotate" style="color:var(--accent-green);margin-right:6px;"></i> Real-Time Notion DB Watcher</div>
+                        <div style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">Auto-detects Notion Cloud deletions and syncs to browser</div>
+                    </div>
+                    <span style="background:rgba(52,168,83,0.15);color:#81C995;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;"><i class="fa-solid fa-satellite-dish"></i> 8s Poller</span>
+                </div>
             </div>
         </div>
     </div>
+</div>
 
-    <!-- Preview Modal -->
-    <div class="modal-overlay" id="previewModal" onclick="closeModal(event)">
-        <div class="modal-content" onclick="event.stopPropagation()">
-            <div class="modal-header">
-                <span style="font-weight: 600;" id="modalTitle">File Preview</span>
-                <div style="display: flex; gap: 10px;">
-                    <a id="modalOpenTabBtn" class="action-btn" title="Open in New Tab" target="_blank"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
-                    <a id="modalDownloadBtn" class="action-btn" title="Download File"><i class="fa-solid fa-download"></i></a>
-                    <button class="action-btn" onclick="closeModal(event)"><i class="fa-solid fa-xmark"></i></button>
-                </div>
-            </div>
-            <div class="modal-body" id="modalBody"></div>
-        </div>
-    </div>
+<!-- Drag-drop overlay -->
+<div id="dropOverlay">
+    <i class="fa-solid fa-cloud-arrow-up"></i>
+    <h2>Drop to upload to Notion Cloud</h2>
+    <p>Files will be synced to your Notion database</p>
+</div>
 
-    <script>
-        let currentFolderId = null;
-        let driveData = { folders: [], files: [], breadcrumbs: [] };
-        let viewMode = 'grid';
-        let sortKey = 'name';
-        let sortDir = 1;
-        let currentMainTab = 'drive';
-        let currentSyncSubTab = 'queue';
-        let lastCacheVersion = -1;
-        let driveFetchInFlight = false;
-        let queuedDriveFolderId = undefined;
-        let visibleFiles = [];
-        const MAX_RENDER_FILES = 150;
-        const LARGE_FOLDER_THRESHOLD = 200;
+<!-- Upload toast -->
+<div id="uploadToast">
+    <div class="ut-header"><span id="utTitle">Uploading...</span><span id="utPct">0%</span></div>
+    <div class="ut-file" id="utFile"></div>
+    <div class="ut-bar-bg"><div class="ut-bar" id="utBar"></div></div>
+</div>
 
-        const fileIcons = {
-            'pdf': 'fa-file-pdf', 'doc': 'fa-file-word', 'docx': 'fa-file-word',
-            'xls': 'fa-file-excel', 'xlsx': 'fa-file-excel', 'csv': 'fa-file-excel',
-            'ppt': 'fa-file-powerpoint', 'pptx': 'fa-file-powerpoint',
-            'jpg': 'fa-file-image', 'jpeg': 'fa-file-image', 'png': 'fa-file-image', 'webp': 'fa-file-image', 'svg': 'fa-file-image',
-            'mp4': 'fa-file-video', 'mkv': 'fa-file-video', 'mp3': 'fa-file-audio', 'm4a': 'fa-file-audio', 'opus': 'fa-file-audio',
-            'zip': 'fa-file-zipper', 'rar': 'fa-file-zipper', '7z': 'fa-file-zipper',
-            'py': 'fa-file-code', 'js': 'fa-file-code', 'ts': 'fa-file-code', 'html': 'fa-file-code', 'css': 'fa-file-code', 'json': 'fa-file-code'
-        };
+<!-- Hidden file inputs -->
+<input type="file" id="fileInput" multiple style="display:none;" onchange="handleFiles(event)">
+<input type="file" id="folderInput" webkitdirectory multiple style="display:none;" onchange="handleFiles(event)">
 
-        function getFolderIcon(name) {
-            if (name.includes('Local Disk (C:)') || name.includes('Local Disk (D:)')) return 'fa-solid fa-hard-drive';
-            if (name.includes('Internal shared storage') || name.includes('Internal Storage')) return 'fa-solid fa-mobile-screen-button';
-            if (name.includes('SD card') || name.includes('SD Card')) return 'fa-solid fa-sd-card';
-            return 'fa-solid fa-folder';
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+const STATE = {
+    tab: 'drive',          // drive | recent | starred | sync
+    folderId: null,        // null = root
+    driveData: { folders: [], files: [], breadcrumbs: [], total_files: 0, has_more: false },
+    viewMode: 'grid',
+    sortKey: 'name',
+    sortDir: 1,
+    // Search
+    searchQuery: '',
+    searchCategory: 'all',
+    // Virtualization / Chunked Scroll
+    loadedFiles: [],
+    pageOffset: 0,
+    fetchingMore: false,
+    totalFiles: 0,
+    // Context Action Sheet
+    selectedItem: null,
+    // Sync sub-tab
+    syncSubTab: 'queue',
+    lastCacheVer: -1,
+};
+
+const IMG_EXTS = new Set(['jpg','jpeg','png','webp','gif','svg','bmp','ico']);
+const fileIcons = {
+    pdf:'fa-file-pdf', doc:'fa-file-word', docx:'fa-file-word', txt:'fa-file-lines',
+    xls:'fa-file-excel', xlsx:'fa-file-excel', csv:'fa-file-excel',
+    ppt:'fa-file-powerpoint', pptx:'fa-file-powerpoint',
+    jpg:'fa-file-image', jpeg:'fa-file-image', png:'fa-file-image',
+    webp:'fa-file-image', gif:'fa-file-image', svg:'fa-file-image',
+    mp4:'fa-file-video', mkv:'fa-file-video', mov:'fa-file-video', webm:'fa-file-video',
+    mp3:'fa-file-audio', wav:'fa-file-audio', m4a:'fa-file-audio', opus:'fa-file-audio',
+    zip:'fa-file-zipper', rar:'fa-file-zipper', '7z':'fa-file-zipper',
+    py:'fa-file-code', js:'fa-file-code', ts:'fa-file-code',
+    html:'fa-file-code', css:'fa-file-code', json:'fa-file-code'
+};
+
+function getFileIcon(ext) { return fileIcons[(ext||'').replace('.','').toLowerCase()] || 'fa-file'; }
+function getFolderIcon(name) {
+    if (!name) return 'fa-folder';
+    const n = name.toLowerCase();
+    if (n.includes('local disk') || n.includes('(c:)') || n.includes('(d:)')) return 'fa-hard-drive';
+    if (n.includes('internal shared storage') || n.includes('internal storage') || n.includes('phone') || n.includes('nord')) return 'fa-mobile-screen-button';
+    if (n.includes('sd card') || n.includes('sdcard')) return 'fa-sd-card';
+    return 'fa-folder';
+}
+function isAndroid(p) {
+    if (!p) return false;
+    return p.includes('Internal shared storage') || p.includes('SD card') || p.startsWith('/storage') || p.startsWith('/sdcard');
+}
+function fmtBytes(b) {
+    if (!b) return '0 B';
+    const k=1024, s=['B','KB','MB','GB'];
+    const i=Math.min(Math.floor(Math.log(b)/Math.log(k)), s.length-1);
+    return (b/Math.pow(k,i)).toFixed(1)+' '+s[i];
+}
+function fmtDate(ts) {
+    if (!ts || ts===0) return '—';
+    return new Date(ts*1000).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'});
+}
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NAVIGATION & TABS
+// ═══════════════════════════════════════════════════════════════════════════
+const NAV_IDS = { drive:'navDrive', recent:'navRecent', starred:'navStarred', sync:'navSync' };
+const MBN_IDS = { drive:'mbnDrive', recent:'mbnRecent', starred:'mbnStarred', sync:'mbnSync' };
+const VIEW_IDS = { drive:'viewDrive', recent:'viewRecent', starred:'viewStarred', sync:'viewSync' };
+
+function switchTab(tab) {
+    STATE.tab = tab;
+    Object.entries(NAV_IDS).forEach(([k,id]) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', k === tab);
+    });
+    Object.entries(MBN_IDS).forEach(([k,id]) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', k === tab);
+    });
+    Object.entries(VIEW_IDS).forEach(([k,id]) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('active', k === tab);
+    });
+    if (tab === 'drive') fetchDrive(STATE.folderId);
+    else if (tab === 'recent') loadRecent();
+    else if (tab === 'starred') loadStarred();
+    else if (tab === 'sync') pollSync();
+}
+
+function goRoot() {
+    STATE.folderId = null;
+    STATE.searchQuery = '';
+    const si = document.getElementById('searchInput');
+    if (si) si.value = '';
+    document.getElementById('searchFilters').style.display = 'none';
+    fetchDrive(null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DRIVE FETCH + VIRTUAL SCROLL (DCIM / Camera lag-free)
+// ═══════════════════════════════════════════════════════════════════════════
+const VIRTUAL_CHUNK = 80;
+
+function fetchDrive(folderId, reset = true) {
+    STATE.folderId = folderId;
+    if (reset) {
+        STATE.loadedFiles = [];
+        STATE.pageOffset = 0;
+        STATE.totalFiles = 0;
+        STATE.fetchingMore = false;
+    }
+    _doFetch(folderId);
+}
+
+async function _doFetch(folderId) {
+    if (STATE.fetchingMore) return;
+    STATE.fetchingMore = true;
+    try {
+        let url = '/api/drive';
+        const ps = new URLSearchParams({
+            offset: STATE.pageOffset,
+            limit: VIRTUAL_CHUNK,
+            sort: STATE.sortKey,
+            order: STATE.sortDir === 1 ? 'asc' : 'desc'
+        });
+        if (folderId) ps.set('folder_id', folderId);
+        const res = await fetch(url + '?' + ps, { cache: 'no-store' });
+        const d = await res.json();
+        STATE.driveData = d;
+
+        if (STATE.pageOffset === 0) {
+            STATE.loadedFiles = d.files || [];
+            _renderDriveShell(d);
+        } else {
+            STATE.loadedFiles = STATE.loadedFiles.concat(d.files || []);
+            _appendFileCards(d.files || []);
         }
 
-        function switchMainTab(tab) {
-            currentMainTab = tab;
-            document.getElementById('navItemDrive').classList.toggle('active', tab === 'drive');
-            document.getElementById('navItemSync').classList.toggle('active', tab === 'sync');
-            
-            document.getElementById('viewMyDrive').style.display = tab === 'drive' ? 'flex' : 'none';
-            document.getElementById('viewSyncCenter').style.display = tab === 'sync' ? 'flex' : 'none';
+        STATE.totalFiles = d.total_files || STATE.loadedFiles.length;
+        STATE.pageOffset += (d.files || []).length;
+        STATE.driveData.has_more = d.has_more;
+        _updateLoadSentinel();
+    } catch(e) {
+        console.error('Drive fetch error', e);
+    } finally {
+        STATE.fetchingMore = false;
+    }
+}
 
-            if (tab === 'drive') {
-                fetchDrive(currentFolderId);
-            } else if (tab === 'sync') {
-                pollSyncStatus();
-            }
-        }
+function _renderDriveShell(d) {
+    const isRoot = !STATE.folderId && !STATE.searchQuery;
+    _renderBreadcrumbs(d.breadcrumbs || []);
 
-        function switchSyncSubTab(subTab) {
-            currentSyncSubTab = subTab;
-            document.getElementById('tabBtnQueue').classList.toggle('active', subTab === 'queue');
-            document.getElementById('tabBtnHistory').classList.toggle('active', subTab === 'history');
-            document.getElementById('tabBtnLogs').classList.toggle('active', subTab === 'logs');
+    document.getElementById('toolbar').style.display = isRoot ? 'none' : 'flex';
+    document.getElementById('dashboardView').style.display = isRoot ? 'block' : 'none';
+    document.getElementById('browserView').style.display = isRoot ? 'none' : 'block';
 
-            document.getElementById('syncSubViewQueue').style.display = subTab === 'queue' ? 'block' : 'none';
-            document.getElementById('syncSubViewHistory').style.display = subTab === 'history' ? 'block' : 'none';
-            document.getElementById('syncSubViewLogs').style.display = subTab === 'logs' ? 'block' : 'none';
-        }
+    if (isRoot) {
+        _renderDashboard(d);
+        return;
+    }
 
-        async function fetchDrive(folderId = null) {
-            currentFolderId = folderId;
-            if (driveFetchInFlight) {
-                queuedDriveFolderId = folderId;
-                return;
-            }
+    // Render folders
+    const fg = document.getElementById('foldersGrid');
+    document.getElementById('foldersSection').style.display = (d.folders && d.folders.length) ? 'block' : 'none';
+    fg.innerHTML = (d.folders || []).map(f => _folderCard(f)).join('');
 
-            driveFetchInFlight = true;
-            const url = folderId ? `/api/drive?folder_id=${encodeURIComponent(folderId)}` : '/api/drive';
-            try {
-                const res = await fetch(url, { cache: 'no-store' });
-                if (!res.ok) {
-                    throw new Error(`Drive request failed: ${res.status}`);
-                }
-                const data = await res.json();
-                if (!data || !Array.isArray(data.folders) || !Array.isArray(data.files)) {
-                    throw new Error('Drive response payload is malformed');
-                }
-                driveData = data;
-                sortItems();
-                renderView();
-                renderBreadcrumbs();
-            } catch (e) {
-                console.error("Drive fetch error:", e);
-            } finally {
-                driveFetchInFlight = false;
-                if (queuedDriveFolderId !== undefined) {
-                    const nextFolderId = queuedDriveFolderId;
-                    queuedDriveFolderId = undefined;
-                    fetchDrive(nextFolderId);
-                }
-            }
-        }
+    // Render files
+    const fg2 = document.getElementById('filesGrid');
+    const lv = document.getElementById('listView');
+    document.getElementById('filesSection').style.display = (d.files.length || d.has_more) ? 'block' : 'none';
+    document.getElementById('emptyMsg').style.display = (!d.folders.length && !d.files.length && !d.has_more) ? 'block' : 'none';
 
-        function formatBytes(bytes) {
-            if (!bytes || bytes === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-        }
+    if (STATE.viewMode === 'grid') {
+        lv.style.display = 'none';
+        fg2.style.display = '';
+        fg2.innerHTML = '';
+        _appendFileCards(d.files || []);
+    } else {
+        fg2.style.display = 'none';
+        lv.style.display = 'block';
+        _renderTable();
+    }
+}
 
-        function formatDate(timestamp) {
-            if (!timestamp || timestamp === 0) return '-';
-            const d = new Date(timestamp * 1000);
-            return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-        }
+function _appendFileCards(files) {
+    const fg2 = document.getElementById('filesGrid');
+    if (STATE.viewMode !== 'grid') return;
+    const startIdx = STATE.loadedFiles.length - files.length;
+    fg2.insertAdjacentHTML('beforeend', files.map((f, i) => _fileCard(f, startIdx + i)).join(''));
+    // Observe thumbnails for lazy loading
+    fg2.querySelectorAll('img[data-src]').forEach(img => _thumbObserver.observe(img));
+}
 
-        function isAndroidLikePath(p) {
-            if (!p) return false;
-            return p.includes('Internal shared storage') ||
-                   p.includes('Internal Storage') ||
-                   p.includes('SD card') ||
-                   p.includes('SD Card') ||
-                   p.startsWith('/storage') ||
-                   p.startsWith('/sdcard');
-        }
-
-        function changeSort(val) {
-            sortKey = val;
-            sortItems();
-            renderView();
-        }
-
-        function toggleSortDir() {
-            sortDir *= -1;
-            document.getElementById('sortDirIcon').className = sortDir === 1 ? 'fa-solid fa-arrow-down-short-wide' : 'fa-solid fa-arrow-up-wide-short';
-            sortItems();
-            renderView();
-        }
-
-        function tableHeaderSort(key) {
-            if (sortKey === key) {
-                toggleSortDir();
-            } else {
-                sortKey = key;
-                sortDir = 1;
-                document.getElementById('sortSelect').value = key;
-                sortItems();
-                renderView();
-            }
-        }
-
-        function sortItems() {
-            const cmp = (a, b) => {
-                let va = a[sortKey];
-                let vb = b[sortKey];
-                if (typeof va === 'string') va = va.toLowerCase();
-                if (typeof vb === 'string') vb = vb.toLowerCase();
-                if (va < vb) return -1 * sortDir;
-                if (va > vb) return 1 * sortDir;
-                return 0;
+// Lazy thumbnail IntersectionObserver
+const _thumbObserver = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+        if (e.isIntersecting) {
+            const img = e.target;
+            img.src = img.dataset.src;
+            img.onload = () => {
+                img.style.opacity = '1';
+                const sk = img.previousElementSibling;
+                if (sk && sk.classList && sk.classList.contains('skeleton')) sk.remove();
             };
-            if (driveData.folders) driveData.folders.sort(cmp);
-            if (driveData.files) driveData.files.sort(cmp);
-        }
-
-        function setViewMode(mode) {
-            viewMode = mode;
-            document.getElementById('btnViewGrid').classList.toggle('active', mode === 'grid');
-            document.getElementById('btnViewList').classList.toggle('active', mode === 'list');
-            document.getElementById('gridViewWrapper').style.display = mode === 'grid' ? 'block' : 'none';
-            document.getElementById('listViewWrapper').style.display = mode === 'list' ? 'block' : 'none';
-            renderView();
-        }
-
-        function renderView() {
-            const isEmpty = (!driveData.folders || driveData.folders.length === 0) && (!driveData.files || driveData.files.length === 0);
-            document.getElementById('emptyMessage').style.display = isEmpty ? 'block' : 'none';
-
-            const allFiles = Array.isArray(driveData.files) ? driveData.files : [];
-            const displayedFiles = allFiles.slice(0, MAX_RENDER_FILES);
-            visibleFiles = displayedFiles;
-            const isLargeFolder = allFiles.length > LARGE_FOLDER_THRESHOLD;
-
-            const existingWarn = document.getElementById('largeFolderWarning');
-            if (existingWarn) {
-                existingWarn.remove();
-            }
-            if (allFiles.length > MAX_RENDER_FILES) {
-                const warning = document.createElement('div');
-                warning.id = 'largeFolderWarning';
-                warning.style.cssText = 'margin:10px 0 14px; padding:10px 12px; border:1px solid #3C4043; border-radius:10px; color:#c9d1d9; background:#1d232a; font-size:12px;';
-                warning.textContent = `Large folder detected: showing first ${MAX_RENDER_FILES.toLocaleString()} of ${allFiles.length.toLocaleString()} files for smooth browsing.`;
-                const container = document.getElementById('viewMyDrive');
-                if (container) container.prepend(warning);
-            }
-
-            if (viewMode === 'grid') {
-                const fg = document.getElementById('foldersGrid');
-                const fs = document.getElementById('filesGrid');
-
-                document.getElementById('foldersSection').style.display = driveData.folders.length ? 'block' : 'none';
-                document.getElementById('filesSection').style.display = driveData.files.length ? 'block' : 'none';
-
-                const folderCards = driveData.folders.map((f) => {
-                    const countTxt = f.item_count !== undefined ? `${f.item_count} items` : '';
-                    return `
-                        <div class="folder-card" onclick="fetchDrive('${f.id}')" title="${f.name}">
-                            <i class="${getFolderIcon(f.name)}"></i>
-                            <div style="overflow:hidden;">
-                                <div class="title">${f.name}</div>
-                                <div class="count">${countTxt}</div>
-                            </div>
-                        </div>
-                    `;
-                });
-                fg.innerHTML = folderCards.join('');
-
-                const fileCards = displayedFiles.map((f, i) => {
-                    const ext = (f.extension || '').replace('.', '').toLowerCase();
-                    const iconClass = fileIcons[ext] || 'fa-file';
-                    const isImg = ['jpg','jpeg','png','webp','gif','svg'].includes(ext);
-                    const useThumb = isImg && !isLargeFolder && !isAndroidLikePath(f.local_path);
-                    const thumb = useThumb
-                        ? `<img src="/view?path=${encodeURIComponent(f.local_path)}" loading="lazy" onerror="this.style.display='none'; this.nextElementSibling && (this.nextElementSibling.style.display='block');"><i class="fa-solid ${iconClass}" style="display:none;"></i>`
-                        : `<i class="fa-solid ${iconClass}"></i>`;
-
-                    return `
-                        <div class="file-card" onclick='previewFileByIndex(${i})' title="${f.name}">
-                            <div class="file-thumb">${thumb}</div>
-                            <div class="file-info">
-                                <i class="fa-solid ${iconClass}"></i>
-                                <div class="file-name">${f.name}</div>
-                            </div>
-                            <div class="file-meta">
-                                <span>${formatBytes(f.size_bytes)}</span>
-                                <span>${f.mtime ? formatDate(f.mtime).split(',')[0] : '-'}</span>
-                            </div>
-                        </div>
-                    `;
-                });
-                fs.innerHTML = fileCards.join('');
-            } else {
-                const tbody = document.getElementById('driveTableBody');
-                const folderRows = driveData.folders.map((f) => {
-                    return `
-                        <tr onclick="fetchDrive('${f.id}')">
-                            <td><div class="table-item-name"><i class="${getFolderIcon(f.name)}"></i><span>${f.name}</span></div></td>
-                            <td>Folder</td>
-                            <td>${formatDate(f.mtime)}</td>
-                            <td>-</td>
-                            <td><a class="action-btn" href="/download-folder?id=${f.id}" onclick="event.stopPropagation()"><i class="fa-solid fa-download"></i> ZIP</a></td>
-                        </tr>
-                    `;
-                });
-
-                const fileRows = displayedFiles.map((f, i) => {
-                    const ext = (f.extension || '').replace('.', '').toLowerCase();
-                    const iconClass = fileIcons[ext] || 'fa-file';
-                    return `
-                        <tr onclick='previewFileByIndex(${i})'>
-                            <td><div class="table-item-name"><i class="fa-solid ${iconClass}"></i><span>${f.name}</span></div></td>
-                            <td>${f.type || ext.toUpperCase() || 'File'}</td>
-                            <td>${formatDate(f.mtime)}</td>
-                            <td>${formatBytes(f.size_bytes)}</td>
-                            <td>
-                                <div style="display:flex; gap:6px;">
-                                    <a class="action-btn" href="/view?path=${encodeURIComponent(f.local_path)}" target="_blank" onclick="event.stopPropagation()"><i class="fa-solid fa-arrow-up-right-from-square"></i></a>
-                                    <a class="action-btn" href="/download?path=${encodeURIComponent(f.local_path)}" onclick="event.stopPropagation()"><i class="fa-solid fa-download"></i></a>
-                                </div>
-                            </td>
-                        </tr>
-                    `;
-                });
-                tbody.innerHTML = folderRows.join('') + fileRows.join('');
-            }
-        }
-
-        function renderBreadcrumbs() {
-            const bc = document.getElementById('breadcrumbContainer');
-            bc.innerHTML = `
-                <span class="breadcrumb-item ${!currentFolderId ? 'active' : ''}" onclick="loadDriveRoot()">
-                    <i class="fa-solid fa-hard-drive"></i> My Drive
-                </span>
-            `;
-
-            if (driveData.breadcrumbs && driveData.breadcrumbs.length) {
-                driveData.breadcrumbs.forEach((b, idx) => {
-                    const isLast = idx === driveData.breadcrumbs.length - 1;
-                    bc.innerHTML += `
-                        <span class="breadcrumb-sep"><i class="fa-solid fa-chevron-right"></i></span>
-                        <span class="breadcrumb-item ${isLast ? 'active' : ''}" onclick="fetchDrive('${b.id}')">${b.name}</span>
-                    `;
-                });
-            }
-        }
-
-        function previewFileByIndex(idx) {
-            if (idx < 0 || idx >= visibleFiles.length) return;
-            previewFile(visibleFiles[idx]);
-        }
-
-        function previewFile(f) {
-            const modal = document.getElementById('previewModal');
-            const body = document.getElementById('modalBody');
-            const title = document.getElementById('modalTitle');
-            const dlBtn = document.getElementById('modalDownloadBtn');
-            const tabBtn = document.getElementById('modalOpenTabBtn');
-
-            title.innerText = f.name;
-            dlBtn.href = `/download?path=${encodeURIComponent(f.local_path)}`;
-            tabBtn.href = `/view?path=${encodeURIComponent(f.local_path)}`;
-            body.innerHTML = '';
-
-            const ext = (f.extension || '').toLowerCase();
-            const viewUrl = `/view?path=${encodeURIComponent(f.local_path)}`;
-
-            if (ext === '.pdf') {
-                body.innerHTML = `<iframe src="${viewUrl}" style="width:100%; height:75vh; border:none; border-radius:8px;"></iframe>`;
-            } else if (['.png', '.jpg', '.jpeg', '.webp', '.svg', '.gif', '.ico', '.bmp'].includes(ext)) {
-                body.innerHTML = `<img src="${viewUrl}" alt="${f.name}" style="max-width:100%; max-height:75vh; object-fit:contain; border-radius:8px;">`;
-            } else if (['.mp4', '.webm', '.mkv'].includes(ext)) {
-                body.innerHTML = `<video controls autoplay src="${viewUrl}" style="max-width:100%; max-height:75vh; border-radius:8px;"></video>`;
-            } else if (['.mp3', '.wav', '.ogg', '.m4a', '.opus'].includes(ext)) {
-                body.innerHTML = `<div style="padding:40px 20px; text-align:center; width:100%;"><audio controls autoplay src="${viewUrl}" style="width:80%; max-width:500px;"></audio></div>`;
-            } else {
-                body.innerHTML = `<iframe src="${viewUrl}" style="width:100%; height:75vh; border:none; border-radius:8px; background:#1e1e1e;"></iframe>`;
-            }
-
-            modal.style.display = 'flex';
-        }
-
-        function closeModal(e) {
-            document.getElementById('previewModal').style.display = 'none';
-            document.getElementById('modalBody').innerHTML = '';
-        }
-
-        function loadDriveRoot() { fetchDrive(null); }
-        function openNotionWeb() { window.open('https://app.notion.com/p/3bd3d81b2f368055902aeee41736ae89', '_blank'); }
-
-        async function handleSearch() {
-            const query = document.getElementById('searchInput').value.trim();
-            if (!query) { fetchDrive(currentFolderId); return; }
-            const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-            driveData = await res.json();
-            sortItems();
-            renderView();
-        }
-
-        async function refreshDrive() {
-            const btn = document.querySelector('.btn-sync');
-            btn.innerHTML = '<i class="fa-solid fa-arrows-rotate fa-spin"></i> Syncing...';
-            await fetch('/api/refresh');
-            await fetchDrive(currentFolderId);
-            btn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Sync Notion';
-        }
-
-        async function fetchStorageStats() {
-            try {
-                const res = await fetch('/api/stats');
-                const st = await res.json();
-                const gb = (st.total_mb / 1024).toFixed(2);
-                document.getElementById('storage-detail').innerText = `${gb} GB Used • ${st.total_files.toLocaleString()} files stored`;
-            } catch (e) {
-                console.error(e);
-            }
-        }
-
-        // =====================================================================
-        // SYNC CENTER LOGIC & REAL-TIME POLLING (DRIVEN BY TERMINAL CLI)
-        // =====================================================================
-        async function pollSyncStatus() {
-            try {
-                const res = await fetch('/api/sync/status');
-                const st = await res.json();
-
-                if (st.cache_version !== undefined && st.cache_version !== lastCacheVersion) {
-                    lastCacheVersion = st.cache_version;
-                    if (currentMainTab === 'drive') {
-                        const browsingDeepFolder = !!currentFolderId;
-                        const skipDeepAutoReloadWhileSync = st.is_running && browsingDeepFolder;
-                        if (!skipDeepAutoReloadWhileSync) {
-                            fetchDrive(currentFolderId);
-                        }
-                    }
-                    fetchStorageStats();
+            img.onerror = () => {
+                const sk = img.previousElementSibling;
+                if (sk && sk.classList && sk.classList.contains('skeleton')) sk.remove();
+                const parent = img.parentElement;
+                if (parent) {
+                    parent.className = 'thumb thumb-image-cloud';
+                    parent.innerHTML = `
+                        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;width:100%;height:100%;background:radial-gradient(circle, #201A30 0%, #12101B 100%);border:1px solid rgba(168,199,250,0.18);position:relative;">
+                            <i class="fa-solid fa-image" style="font-size:32px;color:#A8C7FA;opacity:0.9;"></i>
+                            <div style="position:absolute;bottom:6px;left:6px;background:rgba(168,199,250,0.15);color:#C2E7FF;font-size:9.5px;font-weight:700;padding:2px 5px;border-radius:4px;letter-spacing:0.5px;">IMG</div>
+                            <div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>
+                        </div>`;
                 }
+            };
+            _thumbObserver.unobserve(img);
+        }
+    });
+}, { rootMargin: '250px' });
 
-                const badge = document.getElementById('syncNavBadge');
-                const icon = document.getElementById('syncNavIcon');
-                if (st.is_running) {
-                    badge.className = 'sync-badge running';
-                    badge.innerText = `${st.percent}%`;
-                    icon.className = 'fa-solid fa-arrows-rotate fa-spin';
-                    document.getElementById('syncPulseDot').className = 'sync-pulse-dot running';
-                } else {
-                    badge.className = 'sync-badge idle';
-                    badge.innerText = 'Idle';
-                    icon.className = 'fa-solid fa-arrows-rotate';
-                    document.getElementById('syncPulseDot').className = 'sync-pulse-dot';
-                }
-
-                document.getElementById('syncMainStatus').innerText = st.is_running ? `Syncing ${st.current_target}...` : st.status_message;
-                document.getElementById('syncSubStatus').innerText = st.is_running ? `Active: ${st.current_file}` : 'Tracks .notion_sync_state.json • Skips unchanged files automatically';
-                document.getElementById('syncProgressLabel').innerText = `Progress: ${st.percent}%`;
-                document.getElementById('syncStatsDetail').innerText = `${st.synced_files} / ${st.total_files} changes (${st.remaining_files} remaining)`;
-                document.getElementById('syncProgressBar').style.width = `${st.percent}%`;
-
-                document.getElementById('statTarget').innerText = st.current_target;
-                document.getElementById('statUploaded').innerText = st.synced_files;
-                document.getElementById('statRemaining').innerText = st.remaining_files;
-                document.getElementById('statSpeed').innerText = st.speed_str;
-
-                document.getElementById('badgeQueueCount').innerText = st.remaining_files || (st.queue ? st.queue.length : 0);
-                document.getElementById('badgeHistoryCount').innerText = st.history ? st.history.length : 0;
-
-                if (st.is_running && st.current_file !== 'None') {
-                    document.getElementById('activeFileName').innerText = st.current_file;
-                    document.getElementById('activeFilePath').innerText = st.current_path;
-                    document.getElementById('activeFileSize').innerText = st.current_size_str;
-                } else if (!st.is_running && st.total_files > 0) {
-                    document.getElementById('activeFileName').innerText = "All changes synchronized!";
-                    document.getElementById('activeFilePath').innerText = "Notion Cloud database is 100% up to date with persistent state.";
-                    document.getElementById('activeFileSize').innerText = "✅ Complete";
-                }
-
-                const qBody = document.getElementById('syncQueueTableBody');
-                if (st.queue && st.queue.length) {
-                    qBody.innerHTML = '';
-                    st.queue.forEach(q => {
-                        const statusPill = `<span class="status-pill ${q.status}">${q.status}</span>`;
-                        const tagPill = `<span class="tag-pill ${q.tag || 'NEW'}">${q.tag || 'NEW'}</span>`;
-                        qBody.innerHTML += `
-                            <tr>
-                                <td>${tagPill}</td>
-                                <td style="font-weight:500;">${q.name}</td>
-                                <td style="color:var(--text-muted); font-size:12px;">${q.path}</td>
-                                <td>${q.size_str}</td>
-                                <td>${statusPill}</td>
-                            </tr>
-                        `;
-                    });
-                } else {
-                    if (!st.is_running && st.synced_files > 0) {
-                        qBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: #81C995; padding: 24px; font-weight: 500;">
-                            <i class="fa-solid fa-circle-check" style="font-size: 20px; display: block; margin-bottom: 6px;"></i>
-                            All files have finished syncing! View completed items in the 'Completed History' tab.
-                        </td></tr>`;
-                    } else {
-                        qBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No changes currently in queue. Click a sync button above to calculate differential changes.</td></tr>`;
-                    }
-                }
-
-                const hBody = document.getElementById('syncHistoryTableBody');
-                if (st.history && st.history.length) {
-                    hBody.innerHTML = '';
-                    st.history.forEach(h => {
-                        const pill = h.status === 'success' ? '<span class="status-pill synced">Synced</span>' : '<span class="status-pill failed">Failed</span>';
-                        hBody.innerHTML += `
-                            <tr>
-                                <td style="font-weight:500;">${h.name}</td>
-                                <td style="color:var(--text-muted); font-size:12px;">${h.path}</td>
-                                <td>${h.size_str}</td>
-                                <td>${h.time}</td>
-                                <td>${pill}</td>
-                            </tr>
-                        `;
-                    });
-                }
-
-                const logBox = document.getElementById('consoleLogsBox');
-                if (st.logs && st.logs.length) {
-                    logBox.innerHTML = st.logs.map(l => `<div class="log-entry">${htmlEscape(l)}</div>`).join('');
-                    logBox.scrollTop = logBox.scrollHeight;
-                }
-            } catch (e) {
-                console.error("Poll sync error:", e);
+// Load-more IntersectionObserver for virtual scroll
+let _sentinelObs = null;
+function _updateLoadSentinel() {
+    const sentinel = document.getElementById('loadSentinel');
+    if (!sentinel) return;
+    sentinel.style.display = STATE.driveData.has_more ? 'flex' : 'none';
+    if (STATE.driveData.has_more) {
+        if (_sentinelObs) _sentinelObs.disconnect();
+        _sentinelObs = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting && !STATE.fetchingMore && STATE.driveData.has_more) {
+                if (STATE.searchQuery) _doSearchFetch();
+                else _doFetch(STATE.folderId);
             }
-        }
+        }, { rootMargin: '350px' });
+        _sentinelObs.observe(sentinel);
+    } else {
+        if (_sentinelObs) _sentinelObs.disconnect();
+    }
+}
 
-        function htmlEscape(str) {
-            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        }
+function _folderCard(f) {
+    const icon = getFolderIcon(f.name);
+    const countNum = (f.item_count !== undefined && f.item_count !== null) ? Number(f.item_count) : 0;
+    const cnt = countNum === 1 ? '1 item' : `${countNum.toLocaleString()} items`;
+    return `<div class="folder-card" data-id="${f.id}" onclick="fetchDrive('${f.id}')" title="${esc(f.name)}">
+        <i class="fa-solid ${icon}"></i>
+        <div class="folder-card-info">
+            <div class="folder-card-name">${esc(f.name)}</div>
+            <div class="folder-card-count">${cnt}</div>
+        </div>
+    </div>`;
+}
 
+function _fileCard(f, idx) {
+    const ext = (f.extension || '').replace('.','').toLowerCase();
+    const icon = getFileIcon(ext);
+    const isImg = IMG_EXTS.has(ext);
+    let thumbHtml;
+    const viewUrl = '/view?id=' + encodeURIComponent(f.id||'') + '&path=' + encodeURIComponent(f.local_path||'');
+    const isMobile = (f.local_path && (f.local_path.includes('Internal shared storage') || f.local_path.includes('SD card') || f.local_path.startsWith('/storage') || f.local_path.startsWith('/sdcard')));
+    
+    if (isImg) {
+        thumbHtml = `<div class="skeleton"></div><img data-src="${viewUrl}" style="opacity:0;" alt="${esc(f.name)}" loading="lazy">`;
+    } else if (ext === 'pdf') {
+        thumbHtml = `<div class="thumb-pdf" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative;"><i class="fa-solid fa-file-pdf pdf-icon"></i><div class="pdf-tag">PDF</div>${isMobile ? '<div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>' : ''}</div>`;
+    } else if (['mp4','webm','mkv','mov','avi','flv','wmv','3gp'].includes(ext)) {
+        thumbHtml = `<div class="thumb-video" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative;"><div class="play-btn"><i class="fa-solid fa-play" style="margin-left:2px;"></i></div><div class="vid-tag" style="position:absolute;bottom:6px;left:6px;background:rgba(138,180,248,0.2);color:#A8C7FA;font-size:9.5px;font-weight:700;padding:2px 5px;border-radius:4px;">${ext.toUpperCase()}</div>${isMobile ? '<div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>' : ''}</div>`;
+    } else if (['mp3','wav','ogg','m4a','opus','flac','aac','wma'].includes(ext)) {
+        thumbHtml = `<div class="thumb-audio" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative;"><i class="fa-solid fa-music"></i><div style="position:absolute;bottom:6px;left:6px;background:rgba(251,188,4,0.2);color:#FDD663;font-size:9.5px;font-weight:700;padding:2px 5px;border-radius:4px;">${ext.toUpperCase()}</div>${isMobile ? '<div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>' : ''}</div>`;
+    } else if (['py','js','ts','jsx','tsx','html','css','json','md','sql','sh','bat','txt','env','c','cpp','java','xml','yaml','yml','prisma','toml'].includes(ext)) {
+        const tag = ext ? ext.toUpperCase() : 'CODE';
+        thumbHtml = `<div class="thumb-code" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative;"><div class="code-badge">&lt;${esc(tag)}/&gt;</div>${isMobile ? '<div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>' : ''}</div>`;
+    } else {
+        thumbHtml = `<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#1A1C1E;position:relative;"><i class="fa-solid ${icon}"></i>${isMobile ? '<div style="position:absolute;top:6px;right:6px;font-size:10px;color:#81C995;" title="Cloud Synced"><i class="fa-solid fa-cloud"></i></div>' : ''}</div>`;
+    }
+    return `<div class="file-card" data-id="${f.id}" onclick="previewFile(${idx})" oncontextmenu="openActionSheet(event, ${idx}); return false;" title="${esc(f.name)}">
+        <div class="thumb">${thumbHtml}</div>
+        <div class="file-card-footer">
+            <i class="fa-solid ${icon}"></i>
+            <div class="file-card-name">${esc(f.name)}</div>
+            <button class="card-more-btn" onclick="openActionSheet(event, ${idx})" title="More options"><i class="fa-solid fa-ellipsis-vertical"></i></button>
+        </div>
+        <div class="file-card-meta"><span>${fmtBytes(f.size_bytes)}</span><span>${fmtDate(f.mtime)}</span></div>
+    </div>`;
+}
+
+function _renderTable() {
+    const tbody = document.getElementById('tableBody');
+    const mContainer = document.getElementById('mobileListContainer');
+    
+    const folderRows = (STATE.driveData.folders||[]).map(f => {
+        const countNum = (f.item_count !== undefined && f.item_count !== null) ? Number(f.item_count) : 0;
+        const cnt = countNum === 1 ? '1 item' : `${countNum.toLocaleString()} items`;
+        return `
+        <tr data-id="${f.id}" onclick="fetchDrive('${f.id}')">
+            <td><div class="tname"><i class="fa-solid ${getFolderIcon(f.name)}"></i><span>${esc(f.name)}</span></div></td>
+            <td>Folder (${cnt})</td><td>${fmtDate(f.mtime)}</td><td>—</td>
+            <td><a class="action-btn" href="/download-folder?id=${f.id}" onclick="event.stopPropagation()"><i class="fa-solid fa-download"></i> ZIP</a></td>
+        </tr>`;
+    }).join('');
         
-        // ── Drag & Drop & Upload Handlers ────────────────────────────────────
-        function toggleNewMenu(e) {
-            e.stopPropagation();
-            const m = document.getElementById('newDropdownMenu');
-            m.classList.toggle('show');
+    const fileRows = STATE.loadedFiles.map((f,i) => {
+        const ext = (f.extension||'').replace('.','').toLowerCase();
+        return `<tr data-id="${f.id}" onclick="previewFile(${i})" oncontextmenu="openActionSheet(event, ${i}); return false;">
+            <td><div class="tname"><i class="fa-solid ${getFileIcon(ext)}"></i><span>${esc(f.name)}</span></div></td>
+            <td>${ext.toUpperCase()||'File'}</td><td>${fmtDate(f.mtime)}</td><td>${fmtBytes(f.size_bytes)}</td>
+            <td><div style="display:flex;gap:6px;">
+                <a class="action-btn" href="/view?id=${f.id}&path=${encodeURIComponent(f.local_path||'')}" target="_blank" title="Open via Browser" onclick="event.stopPropagation()"><i class="fa-solid fa-globe"></i></a>
+                <a class="action-btn" href="https://www.notion.so/${f.id}" target="_blank" title="Open in Notion" onclick="event.stopPropagation()"><i class="fa-solid fa-cloud"></i></a>
+                <a class="action-btn" href="/download?id=${f.id}&path=${encodeURIComponent(f.local_path||'')}" title="Download" onclick="event.stopPropagation()"><i class="fa-solid fa-download"></i></a>
+                <button class="action-btn" onclick="openActionSheet(event, ${i})"><i class="fa-solid fa-ellipsis"></i></button>
+            </div></td>
+        </tr>`;
+    }).join('');
+    
+    tbody.innerHTML = folderRows + fileRows;
+
+    // Mobile stacked list
+    const mFolders = (STATE.driveData.folders||[]).map(f => {
+        const countNum = (f.item_count !== undefined && f.item_count !== null) ? Number(f.item_count) : 0;
+        const cnt = countNum === 1 ? '1 item' : `${countNum.toLocaleString()} items`;
+        return `
+        <div class="mobile-list-item" data-id="${f.id}" onclick="fetchDrive('${f.id}')">
+            <div class="mli-icon"><i class="fa-solid ${getFolderIcon(f.name)}"></i></div>
+            <div class="mli-content">
+                <div class="mli-name">${esc(f.name)}</div>
+                <div class="mli-meta">Folder • ${cnt}</div>
+            </div>
+            <i class="fa-solid fa-chevron-right" style="color:var(--text-muted);font-size:12px;"></i>
+        </div>`;
+    }).join('');
+
+    const mFiles = STATE.loadedFiles.map((f,i) => {
+        const ext = (f.extension||'').replace('.','').toLowerCase();
+        return `<div class="mobile-list-item" data-id="${f.id}" onclick="previewFile(${i})">
+            <div class="mli-icon"><i class="fa-solid ${getFileIcon(ext)}"></i></div>
+            <div class="mli-content">
+                <div class="mli-name">${esc(f.name)}</div>
+                <div class="mli-meta">${fmtBytes(f.size_bytes)} • ${fmtDate(f.mtime)}</div>
+            </div>
+            <button class="card-more-btn" onclick="openActionSheet(event, ${i})" style="padding:8px;"><i class="fa-solid fa-ellipsis-vertical"></i></button>
+        </div>`;
+    }).join('');
+
+    mContainer.innerHTML = mFolders + mFiles;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD (Root view)
+// ═══════════════════════════════════════════════════════════════════════════
+function _renderDashboard(d) {
+    const deviceGrid = document.getElementById('deviceGrid');
+    const ROOT_NAMES = new Set(['Local Disk (C:)','Local Disk (D:)','Internal shared storage','SD card','Internal Storage','SD Card']);
+    const rootFolders = (d.folders || []).filter(f => ROOT_NAMES.has(f.name) || f.name.startsWith('Local Disk') || f.name.includes('storage') || f.name.includes('SD card'));
+    
+    if (rootFolders.length > 0) {
+        deviceGrid.innerHTML = rootFolders.map(f => {
+            const icon = getFolderIcon(f.name);
+            const countNum = (f.item_count !== undefined && f.item_count !== null) ? Number(f.item_count) : 0;
+            const cnt = countNum === 1 ? '1 item' : `${countNum.toLocaleString()} items`;
+            return `<div class="device-card" data-id="${f.id}" onclick="fetchDrive('${f.id}')">
+                <div class="device-icon-wrap"><i class="fa-solid ${icon}"></i></div>
+                <div class="device-name">${esc(f.name)}</div>
+                <div class="device-meta"><span>${cnt}</span><span style="color:var(--accent-green);"><i class="fa-solid fa-circle-check" style="font-size:10px;"></i> Synced</span></div>
+            </div>`;
+        }).join('');
+    } else {
+        deviceGrid.innerHTML = '<div style="color:var(--text-muted);font-size:13px;padding:10px 0;">No devices synced yet. Run Notion_Sync to sync your drives.</div>';
+    }
+
+    // Quick access
+    const qRow = document.getElementById('quickAccessRow');
+    const qTitle = document.getElementById('quickAccessTitle');
+    const others = (d.folders || []).filter(f => !ROOT_NAMES.has(f.name) && !f.name.startsWith('Local Disk')).slice(0, 12);
+    if (others.length > 0) {
+        if (qTitle) qTitle.style.display = 'block';
+        if (qRow) {
+            qRow.style.display = 'flex';
+            qRow.innerHTML = others.map(f => {
+                const countNum = (f.item_count !== undefined && f.item_count !== null) ? Number(f.item_count) : 0;
+                const cnt = countNum === 1 ? '1 item' : `${countNum.toLocaleString()} items`;
+                return `
+                <div class="recent-chip" data-id="${f.id}" onclick="fetchDrive('${f.id}')">
+                    <i class="fa-solid ${getFolderIcon(f.name)}"></i>
+                    <div class="recent-chip-info"><div class="recent-chip-name">${esc(f.name)}</div><div class="recent-chip-meta">${cnt}</div></div>
+                </div>`;
+            }).join('');
         }
+    } else {
+        if (qTitle) qTitle.style.display = 'none';
+        if (qRow) qRow.style.display = 'none';
+    }
+}
 
-        function closeNewMenu() {
-            const m = document.getElementById('newDropdownMenu');
-            if (m) m.classList.remove('show');
+function previewRecentFile(id) {
+    const item = STATE.loadedFiles.find(x => x.id === id);
+    if (item) {
+        previewFile(STATE.loadedFiles.indexOf(item));
+        return;
+    }
+    fetch('/api/drive?limit=100').then(r=>r.json()).then(d => {
+        const found = (d.files || []).find(x => x.id === id);
+        if (found) {
+            STATE.loadedFiles = [found];
+            previewFile(0);
+        } else {
+            window.open('https://www.notion.so/' + id, '_blank');
         }
+    }).catch(() => {
+        window.open('https://www.notion.so/' + id, '_blank');
+    });
+}
 
-        document.addEventListener('click', closeNewMenu);
+// ═══════════════════════════════════════════════════════════════════════════
+// RECENT & STARRED VIEWS
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadRecent() {
+    const grid = document.getElementById('recentGrid');
+    const empty = document.getElementById('recentEmpty');
+    try {
+        const d = await fetch('/api/recent').then(r=>r.json());
+        const files = d.files || [];
+        if (!files.length) { empty.style.display='block'; grid.innerHTML=''; return; }
+        empty.style.display='none';
+        grid.innerHTML = files.map((f,i) => _fileCard(f, i)).join('');
+        grid.querySelectorAll('img[data-src]').forEach(img => _thumbObserver.observe(img));
+    } catch(e) {}
+}
 
-        function triggerFileInput() {
-            closeNewMenu();
-            document.getElementById('nativeFileInput').click();
-        }
+async function loadStarred() {
+    const grid = document.getElementById('starredGrid');
+    try {
+        const d = await fetch('/api/starred').then(r=>r.json());
+        const items = d.items || [];
+        grid.innerHTML = items.map(f => `<div class="device-card" data-id="${f.id}" onclick="fetchDrive('${f.id}'); switchTab('drive');">
+            <div class="device-icon-wrap"><i class="fa-solid ${getFolderIcon(f.name)}"></i></div>
+            <div class="device-name">${esc(f.name)}</div>
+            <div class="device-meta"><span>${f.item_count||''}</span></div>
+        </div>`).join('') || '<div style="color:var(--text-muted);padding:10px 0;font-size:13px;">No starred items.</div>';
+    } catch(e) {}
+}
 
-        function triggerFolderInput() {
-            closeNewMenu();
-            document.getElementById('nativeFolderInput').click();
-        }
-
-        function handleFileSelect(e) {
-            const files = Array.from(e.target.files);
-            if (files.length) uploadFileList(files);
-            e.target.value = '';
-        }
-
-        function handleFolderSelect(e) {
-            const files = Array.from(e.target.files);
-            if (files.length) uploadFileList(files);
-            e.target.value = '';
-        }
-
-        // Drag and drop events on window
-        let dragCounter = 0;
-        window.addEventListener('dragenter', (e) => {
-            e.preventDefault();
-            dragCounter++;
-            document.getElementById('dropOverlay').classList.add('active');
+// ═══════════════════════════════════════════════════════════════════════════
+// BREADCRUMBS
+// ═══════════════════════════════════════════════════════════════════════════
+function _renderBreadcrumbs(bcs) {
+    const bc = document.getElementById('breadcrumbs');
+    let html = `<span class="bc-item ${!STATE.folderId?'active':''}" onclick="goRoot()"><i class="fa-solid fa-hard-drive"></i> My Drive</span>`;
+    if (bcs && bcs.length) {
+        bcs.forEach((b,i) => {
+            const isLast = i === bcs.length-1;
+            html += `<span class="bc-sep"><i class="fa-solid fa-chevron-right"></i></span>
+            <span class="bc-item ${isLast?'active':''}" onclick="fetchDrive('${b.id}')">${esc(b.name)}</span>`;
         });
+    }
+    bc.innerHTML = html;
+}
 
-        window.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            dragCounter--;
-            if (dragCounter <= 0) {
-                dragCounter = 0;
-                document.getElementById('dropOverlay').classList.remove('active');
-            }
+// ═══════════════════════════════════════════════════════════════════════════
+// SORT & VIEW CONTROLS
+// ═══════════════════════════════════════════════════════════════════════════
+function changeSort(key) { STATE.sortKey = key; fetchDrive(STATE.folderId); }
+function toggleSortDir() {
+    STATE.sortDir *= -1;
+    document.getElementById('sortDirIcon').className = STATE.sortDir===1 ? 'fa-solid fa-arrow-down-short-wide' : 'fa-solid fa-arrow-up-wide-short';
+    fetchDrive(STATE.folderId);
+}
+function tableSort(key) {
+    if (STATE.sortKey === key) toggleSortDir();
+    else { STATE.sortKey = key; STATE.sortDir = 1; document.getElementById('sortSelect').value = key; fetchDrive(STATE.folderId); }
+}
+function setView(mode) {
+    STATE.viewMode = mode;
+    document.getElementById('btnGrid').classList.toggle('active', mode==='grid');
+    document.getElementById('btnList').classList.toggle('active', mode==='list');
+    document.getElementById('filesGrid').style.display = mode==='grid' ? '' : 'none';
+    document.getElementById('listView').style.display = mode==='list' ? 'block' : 'none';
+    if (mode==='list') _renderTable();
+    else { document.getElementById('filesGrid').innerHTML = ''; _appendFileCards(STATE.loadedFiles); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEARCH WITH CATEGORY FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+let _searchTimer;
+function handleSearch() {
+    clearTimeout(_searchTimer);
+    const q = document.getElementById('searchInput').value.trim();
+    STATE.searchQuery = q;
+    const sf = document.getElementById('searchFilters');
+    if (q) sf.style.display = 'flex';
+    else if (window.innerWidth > 768) sf.style.display = 'none';
+    
+    if (!q) { fetchDrive(STATE.folderId); return; }
+    _searchTimer = setTimeout(_doSearchFetch, 280);
+}
+
+function setSearchCategory(cat, btn) {
+    STATE.searchCategory = cat;
+    document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+    _doSearchFetch();
+}
+
+async function _doSearchFetch() {
+    const q = STATE.searchQuery;
+    const cat = STATE.searchCategory;
+    try {
+        const d = await fetch(`/api/search?q=${encodeURIComponent(q)}&cat=${encodeURIComponent(cat)}`).then(r=>r.json());
+        STATE.driveData = d;
+        STATE.loadedFiles = d.files || [];
+        STATE.folderId = null;
+        _renderBreadcrumbs(d.breadcrumbs || []);
+        document.getElementById('dashboardView').style.display = 'none';
+        document.getElementById('browserView').style.display = 'block';
+        document.getElementById('toolbar').style.display = 'flex';
+        document.getElementById('foldersSection').style.display = (d.folders && d.folders.length) ? 'block' : 'none';
+        document.getElementById('foldersGrid').innerHTML = (d.folders||[]).map(f=>_folderCard(f)).join('');
+        const fg2 = document.getElementById('filesGrid');
+        fg2.innerHTML = '';
+        _appendFileCards(STATE.loadedFiles);
+        document.getElementById('listView').style.display = 'none';
+        document.getElementById('emptyMsg').style.display = (!d.folders.length && !d.files.length) ? 'block' : 'none';
+        document.getElementById('loadSentinel').style.display = 'none';
+    } catch(e) {
+        console.error('Search error', e);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTEXT ACTION SHEET (Mobile bottom sheet / Desktop popup)
+// ═══════════════════════════════════════════════════════════════════════════
+function openActionSheet(e, idx) {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    const f = STATE.loadedFiles[idx];
+    if (!f) return;
+    STATE.selectedItem = f;
+    
+    const ext = (f.extension||'').replace('.','').toLowerCase();
+    document.getElementById('asIcon').innerHTML = `<i class="fa-solid ${getFileIcon(ext)}"></i>`;
+    document.getElementById('asTitle').innerText = f.name;
+    document.getElementById('asSubtitle').innerText = `${fmtBytes(f.size_bytes)} • ${fmtDate(f.mtime)}`;
+    
+    const notionUrl = `https://www.notion.so/${f.id}`;
+    const viewUrl = `/view?id=${encodeURIComponent(f.id||'')}&path=${encodeURIComponent(f.local_path||'')}`;
+    const dlUrl = `/download?id=${encodeURIComponent(f.id||'')}&path=${encodeURIComponent(f.local_path||'')}`;
+    
+    const btnBrowser = document.getElementById('asBtnBrowser');
+    if (btnBrowser) btnBrowser.href = viewUrl;
+    const btnNotion = document.getElementById('asBtnNotion');
+    if (btnNotion) btnNotion.href = notionUrl;
+    const btnDl = document.getElementById('asBtnDownload');
+    if (btnDl) btnDl.href = dlUrl;
+    
+    document.getElementById('actionSheetOverlay').classList.add('open');
+}
+
+function closeActionSheet(e) {
+    document.getElementById('actionSheetOverlay').classList.remove('open');
+}
+
+async function handleAction(action) {
+    const f = STATE.selectedItem;
+    if (!f) return;
+    closeActionSheet();
+
+    if (action === 'preview') {
+        const idx = STATE.loadedFiles.indexOf(f);
+        if (idx !== -1) previewFile(idx);
+    } else if (action === 'copy_browser_link' || action === 'copy_link') {
+        const link = `${window.location.origin}/view?id=${encodeURIComponent(f.id||'')}&path=${encodeURIComponent(f.local_path||'')}`;
+        navigator.clipboard.writeText(link).then(() => {
+            alert('Browser direct view link copied to clipboard!');
+        }).catch(() => {
+            prompt('Copy Browser Direct URL:', link);
         });
-
-        window.addEventListener('dragover', (e) => {
-            e.preventDefault();
+    } else if (action === 'copy_notion_link') {
+        const link = `https://www.notion.so/${f.id}`;
+        navigator.clipboard.writeText(link).then(() => {
+            alert('Notion Cloud link copied to clipboard!');
+        }).catch(() => {
+            prompt('Copy Notion Cloud URL:', link);
         });
-
-        window.addEventListener('drop', async (e) => {
-            e.preventDefault();
-            dragCounter = 0;
-            document.getElementById('dropOverlay').classList.remove('active');
-
-            const items = e.dataTransfer.items;
-            if (!items || !items.length) return;
-
-            const filesToUpload = [];
-            const queue = [];
-
-            for (let i = 0; i < items.length; i++) {
-                const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
-                if (entry) {
-                    queue.push(traverseFileTree(entry, ''));
-                }
-            }
-
-            const results = await Promise.all(queue);
-            const flatFiles = results.flat();
-            if (flatFiles.length) {
-                uploadFileList(flatFiles);
-            }
-        });
-
-        function traverseFileTree(item, path) {
-            return new Promise((resolve) => {
-                path = path || '';
-                if (item.isFile) {
-                    item.file((file) => {
-                        file.relPath = path + file.name;
-                        resolve([file]);
-                    });
-                } else if (item.isDirectory) {
-                    const dirReader = item.createReader();
-                    dirReader.readEntries(async (entries) => {
-                        const subPromises = entries.map((entry) => traverseFileTree(entry, path + item.name + '/'));
-                        const subResults = await Promise.all(subPromises);
-                        resolve(subResults.flat());
-                    });
-                } else {
-                    resolve([]);
-                }
+    } else if (action === 'delete') {
+        if (!confirm(`Delete "${f.name}" from Notion Cloud and local drive?`)) return;
+        try {
+            const res = await fetch('/api/file/delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: f.id, path: f.local_path})
             });
-        }
-
-        async function uploadFileList(files) {
-            const toast = document.getElementById('uploadToast');
-            const title = document.getElementById('uploadToastTitle');
-            const fileLbl = document.getElementById('uploadToastFile');
-            const percentLbl = document.getElementById('uploadToastPercent');
-            const bar = document.getElementById('uploadToastBar');
-
-            toast.style.display = 'flex';
-            const total = files.length;
-
-            for (let i = 0; i < total; i++) {
-                const file = files[i];
-                const relPath = file.relPath || file.webkitRelativePath || file.name;
-                const pct = Math.round(((i) / total) * 100);
-
-                title.innerText = `Uploading (${i + 1}/${total})...`;
-                percentLbl.innerText = `${pct}%`;
-                fileLbl.innerText = relPath;
-                bar.style.width = `${pct}%`;
-
-                try {
-                    const base64Data = await readFileAsBase64(file);
-                    const payload = {
-                        name: file.name,
-                        rel_path: relPath,
-                        data_b64: base64Data,
-                        parent_folder_id: currentFolderId
-                    };
-
-                    await fetch('/api/upload', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                } catch (err) {
-                    console.error("Upload error for " + file.name, err);
+            const data = await res.json();
+            if (data.success) {
+                // Animate removal from DOM
+                const card = document.querySelector(`[data-id="${f.id}"]`);
+                if (card) {
+                    card.style.transition = 'opacity 0.25s, transform 0.25s';
+                    card.style.opacity = '0';
+                    card.style.transform = 'scale(0.85)';
+                    setTimeout(() => card.remove(), 250);
                 }
-            }
-
-            bar.style.width = '100%';
-            percentLbl.innerText = '100%';
-            title.innerText = 'Upload Complete!';
-            fileLbl.innerText = `Successfully uploaded ${total} file(s) to Notion Cloud.`;
-
-            setTimeout(() => {
-                toast.style.display = 'none';
-                fetchDrive(currentFolderId);
+                STATE.loadedFiles = STATE.loadedFiles.filter(x => x.id !== f.id);
                 fetchStorageStats();
-            }, 2500);
-        }
-
-        function readFileAsBase64(file) {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const res = reader.result;
-                    const base64 = res.split(',')[1] || '';
-                    resolve(base64);
-                };
-                reader.onerror = reject;
-                reader.readAsDataURL(file);
-            });
-        }
-
-        
-        async function checkAuthStatus() {
-            try {
-                const r = await fetch('/api/auth/status');
-                const d = await r.json();
-                if (d.protected) {
-                    const btn = document.getElementById('btnLockDrive');
-                    if (btn) btn.style.display = 'flex';
-                }
-            } catch(e) {}
-        }
-
-        async function lockDrive() {
-            if (confirm("Lock Notion Drive and sign out?")) {
-                await fetch('/api/auth/logout', {method: 'POST'});
-                window.location.reload();
+            } else {
+                alert('Error deleting file: ' + (data.error || 'Unknown error'));
             }
+        } catch(err) {
+            alert('Failed to connect to server.');
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PREVIEW MODAL
+// ═══════════════════════════════════════════════════════════════════════════
+function showFallbackCloud(f) {
+    const notionUrl = 'https://www.notion.so/' + (f.id || '');
+    const viewUrl = '/view?id=' + encodeURIComponent(f.id||'') + '&path=' + encodeURIComponent(f.local_path||'');
+    const dlUrl = '/download?id=' + encodeURIComponent(f.id||'') + '&path=' + encodeURIComponent(f.local_path||'');
+    const ext = (f.extension || '').replace('.','').toUpperCase();
+    const isMobile = (f.local_path && (f.local_path.includes('Internal shared storage') || f.local_path.includes('SD card') || f.local_path.startsWith('/storage') || f.local_path.startsWith('/sdcard')));
+    
+    let iconClass = 'fa-cloud';
+    if (['PNG','JPG','JPEG','WEBP','GIF'].includes(ext)) iconClass = 'fa-image';
+    else if (['MP4','WEBM','MKV','MOV','AVI','3GP'].includes(ext)) iconClass = 'fa-film';
+    else if (ext === 'PDF') iconClass = 'fa-file-pdf';
+    else if (['PY','JS','TS','HTML','CSS','JSON','TXT','MD'].includes(ext)) iconClass = 'fa-file-code';
+
+    return '<div style="padding:40px 24px;text-align:center;color:#E8EAED;width:100%;max-width:540px;margin:0 auto;">' +
+        '<div style="width:68px;height:68px;border-radius:20px;background:radial-gradient(circle, rgba(168,199,250,0.18) 0%, rgba(168,199,250,0.06) 100%);border:1px solid rgba(168,199,250,0.25);display:inline-flex;align-items:center;justify-content:center;margin-bottom:18px;">' +
+            '<i class="fa-solid ' + iconClass + '" style="font-size:30px;color:#A8C7FA;"></i>' +
+        '</div>' +
+        '<div><div style="display:inline-block;padding:4px 12px;border-radius:12px;background:rgba(52,168,83,0.15);color:#81C995;font-size:11.5px;font-weight:600;margin-bottom:14px;"><i class="fa-solid fa-circle-check"></i> Notion Cloud Indexed</div></div>' +
+        '<h3 style="margin:0 0 6px;font-size:16px;font-weight:600;word-break:break-all;">' + esc(f.name) + '</h3>' +
+        '<p style="color:#9AA0A6;margin:0 0 8px;font-size:12.5px;">' + fmtBytes(f.size_bytes) + ' • ' + (ext || 'FILE') + '</p>' +
+        (isMobile ? '<p style="color:#80868B;margin:0 0 20px;font-size:11.5px;"><i class="fa-solid fa-mobile-screen"></i> Mobile storage item • Connect phone via USB/ADB for live raw media streaming</p>' : '<p style="color:#80868B;margin:0 0 20px;font-size:11.5px;">Indexed in Notion Cloud Database</p>') +
+        '<div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">' +
+            '<a class="action-btn" href="' + viewUrl + '" target="_blank" style="display:inline-flex;padding:9px 20px;font-size:13px;font-weight:600;background:#1A73E8;color:#fff;border-radius:24px;text-decoration:none;"><i class="fa-solid fa-globe"></i> Open via Browser</a>' +
+            '<a class="action-btn" href="' + notionUrl + '" target="_blank" style="display:inline-flex;padding:9px 18px;font-size:13px;background:#222426;color:#E8EAED;border:1px solid #303234;border-radius:24px;text-decoration:none;"><i class="fa-solid fa-cloud"></i> Open in Notion</a>' +
+            '<a class="action-btn" href="' + dlUrl + '" style="display:inline-flex;padding:9px 18px;font-size:13px;background:#222426;color:#E8EAED;border:1px solid #303234;border-radius:24px;text-decoration:none;"><i class="fa-solid fa-download"></i> Download</a>' +
+        '</div>' +
+    '</div>';
+}
+
+function previewFile(idx) {
+    const f = STATE.loadedFiles[idx];
+    if (!f) return;
+    STATE.previewIndex = idx;
+    const modal = document.getElementById('previewModal');
+    const body = document.getElementById('modalBody');
+    document.getElementById('modalTitle').innerText = f.name;
+    
+    // Update Counter and Navigation buttons
+    const counter = document.getElementById('modalCounter');
+    if (counter) counter.innerText = `${idx + 1} / ${STATE.loadedFiles.length}`;
+
+    const prevBtn = document.getElementById('modalPrevBtn');
+    const nextBtn = document.getElementById('modalNextBtn');
+    if (prevBtn) prevBtn.style.display = STATE.loadedFiles.length > 1 ? 'flex' : 'none';
+    if (nextBtn) nextBtn.style.display = STATE.loadedFiles.length > 1 ? 'flex' : 'none';
+
+    const viewUrl = '/view?id=' + encodeURIComponent(f.id||'') + '&path=' + encodeURIComponent(f.local_path||'');
+    const dlUrl = '/download?id=' + encodeURIComponent(f.id||'') + '&path=' + encodeURIComponent(f.local_path||'');
+    const notionUrl = 'https://www.notion.so/' + (f.id || '');
+    
+    const dlBtn = document.getElementById('modalDl');
+    if (dlBtn) dlBtn.href = dlUrl;
+    const browserBtn = document.getElementById('modalBrowser');
+    if (browserBtn) browserBtn.href = viewUrl;
+    const notionBtn = document.getElementById('modalNotion');
+    if (notionBtn) notionBtn.href = notionUrl;
+
+    body.innerHTML = '';
+    const ext = (f.extension||'').toLowerCase();
+    
+    if (ext === '.pdf') {
+        const iframe = document.createElement('iframe');
+        iframe.src = viewUrl;
+        iframe.style.cssText = 'width:100%;height:78vh;border:none;border-radius:6px;';
+        body.appendChild(iframe);
+    } else if (['.png','.jpg','.jpeg','.webp','.svg','.gif','.ico','.bmp'].includes(ext)) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;';
+        const img = document.createElement('img');
+        img.src = viewUrl;
+        img.style.cssText = 'max-width:100%;max-height:78vh;object-fit:contain;border-radius:6px;';
+        img.alt = f.name;
+        img.onerror = function() { wrap.innerHTML = showFallbackCloud(f); };
+        wrap.appendChild(img);
+        body.appendChild(wrap);
+    } else if (['.mp4','.webm','.mkv','.mov','.avi','.3gp'].includes(ext)) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;';
+        const video = document.createElement('video');
+        video.controls = true;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+        video.src = viewUrl;
+        video.style.cssText = 'max-width:100%;max-height:78vh;border-radius:6px;';
+        video.onerror = function() { wrap.innerHTML = showFallbackCloud(f); };
+        wrap.appendChild(video);
+        body.appendChild(wrap);
+    } else if (['.mp3','.wav','.ogg','.m4a','.opus','.flac'].includes(ext)) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'padding:50px 20px;text-align:center;width:100%;';
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.autoplay = true;
+        audio.src = viewUrl;
+        audio.style.cssText = 'width:80%;max-width:460px;';
+        audio.onerror = function() { wrap.innerHTML = showFallbackCloud(f); };
+        wrap.appendChild(audio);
+        body.appendChild(wrap);
+    } else {
+        const iframe = document.createElement('iframe');
+        iframe.src = viewUrl;
+        iframe.style.cssText = 'width:100%;height:78vh;border:none;border-radius:6px;background:#111;';
+        body.appendChild(iframe);
+    }
+    modal.classList.add('open');
+}
+
+function navigatePreview(dir) {
+    if (!STATE.loadedFiles || !STATE.loadedFiles.length) return;
+    let nextIdx = (STATE.previewIndex || 0) + dir;
+    if (nextIdx < 0) nextIdx = STATE.loadedFiles.length - 1;
+    if (nextIdx >= STATE.loadedFiles.length) nextIdx = 0;
+    previewFile(nextIdx);
+}
+
+function closeModal(e) {
+    document.getElementById('previewModal').classList.remove('open');
+    document.getElementById('modalBody').innerHTML = '';
+}
+function openSettingsModal() {
+    document.getElementById('settingsModal').classList.add('open');
+}
+function closeSettingsModal(e) {
+    document.getElementById('settingsModal').classList.remove('open');
+}
+async function optimizeDatabase() {
+    const btn = document.getElementById('btnOptDb');
+    const status = document.getElementById('optDbStatus');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Optimizing...';
+    try {
+        const res = await fetch('/api/db/optimize', {method:'POST'});
+        const data = await res.json();
+        if (data.success) {
+            status.innerText = 'Database optimized!';
+            status.style.color = 'var(--accent-green)';
+            fetchStorageStats();
+        } else {
+            status.innerText = data.error || 'Optimization failed';
+            status.style.color = 'var(--accent-red)';
+        }
+    } catch(err) {
+        status.innerText = 'Network error';
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> Vacuum & Optimize DB';
+    }
+}
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+        closeModal(e);
+        closeActionSheet(e);
+        closeSettingsModal(e);
+    } else if (e.key === 'ArrowLeft') {
+        const modal = document.getElementById('previewModal');
+        if (modal && modal.classList.contains('open')) navigatePreview(-1);
+    } else if (e.key === 'ArrowRight') {
+        const modal = document.getElementById('previewModal');
+        if (modal && modal.classList.contains('open')) navigatePreview(1);
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORAGE STATS & REFRESH
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchStorageStats() {
+    try {
+        const st = await fetch('/api/stats').then(r=>r.json());
+        const gb = (st.total_mb/1024).toFixed(2);
+        document.getElementById('storageDetail').innerText = `${gb} GB • ${st.total_files.toLocaleString()} files`;
+    } catch(e) {}
+}
+async function refreshDrive() {
+    const icon = document.getElementById('refreshIcon');
+    icon.className = 'fa-solid fa-arrows-rotate fa-spin';
+    try { await fetch('/api/refresh'); await fetchDrive(STATE.folderId); } finally {
+        icon.className = 'fa-solid fa-arrows-rotate';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTH
+// ═══════════════════════════════════════════════════════════════════════════
+async function checkAuth() {
+    try {
+        const d = await fetch('/api/auth/status').then(r=>r.json());
+        if (d.protected) document.getElementById('btnLock').style.display='flex';
+    } catch(e) {}
+}
+async function lockDrive() {
+    if (!confirm('Lock Notion Drive and sign out?')) return;
+    await fetch('/api/auth/logout', {method:'POST'});
+    location.reload();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYNC CENTER
+// ═══════════════════════════════════════════════════════════════════════════
+function syncTab(t) {
+    STATE.syncSubTab = t;
+    ['queue','history','logs'].forEach(k => {
+        document.getElementById('tab'+k.charAt(0).toUpperCase()+k.slice(1)).classList.toggle('active', k===t);
+        document.getElementById('sub'+k.charAt(0).toUpperCase()+k.slice(1)).style.display = k===t ? 'block' : 'none';
+    });
+}
+
+async function startSync(target) {
+    closeNewMenu();
+    closeMobileMenu();
+    const ok = await fetch('/api/sync/start?target='+target, {method:'POST'}).then(r=>r.json()).catch(()=>({success:false}));
+    if (!ok.success) return;
+    switchTab('sync');
+    document.getElementById('btnCancel').style.display='flex';
+}
+async function cancelSync() {
+    await fetch('/api/sync/cancel', {method:'POST'});
+    document.getElementById('btnCancel').style.display='none';
+}
+
+async function pollSync() {
+    try {
+        const st = await fetch('/api/sync/status').then(r=>r.json());
+
+        if (st.cache_version !== undefined && st.cache_version !== STATE.lastCacheVer) {
+            STATE.lastCacheVer = st.cache_version;
+            if (STATE.tab === 'drive') fetchDrive(STATE.folderId, false);
+            else if (STATE.tab === 'recent') loadRecent();
+            else if (STATE.tab === 'starred') loadStarred();
+            fetchStorageStats();
         }
 
-        checkAuthStatus();
-        fetchDrive();
+        const badge = document.getElementById('syncNavBadge');
+        const icon  = document.getElementById('syncNavIcon');
+        const pulse = document.getElementById('syncPulse');
+        if (st.is_running) {
+            badge.className='nav-badge running'; badge.innerText=st.percent+'%';
+            icon.className='fa-solid fa-arrows-rotate fa-spin';
+            pulse.classList.add('running');
+            document.getElementById('btnCancel').style.display='flex';
+        } else {
+            badge.className='nav-badge idle'; badge.innerText='Idle';
+            icon.className='fa-solid fa-arrows-rotate';
+            pulse.classList.remove('running');
+            document.getElementById('btnCancel').style.display='none';
+        }
 
+        const t = st.is_running ? `Syncing ${st.current_target}...` : st.status_message;
+        document.getElementById('syncMainTitle').innerText = t;
+        document.getElementById('syncSubtitle').innerText = st.is_running ? `Active: ${st.current_file}` : 'Tracks .notion_sync_state.json • Skips unchanged files';
+        document.getElementById('progressLabel').innerText = `Progress: ${st.percent}%`;
+        document.getElementById('progressDetail').innerText = `${st.synced_files} / ${st.total_files} files (${st.remaining_files} remaining)`;
+        document.getElementById('progressBar').style.width = st.percent+'%';
+        document.getElementById('statTarget').innerText = st.current_target||'—';
+        document.getElementById('statUploaded').innerText = st.synced_files;
+        document.getElementById('statRemaining').innerText = st.remaining_files;
+        document.getElementById('statSpeed').innerText = st.speed_str||'—';
+        document.getElementById('badgeQueue').innerText = st.remaining_files||0;
+        document.getElementById('badgeHistory').innerText = (st.history||[]).length;
+
+        if (st.is_running && st.current_file!=='None') {
+            document.getElementById('afbName').innerText = st.current_file;
+            document.getElementById('afbPath').innerText = st.current_path;
+            document.getElementById('afbSize').innerText = st.current_size_str;
+        } else if (!st.is_running && st.total_files>0) {
+            document.getElementById('afbName').innerText = 'All changes synchronized!';
+            document.getElementById('afbPath').innerText = '100% up to date with Notion Cloud.';
+            document.getElementById('afbSize').innerText = '\u2705 Done';
+        }
+
+        // Queue table
+        const qb = document.getElementById('queueBody');
+        if (st.queue && st.queue.length) {
+            qb.innerHTML = st.queue.map(q => `<tr>
+                <td><span class="tag ${q.tag||'NEW'}">${q.tag||'NEW'}</span></td>
+                <td style="font-weight:500;">${esc(q.name)}</td>
+                <td style="color:var(--text-muted);font-size:11.5px;">${esc(q.path)}</td>
+                <td>${q.size_str}</td>
+                <td><span class="pill ${q.status}">${q.status}</span></td>
+            </tr>`).join('');
+        } else if (!st.is_running && st.synced_files>0) {
+            qb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#81C995;padding:22px;"><i class="fa-solid fa-circle-check"></i> All files synced!</td></tr>`;
+        }
+
+        // History table
+        const hb = document.getElementById('historyBody');
+        if (st.history && st.history.length) {
+            hb.innerHTML = st.history.map(h => `<tr>
+                <td style="font-weight:500;">${esc(h.name)}</td>
+                <td style="color:var(--text-muted);font-size:11.5px;">${esc(h.path)}</td>
+                <td>${h.size_str}</td><td>${h.time}</td>
+                <td><span class="pill ${h.status==='success'?'synced':'failed'}">${h.status==='success'?'Synced':'Failed'}</span></td>
+            </tr>`).join('');
+        }
+
+        // Console logs
+        const cb = document.getElementById('consoleBox');
+        if (st.logs && st.logs.length) {
+            cb.innerHTML = st.logs.slice(-100).map(l=>`<div class="log-line">${esc(l)}</div>`).join('');
+            cb.scrollTop = cb.scrollHeight;
+        }
+    } catch(e) { console.error('pollSync error', e); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SSE — REAL-TIME LIVE SYNC (Automatic Notion Deletions & Additions)
+// ═══════════════════════════════════════════════════════════════════════════
+function connectSSE() {
+    const dot = document.getElementById('sseDot');
+    const lbl = document.getElementById('sseLabel');
+    const es = new EventSource('/api/events');
+    es.onopen = () => { dot.classList.add('connected'); lbl.innerText='Live'; };
+    es.onerror = () => { dot.classList.remove('connected'); lbl.innerText='Reconnecting...'; setTimeout(connectSSE, 5000); es.close(); };
+    
+    es.addEventListener('file_deleted', e => {
+        const d = JSON.parse(e.data);
+        if (d.id) {
+            const card = document.querySelector(`[data-id="${d.id}"]`);
+            if (card) {
+                card.style.transition = 'opacity 0.25s, transform 0.25s';
+                card.style.opacity = '0';
+                card.style.transform = 'scale(0.85)';
+                setTimeout(() => card.remove(), 250);
+            }
+            STATE.loadedFiles = STATE.loadedFiles.filter(x => x.id !== d.id);
+        }
         fetchStorageStats();
-        setInterval(fetchStorageStats, 15000);
-        setInterval(pollSyncStatus, 1000);
-    </script>
+    });
+    
+    es.addEventListener('file_added', e => {
+        const d = JSON.parse(e.data);
+        if (d.version !== STATE.lastCacheVer) { 
+            STATE.lastCacheVer = d.version; 
+            if (STATE.tab==='drive') fetchDrive(STATE.folderId, false);
+            else if (STATE.tab==='recent') loadRecent();
+            fetchStorageStats();
+        }
+    });
+
+    es.addEventListener('cache_updated', e => {
+        const d = JSON.parse(e.data);
+        if (d.deleted_ids && d.deleted_ids.length) {
+            d.deleted_ids.forEach(delId => {
+                const card = document.querySelector(`[data-id="${delId}"]`);
+                if (card) card.remove();
+            });
+            STATE.loadedFiles = STATE.loadedFiles.filter(x => !d.deleted_ids.includes(x.id));
+        }
+        if (d.version !== STATE.lastCacheVer) { 
+            STATE.lastCacheVer = d.version; 
+            if (STATE.tab==='drive') fetchDrive(STATE.folderId, false);
+            else if (STATE.tab==='recent') loadRecent();
+            else if (STATE.tab==='starred') loadStarred();
+            fetchStorageStats();
+        }
+    });
+    
+    es.addEventListener('sync_progress', e => { if (STATE.tab==='sync') pollSync(); });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DRAG & DROP + UPLOAD
+// ═══════════════════════════════════════════════════════════════════════════
+let _dragN = 0;
+window.addEventListener('dragenter', e => { e.preventDefault(); if(++_dragN===1) document.getElementById('dropOverlay').classList.add('on'); });
+window.addEventListener('dragleave', e => { e.preventDefault(); if(--_dragN<=0) { _dragN=0; document.getElementById('dropOverlay').classList.remove('on'); } });
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', async e => {
+    e.preventDefault(); _dragN=0; document.getElementById('dropOverlay').classList.remove('on');
+    const items = e.dataTransfer.items;
+    if (!items || !items.length) return;
+    const ps = Array.from(items).map(it => it.webkitGetAsEntry ? it.webkitGetAsEntry() : null).filter(Boolean);
+    const allFiles = (await Promise.all(ps.map(x=>_traverseEntry(x,'')))).flat();
+    if (allFiles.length) uploadFiles(allFiles);
+});
+
+function _traverseEntry(entry, path) {
+    return new Promise(res => {
+        if (entry.isFile) entry.file(f => { f.relPath = path+f.name; res([f]); });
+        else if (entry.isDirectory) {
+            entry.createReader().readEntries(async entries => {
+                res((await Promise.all(entries.map(e=>_traverseEntry(e,path+entry.name+'/')))).flat());
+            });
+        } else res([]);
+    });
+}
+
+function triggerFileInput() { closeNewMenu(); document.getElementById('fileInput').click(); }
+function triggerFolderInput() { closeNewMenu(); document.getElementById('folderInput').click(); }
+function handleFiles(e) { const files=Array.from(e.target.files); if(files.length) uploadFiles(files); e.target.value=''; }
+
+async function uploadFiles(files) {
+    const toast=document.getElementById('uploadToast');
+    toast.style.display='flex';
+    for (let i=0;i<files.length;i++) {
+        const f=files[i];
+        const rel=f.relPath||f.webkitRelativePath||f.name;
+        const pct=Math.round(i/files.length*100);
+        document.getElementById('utTitle').innerText=`Uploading (${i+1}/${files.length})...`;
+        document.getElementById('utPct').innerText=pct+'%';
+        document.getElementById('utFile').innerText=rel;
+        document.getElementById('utBar').style.width=pct+'%';
+        try {
+            const b64 = await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]||'');r.onerror=rej;r.readAsDataURL(f);});
+            await fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:f.name,rel_path:rel,data_b64:b64,parent_folder_id:STATE.folderId})});
+        } catch(err) { console.error('Upload error',f.name,err); }
+    }
+    document.getElementById('utBar').style.width='100%'; document.getElementById('utPct').innerText='100%';
+    document.getElementById('utTitle').innerText='Upload Complete!';
+    document.getElementById('utFile').innerText=`${files.length} file(s) uploaded.`;
+    setTimeout(()=>{ toast.style.display='none'; fetchDrive(STATE.folderId); fetchStorageStats(); }, 2500);
+}
+
+function toggleNewMenu(e) { e.stopPropagation(); document.getElementById('newDropdown').classList.toggle('open'); }
+function closeNewMenu() { document.getElementById('newDropdown').classList.remove('open'); }
+document.addEventListener('click', closeNewMenu);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KEYBOARD SHORTCUTS & MOBILE DRAWER
+// ═══════════════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        const searchInput = document.getElementById('searchInput');
+        if (searchInput) searchInput.focus();
+    }
+});
+
+function toggleMobileMenu() {
+    const sidebar = document.getElementById('sidebar');
+    const backdrop = document.getElementById('drawerBackdrop');
+    if (sidebar) sidebar.classList.toggle('open');
+    if (backdrop) backdrop.classList.toggle('open');
+}
+
+function closeMobileMenu() {
+    const sidebar = document.getElementById('sidebar');
+    const backdrop = document.getElementById('drawerBackdrop');
+    if (sidebar) sidebar.classList.remove('open');
+    if (backdrop) backdrop.classList.remove('open');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INITIALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+checkAuth();
+fetchDrive(null);
+fetchStorageStats();
+setInterval(fetchStorageStats, 20000);
+setInterval(pollSync, 1200);
+connectSSE();
+</script>
 </body>
-</html>"""
+</html>
+"""
+
 
 # ==============================================================================
 # HTTP SERVER ROUTING
@@ -2972,9 +3978,11 @@ class NotionServerHandler(BaseHTTPRequestHandler):
         pass
 
     def log_error(self, fmt, *args):
-        # Log errors but safely, stripping non-ASCII characters
+        # Log errors safely, suppressing normal client disconnects (e.g. WinError 10053 / 10054)
         try:
             msg = (fmt % args) if args else str(fmt)
+            if any(k in msg for k in ("10053", "10054", "10058", "Broken pipe", "ConnectionResetError", "ConnectionAbortedError")):
+                return
             msg_safe = msg.encode('ascii', errors='replace').decode('ascii')
             print(f"[!] Server: {msg_safe}", file=sys.stderr)
         except Exception:
@@ -2983,13 +3991,17 @@ class NotionServerHandler(BaseHTTPRequestHandler):
     def handle_one_request(self):
         try:
             super().handle_one_request()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass  # Client disconnected — normal during browser tab switches
         except UnicodeEncodeError:
             pass  # Emoji in path — suppress silently
         except Exception as e:
-            err_str = str(e).encode('ascii', errors='replace').decode('ascii')
-            print(f"[!] Request handler error: {err_str}", file=sys.stderr)
+            try:
+                err_str = str(e).encode('ascii', errors='replace').decode('ascii')
+                if not any(k in err_str for k in ("10053", "10054", "10058", "Broken pipe", "abort")):
+                    print(f"[!] Request handler error: {err_str}", file=sys.stderr)
+            except Exception:
+                pass
 
 
     def do_POST(self):
@@ -3105,6 +4117,8 @@ class NotionServerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/upload":
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length > 100 * 1024 * 1024:  # 100 MB limit
+                    raise ValueError("File too large (max 100 MB)")
                 body = self.rfile.read(length)
                 upload_req = json.loads(body.decode("utf-8"))
                 
@@ -3115,15 +4129,28 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 parent_id = upload_req.get("parent_folder_id")
                 data_bytes = base64.b64decode(upload_req.get("data_b64", ""))
                 
-                # Save locally in UPLOADS_DIR
-                local_file_path = UPLOADS_DIR / rel_path.replace("/", "\\")
+                # Sanitize filename and prevent path traversal
+                safe_name = Path(file_name).name  # strips any directory components
+                if not safe_name:
+                    raise ValueError("Invalid filename")
+                
+                # Build safe relative path - prevent traversal outside UPLOADS_DIR
+                safe_rel = Path(rel_path).name  # Just use filename, ignore any path components
+                local_file_path = UPLOADS_DIR / safe_rel
+                # Final safety check: ensure resolved path is within UPLOADS_DIR
+                try:
+                    local_file_path.resolve().relative_to(UPLOADS_DIR.resolve())
+                except ValueError:
+                    raise ValueError("Path traversal detected")
+                
                 local_file_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(local_file_path, "wb") as f:
                     f.write(data_bytes)
                 
                 file_size = len(data_bytes)
                 size_mb = round(file_size / (1024 * 1024), 4)
-                ext = Path(file_name).suffix.lower()
+                ext = Path(safe_name).suffix.lower()
+                ftype, emoji = F.classify_file(ext) if ext else ("Other", "📄")
                 
                 # Create Notion page
                 api_client = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
@@ -3140,9 +4167,9 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     "parent": {"database_id": DEFAULT_DB_ID},
                     "icon": {"type": "emoji", "emoji": emoji},
                     "properties": {
-                        "Name": {"title": [{"text": {"content": file_name}}]},
+                        "Name": {"title": [{"text": {"content": safe_name}}]},
                         "Type": {"select": {"name": "File"}},
-                        "File Type": {"select": {"name": file_type}},
+                        "File Type": {"select": {"name": ftype}},
                         "File Extension": {"rich_text": [{"text": {"content": ext}}]},
                         "File Size": {"number": size_mb},
                         "Description": {"rich_text": [{"text": {"content": f"Path: {local_file_path}"}}]},
@@ -3158,17 +4185,108 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     cloud_url = f"https://www.notion.so/{new_page_id}"
                     requests.patch(f"https://api.notion.com/v1/pages/{new_page_id}", headers=api_client.headers, json={"properties": {"Open in Browser": {"url": cloud_url}}}, timeout=15)
                     register_drive_cache_item(
-                        new_page_id, file_name, "File", ext, size_mb, file_size,
+                        new_page_id, safe_name, "File", ext, size_mb, file_size,
                         target_parent_notion_id, str(local_file_path), time.time()
                     )
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"success": True, "id": new_page_id, "name": file_name}).encode("utf-8"))
+                    self.wfile.write(json.dumps({"success": True, "id": new_page_id, "name": safe_name}).encode("utf-8"))
                     return
 
                 self.send_response(500)
                 self.end_headers()
+                return
+            except Exception as e:
+                import logging
+                logging.getLogger("notion_server").error(f"Upload error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/delete":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                file_id = data.get("id", "").replace("-", "")
+                local_path = data.get("path", "")
+                
+                if not file_id and not local_path:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success": false, "error": "Missing id or path"}')
+                    return
+                
+                # 1. Archive page in Notion if ID is present
+                if file_id:
+                    try:
+                        runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                        requests.patch(
+                            f"https://api.notion.com/v1/pages/{file_id}",
+                            headers=runner.headers,
+                            json={"archived": True},
+                            timeout=15
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to archive Notion page {file_id}: {e}")
+                
+                # 2. Delete from SQLite index
+                try:
+                    from core.local_index import delete_item, delete_item_by_path
+                    if file_id:
+                        delete_item(file_id)
+                    if local_path:
+                        delete_item_by_path(local_path)
+                except Exception as e:
+                    logger.warning(f"Index delete warning: {e}")
+                
+                # 3. Delete from in-memory DRIVE_CACHE
+                with CACHE_LOCK:
+                    if file_id:
+                        DRIVE_CACHE["items"].pop(file_id, None)
+                        for pid, cids in DRIVE_CACHE["children"].items():
+                            if file_id in cids:
+                                cids.remove(file_id)
+                        if file_id in DRIVE_CACHE["root_items"]:
+                            DRIVE_CACHE["root_items"].remove(file_id)
+                    DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+                
+                save_disk_cache()
+                
+                # 4. Broadcast SSE deletion event
+                _broadcast_sse("file_deleted", {
+                    "id": file_id,
+                    "path": local_path,
+                    "version": DRIVE_CACHE["version"]
+                })
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "id": file_id}).encode("utf-8"))
+                return
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/db/optimize":
+            try:
+                from core.local_index import get_connection
+                conn = get_connection()
+                conn.execute("PRAGMA optimize;")
+                conn.execute("VACUUM;")
+                conn.close()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": true, "message": "Database optimized and vacuumed."}')
                 return
             except Exception as e:
                 self.send_response(500)
@@ -3258,53 +4376,145 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             if folder_id:
                 folder_id = folder_id.replace("-", "")
 
-            with CACHE_LOCK:
-                if folder_id:
-                    child_ids = list(DRIVE_CACHE["children"].get(folder_id, []))
-                else:
-                    ROOT_DEVICE_NAMES = {
-                        "Local Disk (C:)", "Local Disk (D:)",
-                        "Internal shared storage", "SD card",
-                        "Internal Storage", "SD Card"
+            # Pagination + sort params
+            try:
+                offset = int(params.get("offset", ["0"])[0])
+            except ValueError:
+                offset = 0
+            try:
+                limit = min(int(params.get("limit", ["200"])[0]), 500)
+            except ValueError:
+                limit = 200
+            sort_key = params.get("sort", ["name"])[0]
+            sort_order = params.get("order", ["asc"])[0]  # asc | desc
+            type_filter = params.get("type", [""])[0].lower()  # folder|file|''
+
+            # Use SQLite index for scalable queries (handles 10k+ items efficiently)
+            # Fall back to in-memory cache when SQLite has no data yet
+            _use_fallback = False
+            try:
+                from core.local_index import get_children, get_breadcrumbs
+                
+                folders, total_folders, _ = get_children(
+                    parent_id=folder_id,
+                    offset=0,
+                    limit=500,  # Always return all folders (usually small number)
+                    sort=sort_key,
+                    order=sort_order,
+                    type_filter='Folder'
+                )
+                
+                files, total_files, has_more = get_children(
+                    parent_id=folder_id,
+                    offset=offset,
+                    limit=limit,
+                    sort=sort_key,
+                    order=sort_order,
+                    type_filter='File'
+                )
+
+                # If both are empty but cache has data, fall back to in-memory cache
+                # (SQLite not yet populated from cache, happens during first ~2s after startup)
+                if not folders and not files:
+                    with CACHE_LOCK:
+                        cache_has_data = bool(DRIVE_CACHE["items"])
+                    if cache_has_data:
+                        _use_fallback = True
+                        # Also trigger async SQLite population if not already done
+                        _sqlite_pop_thread = threading.Thread(target=_populate_sqlite_from_cache, daemon=True)
+                        _sqlite_pop_thread.start()
+                
+                if not _use_fallback:
+                    breadcrumbs = []
+                    if folder_id:
+                        breadcrumbs = get_breadcrumbs(folder_id)
+                    
+                    resp_data = {
+                        "folders": folders,
+                        "files": files,
+                        "total_files": total_files,
+                        "total_folders": total_folders,
+                        "offset": offset,
+                        "limit": limit,
+                        "has_more": has_more,
+                        "breadcrumbs": breadcrumbs,
+                        "version": DRIVE_CACHE.get("version", 0)
                     }
-                    child_ids = [cid for cid, it in DRIVE_CACHE["items"].items() if it.get("name") in ROOT_DEVICE_NAMES and not it.get("parent_id")]
-                    if not child_ids:
-                        child_ids = list(DRIVE_CACHE["root_items"])
+                
+            except Exception as e:
+                logger.error(f"Index query error, falling back to cache: {e}")
+                _use_fallback = True
 
-                folders = []
-                files = []
-                for cid in child_ids:
-                    item = DRIVE_CACHE["items"].get(cid)
-                    if not item:
-                        continue
-                    if item.get("type") == "Folder":
-                        sub_count = len(DRIVE_CACHE["children"].get(cid, []))
-                        item_copy = dict(item)
-                        item_copy["item_count"] = sub_count
-                        folders.append(item_copy)
+            if _use_fallback:
+                # Fallback to in-memory cache
+                with CACHE_LOCK:
+                    if folder_id:
+                        child_ids = list(DRIVE_CACHE["children"].get(folder_id, []))
                     else:
-                        files.append(dict(item))
+                        ROOT_DEVICE_NAMES = {
+                            "Local Disk (C:)", "Local Disk (D:)",
+                            "Internal shared storage", "SD card",
+                            "Internal Storage", "SD Card"
+                        }
+                        child_ids = [cid for cid, it in DRIVE_CACHE["items"].items()
+                                     if it.get("name") in ROOT_DEVICE_NAMES and not it.get("parent_id")]
+                        if not child_ids:
+                            child_ids = list(DRIVE_CACHE["root_items"])
 
-                breadcrumbs = []
-                curr = folder_id
-                seen = set()
-                while curr:
-                    if curr in seen:
-                        # Break potential parent cycles from stale/corrupt cache data.
-                        break
-                    seen.add(curr)
-                    c_item = DRIVE_CACHE["items"].get(curr)
-                    if not c_item:
-                        break
-                    breadcrumbs.insert(0, {"id": curr, "name": c_item["name"]})
-                    curr = c_item.get("parent_id")
+                    folders = []
+                    files = []
+                    for cid in child_ids:
+                        item = DRIVE_CACHE["items"].get(cid)
+                        if not item:
+                            continue
+                        if item.get("type") == "Folder":
+                            sub_count = len(DRIVE_CACHE["children"].get(cid, []))
+                            item_copy = dict(item)
+                            item_copy["item_count"] = sub_count
+                            folders.append(item_copy)
+                        else:
+                            files.append(dict(item))
 
-                resp_data = {
-                    "folders": sorted(folders, key=lambda x: x["name"].lower()),
-                    "files": sorted(files, key=lambda x: x["name"].lower()),
-                    "breadcrumbs": breadcrumbs,
-                    "version": DRIVE_CACHE.get("version", 0)
-                }
+                    reverse = sort_order == "desc"
+                    def _sort_val(x):
+                        v = x.get(sort_key, "")
+                        return v.lower() if isinstance(v, str) else (v or 0)
+                    folders.sort(key=_sort_val, reverse=reverse)
+                    files.sort(key=_sort_val, reverse=reverse)
+
+                    if type_filter == "folder":
+                        files = []
+                    elif type_filter == "file":
+                        folders = []
+
+                    total_files = len(files)
+                    paged_files = files[offset:offset + limit]
+                    has_more = (offset + limit) < total_files
+
+                    breadcrumbs = []
+                    curr = folder_id
+                    seen = set()
+                    while curr:
+                        if curr in seen:
+                            break
+                        seen.add(curr)
+                        c_item = DRIVE_CACHE["items"].get(curr)
+                        if not c_item:
+                            break
+                        breadcrumbs.insert(0, {"id": curr, "name": c_item["name"]})
+                        curr = c_item.get("parent_id")
+
+                    resp_data = {
+                        "folders": folders,
+                        "files": paged_files,
+                        "total_files": total_files,
+                        "total_folders": len(folders),
+                        "offset": offset,
+                        "limit": limit,
+                        "has_more": has_more,
+                        "breadcrumbs": breadcrumbs,
+                        "version": DRIVE_CACHE.get("version", 0)
+                    }
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -3313,61 +4523,229 @@ class NotionServerHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/search":
-            query = params.get("q", [""])[0].lower()
+            query = params.get("q", [""])[0].strip()
+            category = params.get("cat", ["all"])[0].strip().lower()
             matching_files = []
             matching_folders = []
-            with CACHE_LOCK:
-                for it in DRIVE_CACHE["items"].values():
-                    if query in it["name"].lower():
-                        if it["type"] == "Folder":
-                            matching_folders.append(dict(it))
-                        else:
-                            matching_files.append(dict(it))
+            
+            # Use SQLite index for fast search with category filtering
+            try:
+                from core.local_index import search_items
+                matching_folders, matching_files = search_items(query, category=category, limit=120)
+            except Exception as e:
+                logger.error(f"Search index error, falling back to cache: {e}")
+                with CACHE_LOCK:
+                    for it in DRIVE_CACHE["items"].values():
+                        if not query or query.lower() in it["name"].lower():
+                            if it["type"] == "Folder":
+                                if category in ('all', 'folder'):
+                                    matching_folders.append(dict(it))
+                            else:
+                                if category == 'all':
+                                    matching_files.append(dict(it))
+                                elif category == 'image' and it.get("extension", "").lower().replace(".", "") in ('jpg', 'jpeg', 'png', 'webp', 'gif', 'svg'):
+                                    matching_files.append(dict(it))
+                                elif category == 'document' and it.get("extension", "").lower().replace(".", "") in ('pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx', 'csv', 'ppt', 'pptx'):
+                                    matching_files.append(dict(it))
+                                elif category == 'video' and it.get("extension", "").lower().replace(".", "") in ('mp4', 'mkv', 'mov', 'webm'):
+                                    matching_files.append(dict(it))
+                                elif category == 'audio' and it.get("extension", "").lower().replace(".", "") in ('mp3', 'wav', 'ogg', 'm4a', 'opus'):
+                                    matching_files.append(dict(it))
+                                elif category == 'code' and it.get("extension", "").lower().replace(".", "") in ('py', 'js', 'ts', 'html', 'css', 'json', 'yaml', 'sh', 'sql'):
+                                    matching_files.append(dict(it))
 
+            bc_title = f"Search: '{query}'" if query else f"Filter: {category.capitalize()}"
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "folders": matching_folders[:20],
-                "files": matching_files[:50],
-                "breadcrumbs": [{"id": None, "name": f"Search results for '{query}'"}]
+                "folders": matching_folders[:40],
+                "files": matching_files[:80],
+                "total_files": len(matching_files),
+                "breadcrumbs": [{"id": None, "name": bc_title}]
             }).encode("utf-8"))
             return
 
         if parsed.path == "/api/stats":
+            # Use SQLite index for fast stats
+            try:
+                from core.local_index import get_stats
+                stats = get_stats()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "total_mb": stats["total_size_mb"],
+                    "total_files": stats["total_files"]
+                }).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Stats error: {e}")
+                with CACHE_LOCK:
+                    total_size_mb = sum(it.get("size_mb", 0) for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+                    total_files = sum(1 for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "total_mb": round(total_size_mb, 2),
+                    "total_files": total_files
+                }).encode("utf-8"))
+            return
+
+        if parsed.path == "/api/recent":
+            # Use SQLite index for recent files
+            try:
+                from core.local_index import get_recent
+                recent_items = get_recent(limit=50)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"files": recent_items}).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Recent files error: {e}")
+                with RECENT_LOCK:
+                    recent_copy = list(RECENT_FILES[:50])
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"files": recent_copy}).encode("utf-8"))
+            return
+
+        if parsed.path == "/api/starred":
+            # Use SQLite index for starred items
+            try:
+                from core.local_index import get_starred
+                starred = get_starred()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": starred[:100]}).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Starred error: {e}")
+                starred = []
+                with CACHE_LOCK:
+                    for it in DRIVE_CACHE["items"].values():
+                        if it.get("starred") or it.get("type") == "Folder" and it.get("name") in (
+                            "Local Disk (C:)", "Local Disk (D:)",
+                            "Internal shared storage", "SD card", "Internal Storage", "SD Card"
+                        ):
+                            starred.append(dict(it))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": starred[:100]}).encode("utf-8"))
+            return
+
+        if parsed.path == "/api/storage":
+            devices = []
+            for letter in ("C", "D", "E", "F"):
+                p = Path(f"{letter}:/")
+                if p.exists():
+                    try:
+                        import shutil
+                        total, used, free = shutil.disk_usage(p)
+                        devices.append({
+                            "name": f"Local Disk ({letter}:)",
+                            "type": "local",
+                            "icon": "hard-drive",
+                            "total_gb": round(total / (1024**3), 1),
+                            "used_gb": round(used / (1024**3), 1),
+                            "free_gb": round(free / (1024**3), 1),
+                            "percent": round(used / total * 100, 1) if total else 0
+                        })
+                    except Exception:
+                        devices.append({"name": f"Local Disk ({letter}:)", "type": "local", "icon": "hard-drive"})
+            # Android (estimate from cache)
             with CACHE_LOCK:
-                total_size_mb = sum(it.get("size_mb", 0) for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
-                total_files = sum(1 for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+                android_files = [it for it in DRIVE_CACHE["items"].values()
+                                 if it["type"] == "File" and it.get("local_path", "").startswith("/storage")]
+            if android_files:
+                android_size_mb = sum(f.get("size_mb", 0) for f in android_files)
+                devices.append({
+                    "name": "Mobile Storage",
+                    "type": "android",
+                    "icon": "mobile-screen-button",
+                    "synced_files": len(android_files),
+                    "synced_mb": round(android_size_mb, 1)
+                })
+            with CACHE_LOCK:
+                cloud_files = sum(1 for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
+                cloud_mb = sum(it.get("size_mb", 0) for it in DRIVE_CACHE["items"].values() if it["type"] == "File")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "total_mb": round(total_size_mb, 2),
-                "total_files": total_files
+                "devices": devices,
+                "cloud_files": cloud_files,
+                "cloud_mb": round(cloud_mb, 2)
             }).encode("utf-8"))
             return
 
+        if parsed.path == "/api/events":
+            # Server-Sent Events endpoint
+            q: _queue.SimpleQueue = _queue.SimpleQueue()
+            with _SSE_LOCK:
+                _SSE_CLIENTS.append(q)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                # Send initial heartbeat
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        msg = q.get(timeout=25)
+                        self.wfile.write(msg.encode("utf-8"))
+                        self.wfile.flush()
+                    except _queue.Empty:
+                        # Keepalive ping
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                with _SSE_LOCK:
+                    if q in _SSE_CLIENTS:
+                        _SSE_CLIENTS.remove(q)
+            return
+
         if parsed.path == "/api/refresh":
-            populate_cache_from_notion()
+            def _bg_refresh():
+                populate_cache_from_notion(is_background=False)
+            threading.Thread(target=_bg_refresh, daemon=True).start()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
+            self.wfile.write(b'{"status":"ok","message":"Refreshing from Notion Cloud..."}')
             return
 
+        # 1. Resolve item from ID or Path
+        file_id = params.get("id", [None])[0]
         file_path_str = (params.get("path", [None])[0] or 
                          params.get("file", [None])[0] or 
                          params.get("p", [None])[0] or 
                          params.get("url", [None])[0] or 
                          params.get("target", [None])[0])
+        
+        target_item = None
+        with CACHE_LOCK:
+            if file_id and file_id in DRIVE_CACHE["items"]:
+                target_item = dict(DRIVE_CACHE["items"][file_id])
+            elif file_path_str:
+                clean_lookup = urllib.parse.unquote(file_path_str).strip()
+                for it in DRIVE_CACHE["items"].values():
+                    if it.get("local_path") == clean_lookup or it.get("id") == clean_lookup or it.get("name") == clean_lookup:
+                        target_item = dict(it)
+                        file_id = it.get("id")
+                        break
 
-        if not file_path_str:
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
-
-        clean_path_str = urllib.parse.unquote(file_path_str).replace("Local: ", "").replace("Path: ", "").strip()
+        # 2. Check if local file exists on disk
+        clean_path_str = (file_path_str or (target_item.get("local_path") if target_item else "") or "").strip()
+        clean_path_str = urllib.parse.unquote(clean_path_str).replace("Local: ", "").replace("Path: ", "").strip()
         norm_str = clean_path_str.replace("/", "\\")
         is_android = ("This PC\\OnePlus Nord CE4" in norm_str or 
                       "Internal shared storage" in norm_str or 
@@ -3377,97 +4755,10 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                       clean_path_str.startswith("/storage") or
                       clean_path_str.startswith("/sdcard"))
 
-        if is_android:
-            phone_path = resolve_android_path(clean_path_str)
-            fname = phone_path.split("/")[-1]
-            mime, _ = mimetypes.guess_type(fname)
-            mime = mime or "application/octet-stream"
-
-            acquired = ADB_SEMAPHORE.acquire(timeout=4.0)
-            if not acquired:
-                self.send_response(503)
-                self.send_header("Retry-After", "1")
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"ADB busy, try again")
-                return
-
-            proc = None
-            try:
-                proc = subprocess.Popen(
-                    ["adb", "exec-out", "cat", phone_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                content, err = proc.communicate(timeout=6.0)
-                if proc.returncode == 0 and content and not content.startswith(b"cat: "):
-                    self.send_response(200)
-                    self.send_header("Content-Type", mime)
-                    self.send_header("Content-Length", str(len(content)))
-                    if parsed.path == "/download":
-                        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
-                    else:
-                        self.send_header("Content-Disposition", "inline")
-                    self.end_headers()
-                    self.wfile.write(content)
-                    return
-            except subprocess.TimeoutExpired:
-                if proc:
-                    try:
-                        proc.kill()
-                        proc.communicate(timeout=1.0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            finally:
-                ADB_SEMAPHORE.release()
-
-            self.send_response(404)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            err_html = f"""<!DOCTYPE html><html><head><title>Device Not Connected</title>
-            <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
-            .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
-            a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
-            <body><div class="box"><h2>📱 Phone Not Connected</h2><p style="color:#9E9E9E;">Connect your phone via USB with USB Debugging enabled to view this file.</p><p style="color:#666;font-size:12px;word-break:break-all;">{html.escape(phone_path)}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
-            self.wfile.write(err_html.encode("utf-8"))
-            return
-
-        target_path = Path(clean_path_str).resolve()
-
-        if not target_path.exists():
-            self.send_response(404)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            err_html = f"""<!DOCTYPE html><html><head><title>File Not Found</title>
-            <style>body{{background:#131314;color:#E3E3E3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}}
-            .box{{background:#1E1F20;padding:32px;border-radius:16px;border:1px solid #3C4043;max-width:500px;text-align:center;}}
-            a{{color:#A8C7FA;text-decoration:none;display:inline-block;margin-top:16px;padding:8px 16px;background:#004A77;border-radius:20px;}}</style></head>
-            <body><div class="box"><h2>📄 File Not Found</h2><p style="color:#9E9E9E;word-break:break-all;">{html.escape(str(target_path))}</p><a href="/">📁 Open Notion Drive GUI</a></div></body></html>"""
-            self.wfile.write(err_html.encode("utf-8"))
-            return
-
-        if parsed.path == "/download":
-            if target_path.is_file():
-                try:
-                    with open(target_path, "rb") as f:
-                        content = f.read()
-                    mime, _ = mimetypes.guess_type(str(target_path))
-                    mime = mime or "application/octet-stream"
-                    self.send_response(200)
-                    self.send_header("Content-Type", mime)
-                    self.send_header("Content-Length", str(len(content)))
-                    self.send_header("Content-Disposition", f'attachment; filename="{target_path.name}"')
-                    self.end_headers()
-                    self.wfile.write(content)
-                    return
-                except Exception as e:
-                    self.send_error(500, f"Error reading file: {e}")
-                    return
-
-        if parsed.path == "/download-folder":
-            if target_path.is_dir():
+        # Folder ZIP Download
+        if parsed.path == "/download-folder" and clean_path_str:
+            target_path = Path(clean_path_str).resolve()
+            if target_path.exists() and target_path.is_dir():
                 try:
                     zip_buffer = io.BytesIO()
                     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -3476,7 +4767,6 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                                 file_full_path = Path(root) / file
                                 rel_path = file_full_path.relative_to(target_path)
                                 zip_file.write(file_full_path, arcname=str(rel_path))
-                    
                     zip_data = zip_buffer.getvalue()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
@@ -3489,38 +4779,178 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     self.send_error(500, f"Error creating ZIP: {e}")
                     return
 
-        if target_path.is_file():
+        # Case A: Local PC file that exists on disk
+        if not is_android and clean_path_str:
             try:
-                mime, _ = mimetypes.guess_type(str(target_path))
-                mime = mime or "application/octet-stream"
+                p_obj = Path(clean_path_str).resolve()
+                if p_obj.exists() and p_obj.is_file():
+                    mime, _ = mimetypes.guess_type(str(p_obj))
+                    mime = mime or "application/octet-stream"
+                    file_size = p_obj.stat().st_size
+                    
+                    range_header = self.headers.get("Range")
+                    if range_header and range_header.startswith("bytes="):
+                        range_val = range_header[6:].strip()
+                        parts = range_val.split("-")
+                        start = int(parts[0]) if parts[0] else 0
+                        end = int(parts[1]) if len(parts) > 1 and parts[1] else (file_size - 1)
+                        if start >= file_size:
+                            self.send_error(416, "Requested Range Not Satisfiable")
+                            return
+                        end = min(end, file_size - 1)
+                        chunk_length = (end - start) + 1
+                        
+                        self.send_response(206)
+                        self.send_header("Content-Type", mime)
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                        self.send_header("Content-Length", str(chunk_length))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Cache-Control", "public, max-age=3600")
+                        self.end_headers()
+                        
+                        with open(p_obj, "rb") as f:
+                            f.seek(start)
+                            bytes_remaining = chunk_length
+                            while bytes_remaining > 0:
+                                read_sz = min(bytes_remaining, 65536)
+                                buf = f.read(read_sz)
+                                if not buf:
+                                    break
+                                self.wfile.write(buf)
+                                bytes_remaining -= len(buf)
+                        return
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", mime)
+                        self.send_header("Content-Length", str(file_size))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Cache-Control", "public, max-age=3600")
+                        if parsed.path == "/download":
+                            self.send_header("Content-Disposition", f'attachment; filename="{p_obj.name}"')
+                        else:
+                            self.send_header("Content-Disposition", "inline")
+                        self.end_headers()
+                        import shutil
+                        with open(p_obj, "rb") as f:
+                            shutil.copyfileobj(f, self.wfile, length=65536)
+                        return
+            except Exception:
+                pass
 
-                with open(target_path, "rb") as f:
-                    content = f.read()
+        # Case B: Android file with ADB connected
+        if is_android and clean_path_str:
+            phone_path = resolve_android_path(clean_path_str)
+            fname = phone_path.split("/")[-1]
+            mime, _ = mimetypes.guess_type(fname)
+            mime = mime or "application/octet-stream"
+            acquired = ADB_SEMAPHORE.acquire(timeout=1.5)
+            if acquired:
+                try:
+                    proc = subprocess.Popen(
+                        ["adb", "exec-out", "cat", phone_path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    content, err = proc.communicate(timeout=6.0)
+                    if proc.returncode == 0 and content and not content.startswith(b"cat: "):
+                        file_size = len(content)
+                        range_header = self.headers.get("Range")
+                        if range_header and range_header.startswith("bytes="):
+                            range_val = range_header[6:].strip()
+                            parts = range_val.split("-")
+                            start = int(parts[0]) if parts[0] else 0
+                            end = int(parts[1]) if len(parts) > 1 and parts[1] else (file_size - 1)
+                            end = min(end, file_size - 1)
+                            chunk_length = (end - start) + 1
+                            self.send_response(206)
+                            self.send_header("Content-Type", mime)
+                            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                            self.send_header("Content-Length", str(chunk_length))
+                            self.send_header("Accept-Ranges", "bytes")
+                            self.end_headers()
+                            self.wfile.write(content[start:end+1])
+                            return
+                        else:
+                            self.send_response(200)
+                            self.send_header("Content-Type", mime)
+                            self.send_header("Content-Length", str(file_size))
+                            self.send_header("Accept-Ranges", "bytes")
+                            if parsed.path == "/download":
+                                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                            else:
+                                self.send_header("Content-Disposition", "inline")
+                            self.end_headers()
+                            self.wfile.write(content)
+                            return
+                except Exception:
+                    pass
+                finally:
+                    ADB_SEMAPHORE.release()
 
-                self.send_response(200)
-                self.send_header("Content-Type", mime)
-                self.send_header("Content-Length", str(len(content)))
-                self.send_header("Content-Disposition", "inline")
+        # Case C: CLOUD RETRIEVAL (Always retrieve from Notion Cloud)
+        notion_id = file_id or (target_item.get("id") if target_item else None)
+        item_name = (target_item.get("name") if target_item else None) or (Path(clean_path_str).name if clean_path_str else "Notion Cloud File")
+        item_ext = (target_item.get("extension", "") if target_item else Path(item_name).suffix).lower()
+        size_bytes = target_item.get("size_bytes", 0) if target_item else 0
+
+        if notion_id:
+            notion_cloud_url = f"https://www.notion.so/{notion_id}"
+            
+            # If downloading, redirect directly to Notion Cloud
+            if parsed.path == "/download":
+                self.send_response(302)
+                self.send_header("Location", notion_cloud_url)
                 self.end_headers()
-                self.wfile.write(content)
                 return
-            except Exception as e:
-                self.send_error(500, f"Error serving file: {e}")
+
+            # Check if Notion page has embedded content / code / text / files
+            text_content, bin_content, file_redirect = fetch_notion_page_content(notion_id)
+            if file_redirect:
+                self.send_response(302)
+                self.send_header("Location", file_redirect)
+                self.end_headers()
                 return
-        elif target_path.is_dir():
+
+            if text_content:
+                # Render clean code / text viewer
+                escaped_text = html.escape(text_content)
+                html_resp = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{html.escape(item_name)} — Notion Cloud</title>
+                <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+                <style>body{{background:#111213;color:#E8EAED;font-family:'Consolas','Courier New',monospace;margin:0;padding:20px;font-size:13px;line-height:1.6;}}
+                .header{{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;background:#181A1B;border:1px solid #303234;border-radius:10px;margin-bottom:16px;font-family:sans-serif;}}
+                .btn{{background:#1A73E8;color:#fff;padding:6px 14px;border-radius:18px;text-decoration:none;font-size:12px;display:flex;align-items:center;gap:6px;font-weight:600;}}
+                pre{{background:#181A1B;border:1px solid #303234;border-radius:10px;padding:18px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:0;}}
+                </style></head>
+                <body><div class="header"><div><strong>📄 {html.escape(item_name)}</strong> <span style="color:#9AA0A6;font-size:12px;margin-left:8px;">☁️ Notion Cloud</span></div><a class="btn" href="{notion_cloud_url}" target="_blank"><i class="fa-solid fa-cloud"></i> Open in Notion</a></div><pre>{escaped_text}</pre></body></html>"""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_resp.encode("utf-8"))))
+                self.end_headers()
+                self.wfile.write(html_resp.encode("utf-8"))
+                return
+
+            # Direct seamless transition to Notion Database page
             self.send_response(302)
-            self.send_header("Location", "/")
+            self.send_header("Location", notion_cloud_url)
             self.end_headers()
             return
 
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.end_headers()
+        return
+
 def start_server():
+    _load_recent_files()
+    _build_allowed_roots()
     if not load_disk_cache():
         print("[+] Initializing cache from Notion DB...")
         populate_cache_from_notion()
     
+    start_notion_watcher()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), NotionServerHandler)
     server.daemon_threads = True
-    print(f"🚀 Google Drive Web GUI active on http://127.0.0.1:{PORT}")
+    print(f"🚀 Notion Drive active on http://127.0.0.1:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -3528,3 +4958,4 @@ def start_server():
 
 if __name__ == "__main__":
     start_server()
+

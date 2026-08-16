@@ -35,10 +35,11 @@ def load_state() -> Dict[str, Any]:
     """
     Load the sync state index from disk.
 
-    Returns a dict with three sub-dicts:
-      - "files"         : local PC files  {path_str -> {notion_id, mtime, size}}
-      - "android_files" : Android files   {adb_path  -> {notion_id, mtime, size}}
-      - "folders"       : Notion folder cache {(name, parent_id) -> notion_id}
+    Returns a dict with sub-dicts:
+      - "files"           : local PC files  {path_str -> {notion_id, mtime, size}}
+      - "android_files"   : Android files   {adb_path  -> {notion_id, mtime, size}}
+      - "folders"         : local folder cache {path -> {notion_id, mtime, file_count}}
+      - "android_folders" : Android folder cache {adb_path -> {notion_id, mtime, file_count}}
     """
     search = [
         STATE_FILE,
@@ -59,11 +60,13 @@ def load_state() -> Dict[str, Any]:
                         norm_af[_normalize_android_path(k)] = v
                     data["android_files"] = norm_af
                     data.setdefault("folders", {})
+                    data.setdefault("android_folders", {})  # CRITICAL: ensure bucket exists
                     data.setdefault("last_sync", None)
+                    data.setdefault("sync_queue", [])  # persistent sync queue
                     return data
             except Exception:
                 pass
-    return {"files": {}, "android_files": {}, "folders": {}, "last_sync": None}
+    return {"files": {}, "android_files": {}, "folders": {}, "android_folders": {}, "last_sync": None, "sync_queue": []}
 
 
 def save_state(state: Dict[str, Any]):
