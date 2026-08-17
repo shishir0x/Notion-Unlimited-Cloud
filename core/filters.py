@@ -44,8 +44,9 @@ IGNORED_DIRS = {
 
 # ─── Android-specific paths to always exclude ────────────────────────────────
 ANDROID_EXCLUDED_PATHS = (
-    "/Android/",
-    "/Android",
+    "/Android/data",
+    "/Android/obb",
+    "/Android/sandbox",
     "/.thumbnails",
     "/LOST.DIR",
     "/.trash",
@@ -105,5 +106,20 @@ def should_ignore_file(path: Path) -> bool:
 
 
 def should_ignore_android_path(fpath: str) -> bool:
-    """Return True if an Android file path should be excluded."""
-    return any(excl in fpath for excl in ANDROID_EXCLUDED_PATHS)
+    """
+    Return True if an Android file path should be excluded.
+    Allows /Android/media (and its subdirectories) on mobile internal storage & SD card for backup,
+    while excluding /Android/data, /Android/obb, system junk, and trash folders.
+    """
+    norm = fpath.replace("\\", "/")
+    norm_lower = norm.lower()
+    # If path is inside Android directory:
+    if "/android/" in norm_lower or norm_lower.endswith("/android"):
+        # Allow the Android root, Android/media root, and anything inside Android/media
+        if "/android/media" in norm_lower or norm_lower.endswith("/android") or norm_lower.endswith("/android/"):
+            return any(excl.lower() in norm_lower for excl in ("/.thumbnails", "/LOST.DIR", "/.trash", "/.FileManagerRecycler", "/.Trash"))
+        # Exclude everything else under /Android (such as /Android/data, /Android/obb, /Android/sandbox)
+        return True
+    return any(excl.lower() in norm_lower for excl in ANDROID_EXCLUDED_PATHS)
+
+

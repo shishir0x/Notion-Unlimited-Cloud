@@ -35,7 +35,7 @@ from core import config as cfg
 from core import state as S
 from core import storage as STOR
 from core import sync_engine as ENGINE
-from core.notion_api import NotionAPI
+from core.notion_api import NotionAPI, is_page_archived
 from core.storage import StorageDevice, get_user_subfolders
 
 
@@ -238,12 +238,10 @@ def sync_local(path: str, force: bool = False):
         folders_to_sync, folders_skipped = ENGINE.compute_folder_diff(all_folders, state)
 
     folders_new = sum(1 for f in folders_to_sync if f.status_tag == "NEW")
-    folders_mod = sum(1 for f in folders_to_sync if f.status_tag == "MODIFIED")
 
     print()
     print(f"  ✅ {folders_skipped:,} folders up-to-date (skipped)")
     print(f"  🟢 {folders_new:,} new folders to create")
-    print(f"  🟡 {folders_mod:,} modified folders to update")
     print()
 
     # Sync folders first (so hierarchy exists before files are uploaded)
@@ -255,7 +253,6 @@ def sync_local(path: str, force: bool = False):
         )
         print(f"\n  ✅ Folder sync complete!")
         print(f"     Created : {folder_result.uploaded:,}")
-        print(f"     Updated : {folder_result.updated:,}")
         if folder_result.failed:
             print(f"     ❌ Failed : {folder_result.failed:,}")
         print()
@@ -400,13 +397,11 @@ def sync_android(device: StorageDevice):
 
     folders_to_sync, folders_skipped = ENGINE.compute_folder_diff(all_folders, state)
     folders_new = sum(1 for f in folders_to_sync if f.status_tag == "NEW")
-    folders_mod = sum(1 for f in folders_to_sync if f.status_tag == "MODIFIED")
 
     if folders_to_sync:
         print()
         print(f"  ✅ {folders_skipped:,} folders up-to-date (skipped)")
         print(f"  🟢 {folders_new:,} new folders to create")
-        print(f"  🟡 {folders_mod:,} modified folders to update")
         print()
         print(f"  ⚡ Syncing {len(folders_to_sync):,} folders…\n")
         folder_result = ENGINE.run_folder_sync(
@@ -418,7 +413,6 @@ def sync_android(device: StorageDevice):
         )
         print(f"\n  ✅ Folder sync complete!")
         print(f"     Created : {folder_result.uploaded:,}")
-        print(f"     Updated : {folder_result.updated:,}")
         if folder_result.failed:
             print(f"     ❌ Failed : {folder_result.failed:,}")
         print()
@@ -570,6 +564,8 @@ def rebuild_index():
     count = 0
     for item in api.query_all():
         props = item.get("properties", {})
+        if is_page_archived(props):
+            continue
         desc_rt = props.get("Description", {}).get("rich_text", [])
         desc = desc_rt[0].get("plain_text", "") if desc_rt else ""
         local_path = (

@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
       properties: {
         Name: { title: [{ text: { content: name } }] },
         Type: { select: { name: "File" } },
-        Extension: { rich_text: [{ text: { content: ext } }] },
+        "File Extension": { rich_text: [{ text: { content: ext } }] },
         "File Size": { number: sizeMb },
         ...(folderId
           ? { "Parent Folder": { relation: [{ id: folderId }] } }

@@ -134,27 +134,15 @@ def check_folder(
     Check whether a folder needs syncing.
 
     Returns:
-      - None            → folder is up-to-date, skip it
+      - None            → folder is already synced to Notion (up-to-date, skip upload)
       - "new"           → folder has never been synced
-      - "modified"      → folder changed since last sync (returns existing notion_id via state)
     """
     bucket = "android_folders" if android else "folders"
     folders = state.get(bucket, {})
     prev = folders.get(path)
-    if prev is None:
-        return "new"
-    if abs(prev.get("mtime", 0) - mtime) > 1.0 or prev.get("file_count", 0) != file_count:
-        return "modified"
-    return None  # up-to-date
-
-
-def get_folder_notion_id(
-    state: Dict[str, Any], path: str, android: bool = False
-) -> Optional[str]:
-    """Retrieve the Notion page ID for a previously synced folder."""
-    bucket = "android_folders" if android else "folders"
-    folders = state.get(bucket, {})
-    return folders.get(path, {}).get("notion_id")
+    if prev is not None and prev.get("notion_id"):
+        return None  # Already in Notion database, do not re-upload
+    return "new"
 
 
 def check_file(

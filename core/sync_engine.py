@@ -50,8 +50,7 @@ class FolderItem:
     file_count: int    # Number of files in this folder (non-recursive)
     parent_path: str   # Parent directory path
     display_path: str = ""     # Human-readable Windows-style path for display
-    status_tag: str = ""       # "NEW" | "MODIFIED" | "" (filled by diff step)
-    existing_notion_id: Optional[str] = None
+    status_tag: str = ""       # "NEW" | "" (filled by diff step)
     is_android: bool = False
 
 
@@ -173,7 +172,9 @@ def scan_android_folders(
     cmd = (
         f"find '{adb_root}' "
         f"-name '.*' -prune -o "
-        f"-path '{adb_root}/Android' -prune -o "
+        f"-path '*/Android/data' -prune -o "
+        f"-path '*/Android/obb' -prune -o "
+        f"-path '*/Android/sandbox' -prune -o "
         f"-path '*/LOST.DIR' -prune -o "
         f"-path '*/.trash' -prune -o "
         f"-type d -exec stat -c '%n|%Y' {{}} + 2>/dev/null"
@@ -244,7 +245,9 @@ def scan_android(
     cmd = (
         f"find '{adb_root}' "
         f"-name '.*' -prune -o "
-        f"-path '{adb_root}/Android' -prune -o "
+        f"-path '*/Android/data' -prune -o "
+        f"-path '*/Android/obb' -prune -o "
+        f"-path '*/Android/sandbox' -prune -o "
         f"-path '*/LOST.DIR' -prune -o "
         f"-path '*/.trash' -prune -o "
         f"-type f -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
@@ -338,7 +341,7 @@ def compute_folder_diff(
 ) -> Tuple[List[FolderItem], int]:
     """
     Compare scanned folders against the state index.
-    Populates each folder's status_tag ("NEW" | "MODIFIED") and existing_notion_id.
+    Populates each folder's status_tag ("NEW" | "").
     Returns (folders_to_sync, skipped_count).
     """
     to_sync: List[FolderItem] = []
@@ -352,11 +355,7 @@ def compute_folder_diff(
         if change is None:
             skipped += 1
             continue
-        folder.status_tag = "NEW" if change == "new" else "MODIFIED"
-        if change == "modified":
-            folder.existing_notion_id = S.get_folder_notion_id(
-                state, folder.path, android=folder.is_android,
-            )
+        folder.status_tag = "NEW"
         to_sync.append(folder)
 
     return to_sync, skipped
@@ -593,49 +592,41 @@ def upload_folder(
     parent_notion_id: Optional[str],
 ) -> bool:
     """
-    Upload a single FolderItem to Notion (POST for NEW, PATCH for MODIFIED).
+    Create or find a FolderItem in Notion (folders are created once, never re-uploaded).
     Updates the state dict on success.
     Returns True on success.
     """
     display = folder.display_path or folder.path
 
-    if folder.status_tag == "MODIFIED" and folder.existing_notion_id:
-        # Update existing Notion folder page
-        cloud_url = f"https://www.notion.so/{folder.existing_notion_id}"
-        ok = api.update_page(
-            folder.existing_notion_id,
-            {
-                "Open in Browser": {"url": cloud_url},
-                "Description": {"rich_text": [{"text": {"content": f"Path: {display} (Updated)"}}]},
-            },
+    # Use ensure_folder to find or create the folder without duplicates
+    notion_id = api.ensure_folder(folder.name, parent_notion_id, emoji="📁")
+    if notion_id:
+        cloud_url = f"https://www.notion.so/{notion_id}"
+        try:
+            api.update_page(
+                notion_id,
+                {
+                    "Open in Browser": {"url": cloud_url},
+                    "Description": {"rich_text": [{"text": {"content": f"Path: {display}"}}]},
+                },
+            )
+        except Exception:
+            pass
+        S.record_folder(
+            state, folder.path, notion_id,
+            folder.mtime, folder.file_count,
+            android=folder.is_android,
         )
-        if ok:
-            S.record_folder(
-                state, folder.path, folder.existing_notion_id,
-                folder.mtime, folder.file_count,
+        try:
+            import notion_server
+            notion_server.register_drive_cache_item(
+                notion_id, folder.name, "Folder", "",
+                0, 0, parent_notion_id,
+                folder.path, folder.mtime
             )
-        return ok
-
-    else:
-        # Use ensure_folder to find or create the folder without duplicates
-        notion_id = api.ensure_folder(folder.name, parent_notion_id, emoji="📁")
-        if notion_id:
-            cloud_url = f"https://www.notion.so/{notion_id}"
-            try:
-                api.update_page(
-                    notion_id,
-                    {
-                        "Open in Browser": {"url": cloud_url},
-                        "Description": {"rich_text": [{"text": {"content": f"Path: {display}"}}]},
-                    },
-                )
-            except Exception:
-                pass
-            S.record_folder(
-                state, folder.path, notion_id,
-                folder.mtime, folder.file_count,
-            )
-        return notion_id is not None
+        except Exception:
+            pass
+    return notion_id is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -753,10 +744,7 @@ def run_folder_sync(
         ok = upload_folder(api, state, folder, parent_id)
 
         if ok:
-            if folder.status_tag == "MODIFIED":
-                result.updated += 1
-            else:
-                result.uploaded += 1
+            result.uploaded += 1
         else:
             result.failed += 1
 

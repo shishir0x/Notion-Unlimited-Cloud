@@ -54,9 +54,12 @@ export function pageToItem(page: Record<string, unknown>): DriveItem {
     (props["File Type"] as { select?: { name?: string } | null })?.select
       ?.name ?? "Other";
 
+  // Prefer the canonical "File Extension" property (written by the Python
+  // sync engine); fall back to the legacy "Extension" name used by older uploads.
   const extension =
     (
-      props["Extension"] as {
+      (props["File Extension"] ??
+        props["Extension"]) as {
         rich_text?: Array<{ plain_text?: string }>;
       }
     )?.rich_text?.[0]?.plain_text ?? "";

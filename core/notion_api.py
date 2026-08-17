@@ -111,6 +111,15 @@ class NotionRateLimiter:
 _rate_limiter = NotionRateLimiter(rate=1.0, burst=3)
 
 
+def is_page_archived(props: Dict[str, Any]) -> bool:
+    """Return True if a Notion page's properties mark it as archived (trash).
+
+    Both the Python engine and the Next.js web app treat the "Archived"
+    checkbox as the single source of truth for the trash view.
+    """
+    return bool(props.get("Archived", {}).get("checkbox"))
+
+
 class NotionAPI:
     """Minimal Notion API client with folder caching and retry support."""
 
@@ -274,20 +283,34 @@ class NotionAPI:
         return result is not None
 
     def delete_page(self, notion_id: str) -> bool:
-        """Archive (delete) a page in Notion. Returns True on success."""
+        """Archive (delete) a page in Notion. Returns True on success.
+
+        Sets the "Archived" checkbox so the item lands in the trash view of
+        both the Python web GUI and the Next.js app. Falls back to Notion's
+        native archive for databases that lack the checkbox property.
+        """
         nid = notion_id.replace("-", "")
         for attempt in range(3):
             try:
                 r = requests.patch(
                     f"https://api.notion.com/v1/pages/{nid}",
                     headers=self.headers,
-                    json={"archived": True},
+                    json={"properties": {"Archived": {"checkbox": True}}},
                     timeout=25,
                 )
+                if r.status_code == 200:
+                    return True
                 if r.status_code == 429:
                     time.sleep(float(r.headers.get("Retry-After", 2)))
                     continue
-                return r.status_code == 200
+                # "Archived" may not exist on older databases → native archive fallback
+                r2 = requests.patch(
+                    f"https://api.notion.com/v1/pages/{nid}",
+                    headers=self.headers,
+                    json={"archived": True},
+                    timeout=25,
+                )
+                return r2.status_code == 200
             except requests.RequestException:
                 time.sleep(1.5 * (attempt + 1))
         return False
@@ -299,36 +322,64 @@ class NotionAPI:
     def preload_folders(self):
         """
         Fetch all existing Folder pages into the local cache.
-        Loads instantly from local disk cache (<0.01s) if available.
+        Loads instantly from local disk cache and sync state files.
         """
-        cache_path = Path.home() / ".notion_drive_cache.json"
-        if cache_path.exists():
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                loaded = 0
-                for nid, it in data.get("items", {}).items():
-                    if it.get("type") == "Folder":
-                        clean_name = it.get("name", "").replace("📁 ", "").strip()
-                        parent_id = it.get("parent_id")
-                        if clean_name:
-                            self._folder_cache[(clean_name, parent_id)] = nid
-                            loaded += 1
-                if loaded > 0:
-                    return
-            except Exception:
-                pass
+        project_root = Path(__file__).resolve().parent.parent
+        cache_paths = [
+            project_root / ".notion_drive_cache.json",
+            Path.home() / ".notion_drive_cache.json",
+            Path.cwd() / ".notion_drive_cache.json",
+        ]
+        for cache_path in cache_paths:
+            if cache_path.exists():
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    for nid, it in data.get("items", {}).items():
+                        if it.get("type") == "Folder":
+                            clean_name = it.get("name", "").replace("📁 ", "").strip()
+                            parent_id = it.get("parent_id")
+                            if clean_name:
+                                self._folder_cache[(clean_name, parent_id)] = nid
+                except Exception:
+                    pass
 
-        for item in self.query_all({"property": "Type", "select": {"equals": "Folder"}}):
-            nid = item["id"].replace("-", "")
-            props = item.get("properties", {})
-            title_list = props.get("Name", {}).get("title", [])
-            name = title_list[0].get("plain_text", "").strip() if title_list else ""
-            name = name.replace("📁 ", "").strip()
-            parents = props.get("Parent Folder", {}).get("relation", [])
-            parent_id = parents[0]["id"].replace("-", "") if parents else None
-            if name:
-                self._folder_cache[(name, parent_id)] = nid
+        state_paths = [
+            project_root / ".notion_sync_state.json",
+            Path.home() / ".notion_sync_state.json",
+            Path.cwd() / ".notion_sync_state.json",
+        ]
+        for sp in state_paths:
+            if sp.exists():
+                try:
+                    with open(sp, "r", encoding="utf-8") as f:
+                        sdata = json.load(f)
+                    for b in ("folders", "android_folders"):
+                        for fpath, finfo in sdata.get(b, {}).items():
+                            nid = finfo.get("notion_id")
+                            fname = Path(fpath).name if b == "folders" else fpath.rstrip("/").split("/")[-1]
+                            if nid and fname:
+                                self._folder_cache[(fname, None)] = nid
+                except Exception:
+                    pass
+
+        try:
+            for item in self.query_all({"property": "Type", "select": {"equals": "Folder"}}):
+                nid = item["id"].replace("-", "")
+                props = item.get("properties", {})
+                if is_page_archived(props):
+                    continue
+                title_list = props.get("Name", {}).get("title", [])
+                name = title_list[0].get("plain_text", "").strip() if title_list else ""
+                name = name.replace("📁 ", "").strip()
+                parents = props.get("Parent Folder", {}).get("relation", [])
+                parent_id = parents[0]["id"].replace("-", "") if parents else None
+                if name:
+                    self._folder_cache[(name, parent_id)] = nid
+                    if (name, None) not in self._folder_cache:
+                        self._folder_cache[(name, None)] = nid
+        except Exception:
+            pass
 
     def append_block_children(self, block_id: str, children: List[Dict]) -> bool:
         """Append child blocks (e.g. text/code content) to a Notion page."""
@@ -352,6 +403,8 @@ class NotionAPI:
         cache_key = (name, parent_id)
         if cache_key in self._folder_cache:
             return self._folder_cache[cache_key]
+        if parent_id is None and (name, None) in self._folder_cache:
+            return self._folder_cache[(name, None)]
 
         # Double-check Notion database before creating to prevent duplicate folder creation
         try:
@@ -363,6 +416,8 @@ class NotionAPI:
             }
             for existing in self.query_all(filter_payload):
                 props = existing.get("properties", {})
+                if is_page_archived(props):
+                    continue
                 parents = props.get("Parent Folder", {}).get("relation", [])
                 existing_pid = parents[0]["id"].replace("-", "") if parents else None
                 if existing_pid == parent_id or (not existing_pid and not parent_id):

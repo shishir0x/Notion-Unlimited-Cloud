@@ -164,6 +164,7 @@ def ensure_database_properties(token: str, db_id: str):
         "Parent Folder":  {"relation": {"database_id": db_id, "single_property": {}}},
         "Description":    {"rich_text": {}},
         "Favorite":       {"checkbox": {}},
+        "Archived":       {"checkbox": {}},
     }
     try:
         import requests
@@ -197,7 +198,7 @@ def ensure_database_properties(token: str, db_id: str):
             else:
                 _info("Could not auto-create columns. You may need to add them manually.")
                 _info("Required columns: Type, File Type, File Extension, File Size,")
-                _info("                  Open in Browser, Parent Folder, Description, Favorite")
+                _info("                  Open in Browser, Parent Folder, Description, Favorite, Archived")
         else:
             _ok("All required database columns already exist.")
     except Exception as e:

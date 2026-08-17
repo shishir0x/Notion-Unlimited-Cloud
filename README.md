@@ -131,6 +131,46 @@ Features:
 
 ---
 
+## 🌐 NotionDrive Web App (Next.js)
+
+`notion-drive-app/` is a **second, standalone web frontend** for the same Notion database — a modern Google Drive-style file manager built with **Next.js 16 + React 19 + Tailwind CSS**. It runs independently of the Python CLI/server on **port 3000**.
+
+### Quick Start
+
+```bash
+cd notion-drive-app
+npm install
+
+# Create .env.local with your Notion credentials:
+#   NOTION_TOKEN=ntn_your_integration_secret_here
+#   NOTION_DATABASE_ID=your_32_character_database_id_here
+
+npm run dev        # → http://localhost:3000
+# or
+npm run build && npm start
+```
+
+### Features
+
+- 📂 Folder-tree browsing with breadcrumbs — grid or list view
+- 🔍 Instant full-text search (SQLite FTS5 index) with file-type filters
+- 🕐 **Recent**, ⭐ **Starred**, and 🗑️ **Trash** views
+- ⭐ Star / unstar, ✏️ rename, 📦 move, 🗑️ archive & restore
+- ⬆️ Drag-and-drop upload (creates metadata pages in Notion)
+- 👁️ In-browser preview with signed-URL proxying
+- ⚡ Live updates via SSE — polls Notion every 5 seconds and refreshes the UI automatically
+
+### How it works
+
+- Talks to Notion directly through `@notionhq/client` (`lib/notion.ts`)
+- Caches every page in a local SQLite database (`notion_drive.db`, `lib/cache.ts`) so browsing and search never repeatedly hit the Notion API
+- Server API routes: `/api/drive`, `/api/search`, `/api/action`, `/api/upload`, `/api/view`, `/api/stats`, `/api/events`
+- Same metadata-only philosophy as the CLI: only file name/size/type/path are stored in Notion; file bytes are served via the `/api/view` proxy from wherever they live
+
+> **Schema note:** both apps share the same database schema — files carry their extension in `File Extension`, and deleted items are flagged with the `Archived` checkbox that powers the Trash view in both UIs. Run `python setup.py` to create the base schema (including the `Archived` column) before first use.
+
+---
+
 ## ⌨️ Command Line Usage
 
 ```bash
@@ -176,6 +216,11 @@ Notion-Unlimited-Cloud/
 │   ├── notion_api.py       Notion REST API wrapper (retry, pagination, cache)
 │   └── sync_engine.py      Differential scan → diff → upload engine
 │
+├── notion-drive-app/       Standalone Next.js web drive (port 3000)
+│   ├── app/                UI page + API routes (/api/drive, /api/search, …)
+│   ├── components/         Drive UI (Sidebar, FileGrid, FileTable, PreviewModal…)
+│   └── lib/                Notion SDK client + SQLite cache (notion_drive.db)
+│
 ├── requirements.txt        Python dependencies
 ├── .env.example            Credential template
 └── .env                    Your credentials (git-ignored, never committed)
@@ -194,7 +239,7 @@ Requirements:
 
 The app will automatically detect your phone and list both Internal Storage and SD Card as sync options. Files are streamed directly from phone to Notion — **0 bytes used on your PC disk**.
 
-> **Android app data excluded:** The `Android/` folder (app caches, APK data) is always excluded to avoid uploading irrelevant app files.
+> **Android Media & App Data:** The `Android/media` directory (WhatsApp, Telegram, camera media) is included for backup on internal storage and SD cards, while private app data (`Android/data`, `Android/obb`, cache) and system junk are safely excluded.
 
 ---
 
@@ -232,7 +277,7 @@ unchanged                                               changed
 
 - **Credentials never committed:** `.env`, `.notion_sync_state.json`, and `.notion_drive_cache.json` are all git-ignored
 - **System folders excluded:** `AppData`, `Windows`, `node_modules`, `$Recycle.Bin`, `__pycache__`, and all system-critical directories are automatically skipped
-- **Android app data excluded:** The `Android/` directory, `.thumbnails`, and `LOST.DIR` are always excluded
+- **Android private app data excluded:** `Android/data`, `Android/obb`, `.thumbnails`, and `LOST.DIR` are excluded, while `Android/media` is preserved for backup
 - **No file content sent:** Only file metadata (name, size, path, modification date) is stored in Notion. File content is served locally on demand via `http://127.0.0.1:8765`
 
 ---

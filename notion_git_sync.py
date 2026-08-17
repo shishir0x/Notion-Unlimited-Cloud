@@ -311,7 +311,7 @@ class NotionGitSyncEngine:
                 parents = [p["id"].replace("-", "") for p in props.get("Parent Folder", {}).get("relation", [])]
                 parent_id = parents[0] if parents else None
                 item_type = props.get("Type", {}).get("select", {}).get("name", "")
-                if item_type == "Folder":
+                if item_type == "Folder" and not props.get("Archived", {}).get("checkbox"):
                     self.folder_cache[(clean_name, parent_id)] = it["id"].replace("-", "")
             has_more = res.get("has_more", False)
             start_cursor = res.get("next_cursor")
@@ -454,9 +454,9 @@ class NotionGitSyncEngine:
         items_to_sync = []
         for win_label, linux_base, container_name in storage_targets:
             scan_path = f"{linux_base}/{folder_filter}" if folder_filter else linux_base
-            print(f"🔍 Scanning {container_name} ({scan_path}) directly on phone (Excluding Android app data)...")
+            print(f"🔍 Scanning {container_name} ({scan_path}) directly on phone (including Android/media, excluding private app data)...")
             
-            cmd = f"find '{scan_path}/' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+            cmd = f"find '{scan_path}/' -type f -not -path '*/.*' -not -path '*/Android/data*' -not -path '*/Android/obb*' -not -path '*/Android/sandbox*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
             try:
                 proc = subprocess.run(["adb", "-s", device_id, "shell", cmd], capture_output=True, text=True, errors="ignore")
                 for line in proc.stdout.splitlines():
@@ -467,7 +467,10 @@ class NotionGitSyncEngine:
                             fname = fpath.split("/")[-1]
                             ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
                             
-                            if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath:
+                            norm_p = fpath.replace("\\", "/")
+                            if "/Android/" in norm_p and "/Android/media" not in norm_p:
+                                continue
+                            if "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath or "/.trash" in fpath:
                                 continue
                             if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
                                 continue
@@ -566,6 +569,8 @@ class NotionGitSyncEngine:
         for it in items:
             notion_id = it["id"].replace("-", "")
             props = it.get("properties", {})
+            if props.get("Archived", {}).get("checkbox"):
+                continue
             desc_list = props.get("Description", {}).get("rich_text", [])
             desc = desc_list[0].get("plain_text", "") if desc_list else ""
             local_p = desc.replace("Path: ", "").replace("Local: ", "").replace(" (Updated)", "").replace(" (Modified)", "").strip()

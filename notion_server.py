@@ -421,6 +421,8 @@ class BackgroundSyncRunner:
                     parents = [p["id"].replace("-", "") for p in props.get("Parent Folder", {}).get("relation", [])]
                     parent_id = parents[0] if parents else None
                     item_type = props.get("Type", {}).get("select", {}).get("name", "")
+                    if item_type == "Folder" and props.get("Archived", {}).get("checkbox"):
+                        continue
                     if item_type == "Folder":
                         self.folder_cache[(clean_name, parent_id)] = nid
                         register_drive_cache_item(nid, clean_name, "Folder", "", 0, 0, parent_id, clean_name)
@@ -434,6 +436,14 @@ class BackgroundSyncRunner:
             nid = self.folder_cache[(name, None)]
             register_drive_cache_item(nid, name, "Folder", "", 0, 0, None, name)
             return nid
+        with DRIVE_CACHE_LOCK:
+            for did, dit in DRIVE_CACHE.get("items", {}).items():
+                if dit.get("type") == "Folder":
+                    clean_n = dit.get("name", "").replace("📁 ", "").strip()
+                    if clean_n == name and not dit.get("parent_id"):
+                        self.folder_cache[(name, None)] = did
+                        register_drive_cache_item(did, name, "Folder", "", 0, 0, None, name)
+                        return did
         payload = {
             "parent": {"database_id": self.db_id},
             "icon": {"type": "emoji", "emoji": emoji},
@@ -489,35 +499,50 @@ class BackgroundSyncRunner:
                 parent_cache_id = curr_id
                 curr_id = self.folder_cache[cache_k]
                 register_drive_cache_item(curr_id, part, "Folder", "", 0, 0, parent_cache_id, part)
-            else:
-                payload = {
-                    "parent": {"database_id": self.db_id},
-                    "icon": {"type": "emoji", "emoji": "📁"},
-                    "properties": {
-                        "Name": {"title": [{"text": {"content": part}}]},
-                        "Type": {"select": {"name": "Folder"}},
-                        "Parent Folder": {"relation": [{"id": curr_id}]} if curr_id else {"relation": []}
-                    }
+                continue
+
+            found_nid = None
+            with DRIVE_CACHE_LOCK:
+                for did, dit in DRIVE_CACHE.get("items", {}).items():
+                    if dit.get("type") == "Folder":
+                        clean_n = dit.get("name", "").replace("📁 ", "").strip()
+                        if clean_n == part and dit.get("parent_id") == curr_id:
+                            found_nid = did
+                            break
+            if found_nid:
+                self.folder_cache[cache_k] = found_nid
+                register_drive_cache_item(found_nid, part, "Folder", "", 0, 0, curr_id, part)
+                curr_id = found_nid
+                continue
+
+            payload = {
+                "parent": {"database_id": self.db_id},
+                "icon": {"type": "emoji", "emoji": "📁"},
+                "properties": {
+                    "Name": {"title": [{"text": {"content": part}}]},
+                    "Type": {"select": {"name": "Folder"}},
+                    "Parent Folder": {"relation": [{"id": curr_id}]} if curr_id else {"relation": []}
                 }
-                res = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=20)
-                if res.status_code == 200:
-                    nid = res.json()["id"].replace("-", "")
-                    self.folder_cache[cache_k] = nid
-                    register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
-                    curr_id = nid
-                else:
-                    if "Sub-item hierarchy" in res.text:
-                        del payload["properties"]["Parent Folder"]
-                        res2 = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=20)
-                        if res2.status_code == 200:
-                            nid = res2.json()["id"].replace("-", "")
-                            self.folder_cache[cache_k] = nid
-                            register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
-                            curr_id = nid
-                        else:
-                            return curr_id
+            }
+            res = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=20)
+            if res.status_code == 200:
+                nid = res.json()["id"].replace("-", "")
+                self.folder_cache[cache_k] = nid
+                register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
+                curr_id = nid
+            else:
+                if "Sub-item hierarchy" in res.text:
+                    del payload["properties"]["Parent Folder"]
+                    res2 = requests.post("https://api.notion.com/v1/pages", headers=self.headers, json=payload, timeout=20)
+                    if res2.status_code == 200:
+                        nid = res2.json()["id"].replace("-", "")
+                        self.folder_cache[cache_k] = nid
+                        register_drive_cache_item(nid, part, "Folder", "", 0, 0, curr_id, part)
+                        curr_id = nid
                     else:
                         return curr_id
+                else:
+                    return curr_id
         return curr_id
 
     def run_sync(self, target: str):
@@ -658,8 +683,8 @@ class BackgroundSyncRunner:
                             pass
 
                     for win_label, linux_base, container_name in phone_targets:
-                        add_sync_log(f"Scanning {container_name} ({linux_base}) excluding Android app data...")
-                        cmd = f"find '{linux_base}/' -type f -not -path '*/.*' -not -path '*/Android*' -not -path '*/Android/*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
+                        add_sync_log(f"Scanning {container_name} ({linux_base}) including Android/media (excluding private app data)...")
+                        cmd = f"find '{linux_base}/' -type f -not -path '*/.*' -not -path '*/Android/data*' -not -path '*/Android/obb*' -not -path '*/Android/sandbox*' -not -path '*/.thumbnails*' -not -path '*/LOST.DIR*' -not -path '*/.trash*' -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
                         try:
                             proc = subprocess.run(["adb", "-s", dev_id, "shell", cmd], capture_output=True, text=True, errors="ignore")
                             for line in proc.stdout.splitlines():
@@ -669,7 +694,10 @@ class BackgroundSyncRunner:
                                         fpath, fsize, fmtime = parts[0], int(parts[1]), float(parts[2])
                                         fname = fpath.split("/")[-1]
                                         ext = "." + fname.split(".")[-1].lower() if "." in fname else ""
-                                        if "/Android" in fpath or "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath:
+                                        norm_p = fpath.replace("\\", "/")
+                                        if "/Android/" in norm_p and "/Android/media" not in norm_p:
+                                            continue
+                                        if "/." in fpath or "/LOST.DIR" in fpath or "/.thumbnails" in fpath or "/.trash" in fpath:
                                             continue
                                         if any(fname.lower().startswith(p) for p in IGNORED_FILE_PREFIXES):
                                             continue
@@ -1168,6 +1196,9 @@ def populate_cache_from_notion(is_background: bool = False):
                     parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
                     parent_id = parents[0] if parents else None
 
+                    if props.get("Archived", {}).get("checkbox"):
+                        continue
+
                     cached_items[it_id] = {
                         "id": it_id,
                         "name": clean_name,
@@ -1234,6 +1265,9 @@ def populate_cache_from_notion(is_background: bool = False):
                 size_mb = props.get("File Size", {}).get("number", 0) or 0
                 parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
                 parent_id = parents[0] if parents else None
+
+                if props.get("Archived", {}).get("checkbox"):
+                    continue
 
                 desc_list = props.get("Description", {}).get("rich_text", [])
                 desc = desc_list[0].get("plain_text", "") if desc_list else ""
@@ -4225,12 +4259,20 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 if file_id:
                     try:
                         runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
-                        requests.patch(
+                        del_res = requests.patch(
                             f"https://api.notion.com/v1/pages/{file_id}",
                             headers=runner.headers,
-                            json={"archived": True},
+                            json={"properties": {"Archived": {"checkbox": True}}},
                             timeout=15
                         )
+                        if del_res.status_code != 200:
+                            # "Archived" may not exist on older databases → native archive fallback
+                            requests.patch(
+                                f"https://api.notion.com/v1/pages/{file_id}",
+                                headers=runner.headers,
+                                json={"archived": True},
+                                timeout=15
+                            )
                     except Exception as e:
                         logger.warning(f"Failed to archive Notion page {file_id}: {e}")
                 
