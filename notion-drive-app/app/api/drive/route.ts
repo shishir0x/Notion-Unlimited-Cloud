@@ -1,50 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getFolderChildren, getBreadcrumbs, getRecent, getStarred, getTrash, syncFromNotion, type DbItem } from "@/lib/cache";
+import { backendJson, normalizeListing, type RawItem } from "@/lib/backend";
 
 export const dynamic = "force-dynamic";
 
-function toClient(item: DbItem) {
-  return {
-    id: item.id,
-    name: item.name,
-    type: item.type,
-    fileType: item.file_type,
-    extension: item.extension,
-    sizeMb: item.size_mb,
-    parentId: item.parent_id,
-    starred: item.starred === 1,
-    archived: item.archived === 1,
-    createdAt: item.created_at,
-    modifiedAt: item.modified_at,
-    notionUrl: item.notion_url,
-    fileUrl: item.file_url,
-  };
-}
-
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const view = searchParams.get("view") ?? "folder";
-  const folderId = searchParams.get("folder") ?? null;
-  const sort = (searchParams.get("sort") ?? "name") as "name" | "size" | "date";
-  const dir = (searchParams.get("dir") ?? "asc") as "asc" | "desc";
+  try {
+    const { searchParams } = new URL(req.url);
+    const params = new URLSearchParams();
+    const folderId = searchParams.get("folder_id") ?? searchParams.get("folder");
+    if (folderId) params.set("folder_id", folderId);
+    const sort = searchParams.get("sort");
+    const order = searchParams.get("order");
+    if (sort) params.set("sort", sort);
+    if (order) params.set("order", order);
+    if (searchParams.get("limit")) params.set("limit", searchParams.get("limit")!);
+    if (searchParams.get("offset")) params.set("offset", searchParams.get("offset")!);
 
-  // Trigger background sync (non-blocking)
-  syncFromNotion().catch(() => {});
-
-  if (view === "recent") {
-    const items = getRecent(30).map(toClient);
-    return NextResponse.json({ items, breadcrumbs: [] });
+    const data = await backendJson<{
+      folders?: RawItem[]; files?: RawItem[]; breadcrumbs?: RawItem[];
+      has_more?: boolean; total_files?: number; total_folders?: number; version?: number;
+    }>(`/api/drive?${params.toString()}`);
+    return NextResponse.json(normalizeListing(data));
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500;
+    return NextResponse.json(
+      { error: status === 401 ? "Unauthorized" : `Drive unavailable: ${String(err)}` },
+      { status },
+    );
   }
-  if (view === "starred") {
-    const items = getStarred().map(toClient);
-    return NextResponse.json({ items, breadcrumbs: [] });
-  }
-  if (view === "trash") {
-    const items = getTrash().map(toClient);
-    return NextResponse.json({ items, breadcrumbs: [] });
-  }
-
-  const items = getFolderChildren(folderId, sort, dir).map(toClient);
-  const breadcrumbs = folderId ? getBreadcrumbs(folderId).map(toClient) : [];
-  return NextResponse.json({ items, breadcrumbs });
 }

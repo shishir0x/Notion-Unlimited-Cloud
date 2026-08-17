@@ -36,6 +36,10 @@ def init_db():
     """Create tables if they don't exist."""
     conn = get_connection()
     try:
+        # Add the archived column if it is missing (migration for older DBs)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if cols and "archived" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN archived INTEGER DEFAULT 0")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS items (
                 id TEXT PRIMARY KEY,
@@ -66,6 +70,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sync ON items(sync_status);
             CREATE INDEX IF NOT EXISTS idx_starred ON items(starred);
             CREATE INDEX IF NOT EXISTS idx_local_path ON items(local_path);
+            CREATE INDEX IF NOT EXISTS idx_archived ON items(archived);
             
             CREATE TABLE IF NOT EXISTS sync_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,10 +112,10 @@ def upsert_item(item: Dict[str, Any]):
         conn.execute("""
             INSERT INTO items (id, name, type, extension, size_mb, size_bytes, mtime, ctime,
                               created_time, last_edited_time, parent_id, local_path, storage_root,
-                              notion_id, sync_status, starred, item_count, last_seen)
+                              notion_id, sync_status, starred, archived, item_count, last_seen)
             VALUES (:id, :name, :type, :extension, :size_mb, :size_bytes, :mtime, :ctime,
                     :created_time, :last_edited_time, :parent_id, :local_path, :storage_root,
-                    :notion_id, :sync_status, :starred, :item_count, :last_seen)
+                    :notion_id, :sync_status, :starred, :archived, :item_count, :last_seen)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 size_mb=excluded.size_mb,
@@ -122,6 +127,7 @@ def upsert_item(item: Dict[str, Any]):
                 local_path=excluded.local_path,
                 sync_status=excluded.sync_status,
                 starred=excluded.starred,
+                archived=excluded.archived,
                 item_count=excluded.item_count,
                 last_seen=excluded.last_seen
         """, {
@@ -141,6 +147,7 @@ def upsert_item(item: Dict[str, Any]):
             'notion_id': item.get('notion_id', item.get('id', '')),
             'sync_status': item.get('sync_status', 'synced'),
             'starred': 1 if item.get('starred') else 0,
+            'archived': 1 if item.get('archived') else 0,
             'item_count': item.get('item_count', 0),
             'last_seen': time.time(),
         })
@@ -174,16 +181,17 @@ def upsert_many(items: List[Dict[str, Any]]):
                 'notion_id': item.get('notion_id', item.get('id', '')),
                 'sync_status': item.get('sync_status', 'synced'),
                 'starred': 1 if item.get('starred') else 0,
+                'archived': 1 if item.get('archived') else 0,
                 'item_count': item.get('item_count', 0),
                 'last_seen': time.time(),
             })
         conn.executemany("""
             INSERT OR REPLACE INTO items (id, name, type, extension, size_mb, size_bytes, mtime, ctime,
                               created_time, last_edited_time, parent_id, local_path, storage_root,
-                              notion_id, sync_status, starred, item_count, last_seen)
+                              notion_id, sync_status, starred, archived, item_count, last_seen)
             VALUES (:id, :name, :type, :extension, :size_mb, :size_bytes, :mtime, :ctime,
                     :created_time, :last_edited_time, :parent_id, :local_path, :storage_root,
-                    :notion_id, :sync_status, :starred, :item_count, :last_seen)
+                    :notion_id, :sync_status, :starred, :archived, :item_count, :last_seen)
         """, data)
         conn.commit()
     finally:
@@ -191,7 +199,8 @@ def upsert_many(items: List[Dict[str, Any]]):
 
 
 def get_children(parent_id: Optional[str] = None, offset: int = 0, limit: int = 200,
-                 sort: str = 'name', order: str = 'asc', type_filter: str = '') -> Tuple[List[Dict], int, bool]:
+                 sort: str = 'name', order: str = 'asc', type_filter: str = '',
+                 include_archived: bool = False) -> Tuple[List[Dict], int, bool]:
     """
     Get children of a folder (or root items if parent_id is None).
     Returns (items, total_count, has_more).
@@ -212,6 +221,9 @@ def get_children(parent_id: Optional[str] = None, offset: int = 0, limit: int = 
             where.append("type = :type_filter")
             params['type_filter'] = type_filter.capitalize()
         
+        if not include_archived:
+            where.append("archived = 0")
+        
         where_sql = " AND ".join(where) if where else "1=1"
         sort_dir = "DESC" if order == 'desc' else "ASC"
         
@@ -227,9 +239,9 @@ def get_children(parent_id: Optional[str] = None, offset: int = 0, limit: int = 
         rows = conn.execute(f"""
             SELECT items.id, items.name, items.type, items.extension, items.size_mb, items.size_bytes,
                    items.mtime, items.ctime, items.created_time, items.last_edited_time, items.parent_id,
-                   items.local_path, items.storage_root, items.notion_id, items.sync_status, items.starred,
+                   items.local_path, items.storage_root, items.notion_id, items.sync_status, items.starred, items.archived,
                    CASE WHEN items.type = 'Folder' 
-                        THEN (SELECT COUNT(*) FROM items child WHERE child.parent_id = items.id)
+                        THEN (SELECT COUNT(*) FROM items child WHERE child.parent_id = items.id AND child.archived = 0)
                         ELSE items.item_count
                    END AS item_count,
                    items.last_seen
@@ -256,7 +268,7 @@ def search_items(query: str, category: str = 'all', limit: int = 60) -> Tuple[Li
         search_term = f"%{query.lower()}%" if query else "%"
         params: Dict[str, Any] = {'q': search_term, 'limit': limit}
         
-        where_clauses = ["LOWER(name) LIKE :q"]
+        where_clauses = ["LOWER(name) LIKE :q", "archived = 0"]
         
         CATEGORY_EXTENSIONS = {
             'image': ("'.jpg'", "'.jpeg'", "'.png'", "'.webp'", "'.gif'", "'.svg'", "'.bmp'", "'.ico'"),
@@ -297,7 +309,7 @@ def get_recent(limit: int = 50) -> List[Dict]:
     try:
         rows = conn.execute("""
             SELECT * FROM items 
-            WHERE type = 'File' AND last_seen > 0
+            WHERE type = 'File' AND last_seen > 0 AND archived = 0
             ORDER BY last_seen DESC
             LIMIT :limit
         """, {'limit': limit}).fetchall()
@@ -312,10 +324,35 @@ def get_starred() -> List[Dict]:
     try:
         rows = conn.execute("""
             SELECT * FROM items 
-            WHERE starred = 1
+            WHERE starred = 1 AND archived = 0
             ORDER BY type, name
         """).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_trash(limit: int = 200) -> List[Dict]:
+    """Get archived (trashed) items."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT * FROM items 
+            WHERE archived = 1
+            ORDER BY last_edited_time DESC
+            LIMIT :limit
+        """, {'limit': limit}).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_archived(item_id: str, archived: bool = True):
+    """Mark an item as archived (trash) or restore it in the index."""
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE items SET archived = ? WHERE id = ?", (1 if archived else 0, item_id))
+        conn.commit()
     finally:
         conn.close()
 

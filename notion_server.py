@@ -178,7 +178,7 @@ def _broadcast_sse(event_type: str, data: dict):
         for q in dead:
             _SSE_CLIENTS.remove(q)
 
-def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0):
+def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str, size_mb: float, size_bytes: int, parent_id: str, local_path: str, mtime: float = 0, starred: bool = False, archived: bool = False):
     """Instantly registers a file or folder in the in-memory cache AND SQLite index, bumps version for live updates."""
     is_new = False
     with CACHE_LOCK:
@@ -207,7 +207,9 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
             "created_time": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "last_edited_time": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "parent_id": parent_id,
-            "local_path": local_path
+            "local_path": local_path,
+            "starred": starred,
+            "archived": archived
         }
         DRIVE_CACHE["items"][item_id] = entry
         if parent_id:
@@ -248,6 +250,8 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
                 'storage_root': 'Notion Cloud',
                 'notion_id': item_id,
                 'sync_status': 'synced',
+                'starred': 1 if starred else 0,
+                'archived': 1 if archived else 0,
                 'last_seen': time.time()
             }
             upsert_item(index_entry)
@@ -262,6 +266,95 @@ def register_drive_cache_item(item_id: str, name: str, item_type: str, ext: str,
         "id": item_id, "name": name, "type": item_type,
         "parent_id": parent_id, "version": DRIVE_CACHE.get("version", 0)
     })
+
+
+def _sync_cache_entry_to_index(entry: dict):
+    """Upsert a single DRIVE_CACHE entry into the SQLite index (non-blocking)."""
+    try:
+        from core.local_index import upsert_item
+        index_entry = {
+            'id': entry.get('id'),
+            'name': entry.get('name', ''),
+            'type': entry.get('type', 'File'),
+            'extension': entry.get('extension', ''),
+            'size_mb': entry.get('size_mb', 0),
+            'size_bytes': entry.get('size_bytes', 0),
+            'mtime': entry.get('mtime', 0),
+            'ctime': entry.get('ctime', 0),
+            'created_time': entry.get('created_time', ''),
+            'last_edited_time': entry.get('last_edited_time', ''),
+            'parent_id': entry.get('parent_id'),
+            'local_path': (entry.get('local_path') or '').strip() or None,
+            'storage_root': entry.get('storage_root', 'Notion Cloud'),
+            'notion_id': entry.get('id'),
+            'sync_status': 'synced',
+            'starred': 1 if entry.get('starred') else 0,
+            'archived': 1 if entry.get('archived') else 0,
+            'item_count': entry.get('item_count', 0),
+            'last_seen': time.time()
+        }
+        upsert_item(index_entry)
+    except Exception as e:
+        logger.debug(f"Index update skipped: {e}")
+
+
+def _store_uploaded_file(safe_name: str, parent_id: Optional[str], data_bytes: bytes):
+    """Persist an uploaded file to disk + create its Notion page + register in the drive cache.
+    Returns (ok: bool, new_page_id: Optional[str], error: Optional[str]).
+    """
+    try:
+        safe_rel = Path(safe_name).name
+        local_file_path = UPLOADS_DIR / safe_rel
+        try:
+            local_file_path.resolve().relative_to(UPLOADS_DIR.resolve())
+        except ValueError:
+            return False, None, "Path traversal detected"
+        local_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(local_file_path, "wb") as f:
+            f.write(data_bytes)
+
+        file_size = len(data_bytes)
+        size_mb = round(file_size / (1024 * 1024), 4)
+        ext = Path(safe_name).suffix.lower()
+        ftype, emoji = F.classify_file(ext) if ext else ("Other", "📄")
+
+        api_client = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+        target_parent_notion_id = parent_id or api_client.ensure_root("Local Disk (C:)")
+
+        payload = {
+            "parent": {"database_id": DEFAULT_DB_ID},
+            "icon": {"type": "emoji", "emoji": emoji},
+            "properties": {
+                "Name": {"title": [{"text": {"content": safe_name}}]},
+                "Type": {"select": {"name": "File"}},
+                "File Type": {"select": {"name": ftype}},
+                "File Extension": {"rich_text": [{"text": {"content": ext}}]},
+                "File Size": {"number": size_mb},
+                "Description": {"rich_text": [{"text": {"content": f"Path: {local_file_path}"}}]},
+                "Favorite": {"checkbox": False},
+                "Archived": {"checkbox": False}
+            }
+        }
+        if target_parent_notion_id:
+            payload["properties"]["Parent Folder"] = {"relation": [{"id": target_parent_notion_id}]}
+
+        res = requests.post("https://api.notion.com/v1/pages", headers=api_client.headers, json=payload, timeout=30)
+        if res.status_code == 200:
+            new_page_id = res.json()["id"].replace("-", "")
+            cloud_url = f"https://www.notion.so/{new_page_id}"
+            try:
+                requests.patch(f"https://api.notion.com/v1/pages/{new_page_id}", headers=api_client.headers, json={"properties": {"Open in Browser": {"url": cloud_url}}}, timeout=15)
+            except Exception:
+                pass
+            register_drive_cache_item(
+                new_page_id, safe_name, "File", ext, size_mb, file_size,
+                target_parent_notion_id, str(local_file_path), time.time()
+            )
+            return True, new_page_id, None
+        return False, None, f"Notion error: {res.status_code}"
+    except Exception as e:
+        logger.error(f"Upload store error: {e}")
+        return False, None, str(e)
 
 
 # ── Path Safety ───────────────────────────────────────────────────────────────
@@ -436,7 +529,7 @@ class BackgroundSyncRunner:
             nid = self.folder_cache[(name, None)]
             register_drive_cache_item(nid, name, "Folder", "", 0, 0, None, name)
             return nid
-        with DRIVE_CACHE_LOCK:
+        with CACHE_LOCK:
             for did, dit in DRIVE_CACHE.get("items", {}).items():
                 if dit.get("type") == "Folder":
                     clean_n = dit.get("name", "").replace("📁 ", "").strip()
@@ -502,7 +595,7 @@ class BackgroundSyncRunner:
                 continue
 
             found_nid = None
-            with DRIVE_CACHE_LOCK:
+            with CACHE_LOCK:
                 for did, dit in DRIVE_CACHE.get("items", {}).items():
                     if dit.get("type") == "Folder":
                         clean_n = dit.get("name", "").replace("📁 ", "").strip()
@@ -1039,6 +1132,8 @@ def _populate_sqlite_from_cache():
                 'storage_root': 'Notion Cloud',
                 'notion_id': it_id,
                 'sync_status': 'synced',
+                'starred': 1 if it.get('starred') else 0,
+                'archived': 1 if it.get('archived') else 0,
                 'last_seen': time.time()
             })
         if index_items:
@@ -1196,8 +1291,8 @@ def populate_cache_from_notion(is_background: bool = False):
                     parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
                     parent_id = parents[0] if parents else None
 
-                    if props.get("Archived", {}).get("checkbox"):
-                        continue
+                    starred = bool(props.get("Favorite", {}).get("checkbox"))
+                    archived = bool(props.get("Archived", {}).get("checkbox"))
 
                     cached_items[it_id] = {
                         "id": it_id,
@@ -1211,7 +1306,9 @@ def populate_cache_from_notion(is_background: bool = False):
                         "created_time": it.get("created_time", ""),
                         "last_edited_time": it.get("last_edited_time", ""),
                         "parent_id": parent_id,
-                        "local_path": ""
+                        "local_path": "",
+                        "starred": starred,
+                        "archived": archived
                     }
                     
                     # Add to SQLite index
@@ -1222,7 +1319,9 @@ def populate_cache_from_notion(is_background: bool = False):
                         'parent_id': parent_id,
                         'created_time': it.get("created_time", ""),
                         'last_edited_time': it.get("last_edited_time", ""),
-                        'storage_root': 'Notion Cloud'
+                        'storage_root': 'Notion Cloud',
+                        'starred': 1 if starred else 0,
+                        'archived': 1 if archived else 0
                     })
                 has_more_folders = data.get("has_more", False)
                 folder_cursor = data.get("next_cursor")
@@ -1266,8 +1365,8 @@ def populate_cache_from_notion(is_background: bool = False):
                 parents = [pr["id"].replace("-", "") for pr in props.get("Parent Folder", {}).get("relation", [])]
                 parent_id = parents[0] if parents else None
 
-                if props.get("Archived", {}).get("checkbox"):
-                    continue
+                starred = bool(props.get("Favorite", {}).get("checkbox"))
+                archived = bool(props.get("Archived", {}).get("checkbox"))
 
                 desc_list = props.get("Description", {}).get("rich_text", [])
                 desc = desc_list[0].get("plain_text", "") if desc_list else ""
@@ -1318,7 +1417,9 @@ def populate_cache_from_notion(is_background: bool = False):
                     "created_time": created_iso,
                     "last_edited_time": edited_iso,
                     "parent_id": parent_id,
-                    "local_path": local_p
+                    "local_path": local_p,
+                    "starred": starred,
+                    "archived": archived
                 }
                 
                 # Add to SQLite index
@@ -1336,7 +1437,9 @@ def populate_cache_from_notion(is_background: bool = False):
                     'parent_id': parent_id,
                     'local_path': local_p,
                     'storage_root': 'Notion Cloud',
-                    'notion_id': it_id
+                    'notion_id': it_id,
+                    'starred': 1 if starred else 0,
+                    'archived': 1 if archived else 0
                 })
 
             has_more_files = res.get("has_more", False)
@@ -4276,25 +4379,18 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     except Exception as e:
                         logger.warning(f"Failed to archive Notion page {file_id}: {e}")
                 
-                # 2. Delete from SQLite index
+                # 2. Soft-delete in SQLite index (item is kept for Trash / Restore)
                 try:
-                    from core.local_index import delete_item, delete_item_by_path
+                    from core.local_index import set_archived
                     if file_id:
-                        delete_item(file_id)
-                    if local_path:
-                        delete_item_by_path(local_path)
+                        set_archived(file_id, True)
                 except Exception as e:
-                    logger.warning(f"Index delete warning: {e}")
+                    logger.warning(f"Index archive warning: {e}")
                 
-                # 3. Delete from in-memory DRIVE_CACHE
+                # 3. Mark archived in-memory DRIVE_CACHE
                 with CACHE_LOCK:
-                    if file_id:
-                        DRIVE_CACHE["items"].pop(file_id, None)
-                        for pid, cids in DRIVE_CACHE["children"].items():
-                            if file_id in cids:
-                                cids.remove(file_id)
-                        if file_id in DRIVE_CACHE["root_items"]:
-                            DRIVE_CACHE["root_items"].remove(file_id)
+                    if file_id and file_id in DRIVE_CACHE["items"]:
+                        DRIVE_CACHE["items"][file_id]["archived"] = True
                     DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
                 
                 save_disk_cache()
@@ -4312,6 +4408,375 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": True, "id": file_id}).encode("utf-8"))
                 return
             except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        # ── Trash listing ──────────────────────────────────────────────────────
+        if parsed.path == "/api/trash":
+            try:
+                from core.local_index import get_trash
+                items = get_trash(limit=200)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": items}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Trash query error: {e}")
+                # Fallback: scan in-memory cache for archived items
+                with CACHE_LOCK:
+                    items = [dict(it) for it in DRIVE_CACHE["items"].values() if it.get("archived")]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": items}).encode("utf-8"))
+                return
+
+        # ── Folder & file management endpoints (used by the Next.js web app) ──
+        if parsed.path == "/api/folder/create":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                name = str(data.get("name", "")).strip()
+                parent_id = (data.get("parent_folder_id") or "").replace("-", "") or None
+                if not name:
+                    raise ValueError("Folder name is required")
+                safe_name = Path(name).name.strip()
+                if not safe_name:
+                    raise ValueError("Invalid folder name")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                payload = {
+                    "parent": {"database_id": DEFAULT_DB_ID},
+                    "icon": {"type": "emoji", "emoji": "📁"},
+                    "properties": {
+                        "Name": {"title": [{"text": {"content": safe_name}}]},
+                        "Type": {"select": {"name": "Folder"}},
+                        "Favorite": {"checkbox": False},
+                        "Archived": {"checkbox": False}
+                    }
+                }
+                if parent_id:
+                    payload["properties"]["Parent Folder"] = {"relation": [{"id": parent_id}]}
+
+                res = requests.post("https://api.notion.com/v1/pages", headers=runner.headers, json=payload, timeout=20)
+                if res.status_code == 200:
+                    nid = res.json()["id"].replace("-", "")
+                    register_drive_cache_item(nid, safe_name, "Folder", "", 0, 0, parent_id, "")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": nid, "name": safe_name, "parent_folder_id": parent_id}).encode("utf-8"))
+                    return
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Notion error: {res.status_code}"}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Folder create error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/rename":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                item_id = data.get("id", "").replace("-", "")
+                new_name = str(data.get("name", "")).strip()
+                if not item_id or not new_name:
+                    raise ValueError("Missing id or name")
+                safe_name = Path(new_name).name.strip()
+                if not safe_name:
+                    raise ValueError("Invalid name")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                res = requests.patch(
+                    f"https://api.notion.com/v1/pages/{item_id}",
+                    headers=runner.headers,
+                    json={"properties": {"Name": {"title": [{"text": {"content": safe_name}}]}}},
+                    timeout=15,
+                )
+                if res.status_code == 200:
+                    with CACHE_LOCK:
+                        entry = DRIVE_CACHE["items"].get(item_id)
+                        if entry:
+                            entry["name"] = safe_name
+                            entry["last_edited_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+                    if entry:
+                        _sync_cache_entry_to_index(entry)
+                    _broadcast_sse("file_updated", {"id": item_id, "name": safe_name, "version": DRIVE_CACHE.get("version", 0)})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": item_id, "name": safe_name}).encode("utf-8"))
+                    return
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Notion error: {res.status_code}"}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Rename error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/move":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                item_id = data.get("id", "").replace("-", "")
+                parent_id = (data.get("parent_folder_id") or "").replace("-", "") or None
+                if not item_id:
+                    raise ValueError("Missing id")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                props = {"Parent Folder": {"relation": [{"id": parent_id}]} if parent_id else {"relation": []}}
+                res = requests.patch(
+                    f"https://api.notion.com/v1/pages/{item_id}",
+                    headers=runner.headers,
+                    json={"properties": props},
+                    timeout=15,
+                )
+                if res.status_code == 200:
+                    with CACHE_LOCK:
+                        entry = DRIVE_CACHE["items"].get(item_id)
+                        if entry:
+                            entry = dict(entry)
+                            entry["parent_id"] = parent_id
+                            entry["last_edited_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if entry:
+                        register_drive_cache_item(
+                            item_id, entry.get("name", ""), entry.get("type", "File"), entry.get("extension", ""),
+                            entry.get("size_mb", 0), entry.get("size_bytes", 0), parent_id,
+                            entry.get("local_path", ""), entry.get("mtime", 0),
+                            starred=bool(entry.get("starred")), archived=bool(entry.get("archived")),
+                        )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": item_id, "parent_folder_id": parent_id}).encode("utf-8"))
+                    return
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Notion error: {res.status_code}"}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Move error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/star":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                item_id = data.get("id", "").replace("-", "")
+                starred = bool(data.get("starred", True))
+                if not item_id:
+                    raise ValueError("Missing id")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                res = requests.patch(
+                    f"https://api.notion.com/v1/pages/{item_id}",
+                    headers=runner.headers,
+                    json={"properties": {"Favorite": {"checkbox": starred}}},
+                    timeout=15,
+                )
+                if res.status_code == 200:
+                    with CACHE_LOCK:
+                        entry = DRIVE_CACHE["items"].get(item_id)
+                        if entry:
+                            entry["starred"] = starred
+                            entry["last_edited_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+                    if entry:
+                        _sync_cache_entry_to_index(entry)
+                    _broadcast_sse("file_updated", {"id": item_id, "starred": starred, "version": DRIVE_CACHE.get("version", 0)})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": item_id, "starred": starred}).encode("utf-8"))
+                    return
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Notion error: {res.status_code}"}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Star error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/restore":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                item_id = data.get("id", "").replace("-", "")
+                if not item_id:
+                    raise ValueError("Missing id")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                res = requests.patch(
+                    f"https://api.notion.com/v1/pages/{item_id}",
+                    headers=runner.headers,
+                    json={"properties": {"Archived": {"checkbox": False}}},
+                    timeout=15,
+                )
+                if res.status_code == 200:
+                    with CACHE_LOCK:
+                        entry = DRIVE_CACHE["items"].get(item_id)
+                        if entry:
+                            entry["archived"] = False
+                            entry["last_edited_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+                    if entry:
+                        _sync_cache_entry_to_index(entry)
+                    else:
+                        try:
+                            from core.local_index import set_archived
+                            set_archived(item_id, False)
+                        except Exception:
+                            pass
+                    _broadcast_sse("file_updated", {"id": item_id, "archived": False, "version": DRIVE_CACHE.get("version", 0)})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": item_id}).encode("utf-8"))
+                    return
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Notion error: {res.status_code}"}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Restore error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/file/delete-permanent":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                data = json.loads(body.decode("utf-8"))
+                item_id = data.get("id", "").replace("-", "")
+                if not item_id:
+                    raise ValueError("Missing id")
+
+                runner = BackgroundSyncRunner(DEFAULT_API_KEY, DEFAULT_DB_ID)
+                try:
+                    requests.patch(
+                        f"https://api.notion.com/v1/pages/{item_id}",
+                        headers=runner.headers,
+                        json={"archived": True},
+                        timeout=15,
+                    )
+                except Exception as e:
+                    logger.warning(f"Native archive failed: {e}")
+
+                try:
+                    from core.local_index import delete_item
+                    delete_item(item_id)
+                except Exception as e:
+                    logger.warning(f"Index delete warning: {e}")
+
+                with CACHE_LOCK:
+                    DRIVE_CACHE["items"].pop(item_id, None)
+                    for pid, cids in DRIVE_CACHE["children"].items():
+                        if item_id in cids:
+                            cids.remove(item_id)
+                    if item_id in DRIVE_CACHE["root_items"]:
+                        DRIVE_CACHE["root_items"].remove(item_id)
+                    DRIVE_CACHE["version"] = DRIVE_CACHE.get("version", 0) + 1
+
+                save_disk_cache()
+                _broadcast_sse("file_deleted", {"id": item_id, "permanent": True, "version": DRIVE_CACHE.get("version", 0)})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "id": item_id}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Permanent delete error: {e}")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+                return
+
+        if parsed.path == "/api/upload-multipart":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if length > 100 * 1024 * 1024:  # 100 MB limit
+                    raise ValueError("File too large (max 100 MB)")
+                body = self.rfile.read(length)
+
+                from email import policy
+                from email.parser import BytesParser
+                # BaseHTTPRequestHandler strips request headers, so the email parser
+                # never sees the Content-Type that carries the multipart boundary.
+                # Reconstruct the message headers before parsing the body.
+                content_type = self.headers.get("Content-Type", "multipart/form-data")
+                msg = BytesParser(policy=policy.default).parsebytes(
+                    f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
+                )
+
+                file_name = None
+                file_bytes = b""
+                parent_id = None
+                for part in msg.iter_parts():
+                    filename = part.get_filename()
+                    if filename:
+                        file_name = filename
+                        file_bytes = part.get_payload(decode=True) or b""
+                    elif part.get_param("name", header="content-disposition") == "folder_id":
+                        raw = part.get_payload(decode=True) or b""
+                        parent_id = raw.decode("utf-8", errors="ignore").strip().replace("-", "") or None
+
+                if not file_name:
+                    raise ValueError("No file part in multipart upload")
+                safe_name = Path(file_name).name
+                if not safe_name:
+                    raise ValueError("Invalid filename")
+
+                ok, new_id, err = _store_uploaded_file(safe_name, parent_id, file_bytes)
+                if ok:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "id": new_id, "name": safe_name}).encode("utf-8"))
+                else:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": err}).encode("utf-8"))
+                return
+            except Exception as e:
+                logger.error(f"Multipart upload error: {e}")
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -4507,7 +4972,7 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                     files = []
                     for cid in child_ids:
                         item = DRIVE_CACHE["items"].get(cid)
-                        if not item:
+                        if not item or item.get("archived"):
                             continue
                         if item.get("type") == "Folder":
                             sub_count = len(DRIVE_CACHE["children"].get(cid, []))
@@ -4676,6 +5141,25 @@ class NotionServerHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"items": starred[:100]}).encode("utf-8"))
+            return
+
+        if parsed.path == "/api/trash":
+            # List soft-deleted (archived) items for the trash view
+            try:
+                from core.local_index import get_trash
+                items = get_trash(limit=200)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": items}).encode("utf-8"))
+            except Exception as e:
+                logger.error(f"Trash GET error: {e}")
+                with CACHE_LOCK:
+                    items = [dict(it) for it in DRIVE_CACHE["items"].values() if it.get("archived")]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": items[:200]}).encode("utf-8"))
             return
 
         if parsed.path == "/api/storage":

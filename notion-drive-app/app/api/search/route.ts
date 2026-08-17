@@ -1,33 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
-import { searchItems, type DbItem } from "@/lib/cache";
+import { backendJson, normalizeSearch, type RawItem } from "@/lib/backend";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const q = searchParams.get("q")?.trim() ?? "";
-  const fileType = searchParams.get("type") ?? undefined;
-
-  if (!q || q.length < 2) {
-    return NextResponse.json({ items: [] });
+  try {
+    const { searchParams } = new URL(req.url);
+    const q = (searchParams.get("q") ?? "").trim();
+    if (!q || q.length < 2) {
+      return NextResponse.json({ items: [], total: 0 });
+    }
+    const data = await backendJson<{ folders?: RawItem[]; files?: RawItem[]; total_files?: number }>(
+      `/api/search?q=${encodeURIComponent(q)}`,
+    );
+    return NextResponse.json(normalizeSearch(data));
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500;
+    return NextResponse.json(
+      { error: status === 401 ? "Unauthorized" : `Search unavailable: ${String(err)}` },
+      { status },
+    );
   }
-
-  const raw = searchItems(q, fileType);
-  const items = raw.map((item: DbItem) => ({
-    id: item.id,
-    name: item.name,
-    type: item.type,
-    fileType: item.file_type,
-    extension: item.extension,
-    sizeMb: item.size_mb,
-    parentId: item.parent_id,
-    starred: item.starred === 1,
-    archived: item.archived === 1,
-    createdAt: item.created_at,
-    modifiedAt: item.modified_at,
-    notionUrl: item.notion_url,
-    fileUrl: item.file_url,
-  }));
-
-  return NextResponse.json({ items });
 }

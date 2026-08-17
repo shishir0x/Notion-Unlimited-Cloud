@@ -133,39 +133,49 @@ Features:
 
 ## 🌐 NotionDrive Web App (Next.js)
 
-`notion-drive-app/` is a **second, standalone web frontend** for the same Notion database — a modern Google Drive-style file manager built with **Next.js 16 + React 19 + Tailwind CSS**. It runs independently of the Python CLI/server on **port 3000**.
+`notion-drive-app/` is a **Google Drive-style web frontend** for the same storage system — built with **Next.js 16 + React 19 + Tailwind CSS**. It is a *BFF* (backend-for-frontend): it does **not** talk to Notion directly. Every request is proxied to the Python backend (`notion_server.py`), which remains the source of truth for sync, the drive cache, and the Notion API. It runs on **port 3000**.
 
 ### Quick Start
 
 ```bash
+# 1. Start the Python backend first (it serves the storage API on :8765)
+python notion_server.py
+
+# 2. Start the Next.js app
 cd notion-drive-app
 npm install
 
-# Create .env.local with your Notion credentials:
-#   NOTION_TOKEN=ntn_your_integration_secret_here
-#   NOTION_DATABASE_ID=your_32_character_database_id_here
+# Copy the template and adjust if your backend is not on :8765:
+cp .env.example .env.local
+#   PYTHON_BACKEND_URL=http://127.0.0.1:8765
 
 npm run dev        # → http://localhost:3000
 # or
 npm run build && npm start
 ```
 
+> **Secrets stay server-side.** `NOTION_TOKEN` / `NOTION_DATABASE_ID` live in the root `.env` used by the Python backend only. The Next app needs no Notion credentials — it forwards the backend's session cookie, so the Python `DRIVE_PASSWORD` lock screen is preserved.
+
 ### Features
 
-- 📂 Folder-tree browsing with breadcrumbs — grid or list view
-- 🔍 Instant full-text search (SQLite FTS5 index) with file-type filters
-- 🕐 **Recent**, ⭐ **Starred**, and 🗑️ **Trash** views
-- ⭐ Star / unstar, ✏️ rename, 📦 move, 🗑️ archive & restore
-- ⬆️ Drag-and-drop upload (creates metadata pages in Notion)
-- 👁️ In-browser preview with signed-URL proxying
-- ⚡ Live updates via SSE — polls Notion every 5 seconds and refreshes the UI automatically
+- 📂 Google Drive-style layout: sidebar (My Drive / Recent / Starred / Trash), breadcrumbs, grid & list views
+- 🔍 Debounced global search (`Ctrl+K` or `/`), sorting, multi-select (Ctrl/Shift/Ctrl+A), right-click context menus
+- ⭐ Star / unstar, ✏️ rename, 📦 move (drag onto a folder), 🗑️ soft-delete → **Trash** with restore & permanent delete
+- ⬆️ Upload manager with progress/speed/ETA/cancel/retry, drag-and-drop upload, folder upload, folder ZIP download
+- 👁️ In-browser preview (images, video, audio, PDF, code/text) via the `/api/view` proxy; streaming downloads
+- ⚡ Live updates: SSE from the backend refreshes the listing when sync changes the drive
+- 🌗 Light / dark / system theme
 
 ### How it works
 
-- Talks to Notion directly through `@notionhq/client` (`lib/notion.ts`)
-- Caches every page in a local SQLite database (`notion_drive.db`, `lib/cache.ts`) so browsing and search never repeatedly hit the Notion API
-- Server API routes: `/api/drive`, `/api/search`, `/api/action`, `/api/upload`, `/api/view`, `/api/stats`, `/api/events`
-- Same metadata-only philosophy as the CLI: only file name/size/type/path are stored in Notion; file bytes are served via the `/api/view` proxy from wherever they live
+```text
+Browser  →  Next.js Route Handlers (BFF)  →  Python backend :8765  →  Notion API / disk / ADB
+```
+
+- **BFF proxy** (`lib/backend.ts`): forwards the `notion_session` cookie and normalizes the backend's JSON into a typed `DriveItem` model
+- **API routes** (`app/api/`): `/drive`, `/search`, `/recent`, `/starred`, `/trash`, `/stats`, `/storage`, `/sync`, `/sync/events` (SSE), `/auth/*`, `/action` (star/rename/move/delete/restore/new-folder), `/upload` (streamed multipart), `/download`, `/download-folder`, `/view`
+- The backend's SQLite index (`.notion_drive_index.db`) powers fast listing/search/recent/starred/trash queries; the Next app never holds its own copy
+- Same metadata-only philosophy as the CLI: only file name/size/type/path are stored in Notion; file bytes are served from disk/ADB via the `/view` & `/download` proxies
 
 > **Schema note:** both apps share the same database schema — files carry their extension in `File Extension`, and deleted items are flagged with the `Archived` checkbox that powers the Trash view in both UIs. Run `python setup.py` to create the base schema (including the `Archived` column) before first use.
 
@@ -216,10 +226,11 @@ Notion-Unlimited-Cloud/
 │   ├── notion_api.py       Notion REST API wrapper (retry, pagination, cache)
 │   └── sync_engine.py      Differential scan → diff → upload engine
 │
-├── notion-drive-app/       Standalone Next.js web drive (port 3000)
-│   ├── app/                UI page + API routes (/api/drive, /api/search, …)
-│   ├── components/         Drive UI (Sidebar, FileGrid, FileTable, PreviewModal…)
-│   └── lib/                Notion SDK client + SQLite cache (notion_drive.db)
+├── notion-drive-app/       Next.js web drive (port 3000) — BFF for the Python backend
+│   ├── app/                UI page + API routes (drive, search, action, upload, …)
+│   ├── components/         Drive UI (Sidebar, TopBar, FileGrid, FileTable, PreviewModal…)
+│   ├── hooks/              Client hooks (uploads, theme)
+│   └── lib/                BFF proxy (backend.ts) + types + file-type/path utilities
 │
 ├── requirements.txt        Python dependencies
 ├── .env.example            Credential template

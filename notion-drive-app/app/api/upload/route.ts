@@ -1,52 +1,43 @@
-import { NextRequest, NextResponse } from "next/server";
-import { notion, DB_ID, queryDatabase } from "@/lib/notion";
-import { upsertItems } from "@/lib/cache";
+import { NextResponse } from "next/server";
+import { PYTHON_BACKEND_URL } from "@/lib/config";
+import { cookies } from "next/headers";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
-    const formData = await req.formData();
-    const file = formData.get("file") as File | null;
-    const folderId = formData.get("folder_id") as string | null;
-
-    if (!file) {
-      return NextResponse.json({ success: false, error: "No file provided" }, { status: 400 });
+    const contentType = req.headers.get("content-type") ?? "";
+    if (!contentType.includes("multipart/form-data")) {
+      return NextResponse.json({ success: false, error: "Expected multipart/form-data" }, { status: 400 });
     }
 
-    const name = file.name;
-    const ext = name.includes(".") ? "." + name.split(".").pop()!.toLowerCase() : "";
-    const sizeMb = +(file.size / (1024 * 1024)).toFixed(3);
+    const store = await cookies();
+    const session = store.get("notion_session")?.value;
+    const headers: Record<string, string> = { "Content-Type": contentType };
+    // The Python backend reads Content-Length to size the body read, so the
+    // streamed proxy request must carry the original length.
+    const incomingLength = req.headers.get("content-length");
+    if (incomingLength) headers["Content-Length"] = incomingLength;
+    if (session) headers["Cookie"] = `notion_session=${session}`;
 
-    // Create Notion page for this file
-    const page = await notion.pages.create({
-      parent: { database_id: DB_ID },
-      properties: {
-        Name: { title: [{ text: { content: name } }] },
-        Type: { select: { name: "File" } },
-        "File Extension": { rich_text: [{ text: { content: ext } }] },
-        "File Size": { number: sizeMb },
-        ...(folderId
-          ? { "Parent Folder": { relation: [{ id: folderId }] } }
-          : {}),
-      },
-    });
+    // Stream the raw request body straight to the Python backend — no
+    // buffering of the file in Next.js memory. `duplex` is required by
+    // undici when the body is a stream; RequestInit predates it, so cast.
+    const upstream = await fetch(`${PYTHON_BACKEND_URL}/api/upload-multipart`, {
+      method: "POST",
+      headers,
+      body: req.body as ReadableStream<Uint8Array>,
+      cache: "no-store",
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
 
-    // For small files (< 5MB), embed content as file block
-    if (file.size < 5 * 1024 * 1024) {
-      const arrayBuffer = await file.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
-      // Notion API doesn't support direct binary upload via API — store metadata only
-      // The file_url will be set when uploaded via Notion UI or S3 pre-signed URL workflow
-      void base64; // suppress unused warning
-    }
-
-    // Re-index this new item
-    const items = await queryDatabase({ property: "Type", select: { equals: "File" } }, undefined, 5);
-    upsertItems(items);
-
-    return NextResponse.json({ success: true, id: (page as { id: string }).id.replace(/-/g, ""), name });
+    const data = await upstream.json().catch(() => ({}));
+    return NextResponse.json(data, { status: upstream.status });
   } catch (err) {
-    return NextResponse.json({ success: false, error: String(err) }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: `Upload failed: ${String(err)}` },
+      { status: 500 },
+    );
   }
 }

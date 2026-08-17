@@ -4,8 +4,6 @@ import { backendFetch } from "@/lib/backend";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-// Inline (non-attachment) proxy used for browser previews — same file serving
-// as /api/download but with inline Content-Disposition from the backend.
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
@@ -13,20 +11,17 @@ export async function GET(req: NextRequest) {
     if (searchParams.get("id")) params.set("id", searchParams.get("id")!);
     if (searchParams.get("path")) params.set("path", searchParams.get("path")!);
 
-    // The Python backend serves inline (non-attachment) content on /view.
-    const upstream = await backendFetch(`/view?${params.toString()}`, {
-      headers: req.headers.get("range") ? { Range: req.headers.get("range")! } : undefined,
-    });
+    const upstream = await backendFetch(`/download-folder?${params.toString()}`);
     if (!upstream.body) {
       return new Response("Not found", { status: upstream.status });
     }
     const headers = new Headers();
-    for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "cache-control", "location"]) {
-      const v = upstream.headers.get(h);
-      if (v) headers.set(h, v);
-    }
+    const contentType = upstream.headers.get("content-type");
+    const disposition = upstream.headers.get("content-disposition");
+    if (contentType) headers.set("Content-Type", contentType);
+    if (disposition) headers.set("Content-Disposition", disposition);
     return new Response(upstream.body, { status: upstream.status, headers });
   } catch (err) {
-    return new Response(`Preview unavailable: ${String(err)}`, { status: 502 });
+    return new Response(`Download unavailable: ${String(err)}`, { status: 502 });
   }
 }
