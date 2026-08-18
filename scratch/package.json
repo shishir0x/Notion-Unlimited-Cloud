@@ -1,0 +1,10 @@
+{
+  "name": "scratch-e2e",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Scratch E2E browser tests for the NotionDrive Next.js app",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

@@ -146,8 +146,8 @@ export default function DrivePage() {
       else if (view === "recent") data = await api.recent();
       else if (view === "starred") data = await api.starred();
       else data = await api.trash();
-      setItems(data.items);
-      setBreadcrumbs(data.breadcrumbs);
+      setItems(data.items ?? []);
+      setBreadcrumbs(data.breadcrumbs ?? []);
       if (selectOnLoadRef.current) {
         const sel = data.items.find((i) => i.id === selectOnLoadRef.current);
         if (sel) setSelected(new Set([sel.id]));

@@ -6,14 +6,14 @@ Run this script to:
   - Select which folders/devices to sync to Notion
   - Run a Git-style incremental sync (only new/changed files uploaded)
   - Monitor sync status live
-  - Launch the Web Drive GUI
+  - Launch the Next.js web app
 
 Usage:
     python notion_sync.py                  # Interactive menu (recommended)
     python notion_sync.py status           # Show git-status of all sources
     python notion_sync.py sync --path C:\\Users\\nitro\\Documents
     python notion_sync.py watch --path C:\\Users\\nitro
-    python notion_sync.py gui              # Open web browser at http://127.0.0.1:8765
+    python notion_sync.py gui              # Open web browser at http://localhost:3000
     python notion_sync.py rebuild          # Rebuild local index from Notion
 """
 
@@ -64,7 +64,7 @@ def _ensure_credentials():
 _server_instance = None
 
 def start_web_server(port: int = None) -> bool:
-    """Start notion_server.py as a background daemon thread. Returns True if running."""
+    """Start notion_server.py API backend as a background daemon thread. Returns True if running."""
     port = port or cfg.LOCAL_SERVER_PORT
     # Already running?
     try:
@@ -76,7 +76,7 @@ def start_web_server(port: int = None) -> bool:
     try:
         import notion_server
         from http.server import ThreadingHTTPServer
-        # Load disk cache first (populates from Notion if needed)
+        # Initialize API-only backend
         if hasattr(notion_server, "load_disk_cache"):
             notion_server.load_disk_cache()
         if hasattr(notion_server, "_load_recent_files"):
@@ -85,7 +85,7 @@ def start_web_server(port: int = None) -> bool:
             notion_server._build_allowed_roots()
         if hasattr(notion_server, "start_notion_watcher"):
             notion_server.start_notion_watcher()
-            
+        
         handler_cls = getattr(
             notion_server,
             "NotionServerHandler",        # current name
@@ -100,10 +100,10 @@ def start_web_server(port: int = None) -> bool:
         global _server_instance
         _server_instance = srv
         time.sleep(0.5)
-        print(f"  🚀 Web Drive GUI started → http://127.0.0.1:{port}")
+        print(f"  🚀 API backend started → http://127.0.0.1:{port}")
         return True
     except Exception as e:
-        print(f"  ⚠️  Could not start web server: {e}")
+        print(f"  ⚠️  Could not start API backend: {e}")
         return False
 
 
@@ -662,14 +662,18 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
         print("    To connect: enable USB Debugging, plug in via USB, tap 'Allow'")
 
     print()
-    print("  ── OTHER OPTIONS ────────────────────────────────────────────")
-    print(f"    [g] 🌐  Open Web Drive GUI (http://127.0.0.1:{cfg.LOCAL_SERVER_PORT})")
-    print(f"    [s] 📊  Show Sync Status (git status view)")
-    print(f"    [r] 🔄  Rebuild index from Notion")
-    print(f"    [n] 📝  Open Notion database in browser")
+    print("  ── ACTIONS & TOOLS ──────────────────────────────────────────")
+    print(f"    [c] 📁  Sync Custom Folder Path")
+    print(f"    [w] 👀  Watch Folder (Real-time Auto-Sync)")
+    print(f"    [g] 🌐  Open Web Drive (http://localhost:3000)")
+    print(f"    [s] 📊  Show Git-Style Sync Status")
+    print(f"    [r] 🔄  Rebuild Local Index from Notion")
+    print(f"    [n] 📝  Open Notion Database in Browser")
     print(f"    [q] ❌  Exit")
     print()
 
+    device_map["c"] = "custom"
+    device_map["w"] = "watch"
     device_map["g"] = "gui"
     device_map["s"] = "status"
     device_map["r"] = "rebuild"
@@ -680,37 +684,8 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
     return device_map.get(choice)
 
 
-def _menu_subfolders(device: StorageDevice) -> Optional[str]:
-    """Show folder selection for a local drive. Returns the selected path."""
-    print(f"\n  📁 Choose what to sync from {device.label}:\n")
-
-    subfolders = get_user_subfolders(device)
-    idx_map = {}
-    for i, sf in enumerate(subfolders, 1):
-        count_hint = ""
-        print(f"    [{i}] {sf['emoji']}  {sf['name']}")
-        idx_map[str(i)] = sf
-
-    print(f"    [b] ↩  Back to device list")
-    print()
-
-    choice = input("  Select folder: ").strip().lower()
-    if choice == "b":
-        return None
-
-    sf = idx_map.get(choice)
-    if not sf:
-        return None
-
-    if sf["path"] == "__custom__":
-        custom = input(f"  Enter full path (e.g. {device.path}Documents): ").strip()
-        return custom if custom else None
-
-    return sf["path"]
-
-
 def interactive_menu():
-    """The main interactive loop shown when user just runs `python notion_sync.py`."""
+    """The main interactive loop shown when user runs `python notion_sync.py`."""
     _ensure_credentials()
     start_web_server()
     _print_banner()
@@ -732,11 +707,23 @@ def interactive_menu():
 
         elif action == "gui":
             start_web_server()
-            webbrowser.open(f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}")
+            webbrowser.open("http://localhost:3000")
             print(f"\n  🌐 Web Drive opened in browser.\n")
 
+        elif action == "custom":
+            custom_path = input("\n  Enter full directory path to sync: ").strip().strip('"').strip("'")
+            if custom_path and Path(custom_path).exists():
+                sync_local(custom_path)
+            elif custom_path:
+                print(f"  ❌ Directory not found: {custom_path}")
+
+        elif action == "watch":
+            watch_path = input("\n  Enter directory path to watch (Enter for home): ").strip().strip('"').strip("'")
+            target = watch_path if (watch_path and Path(watch_path).exists()) else str(Path.home())
+            watch(target)
+
         elif action == "status":
-            path = input("\n  Enter path to check (or press Enter for home directory): ").strip()
+            path = input("\n  Enter path to check (or press Enter for home directory): ").strip().strip('"').strip("'")
             show_status(path or str(Path.home()))
 
         elif action == "rebuild":
@@ -750,13 +737,11 @@ def interactive_menu():
         elif isinstance(action, StorageDevice):
             device = action
             if device.is_android:
-                # Confirm and sync
                 print(f"\n  📱 Selected: {device.label}")
                 confirm = input("  Start syncing? [Y/n]: ").strip().lower()
                 if confirm not in ("n", "no"):
                     sync_android(device)
             else:
-                # Direct sync without choosing subfolders
                 target_path = device.path
                 if device.path.upper().startswith("C:") and Path(r"C:\Users").exists():
                     target_path = r"C:\Users"
@@ -796,7 +781,7 @@ Commands:
   sync         Sync a specific path to Notion (incremental)
   sync-all     Force re-upload all files in a path
   watch        Auto-sync a path in real time
-  gui          Open the Web Drive GUI in browser
+  gui          Open the Next.js web app in browser
   rebuild      Rebuild local index from Notion
         """,
     )
@@ -820,7 +805,7 @@ Commands:
         watch(args.path, args.interval)
     elif args.command == "gui":
         start_web_server()
-        webbrowser.open(f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}")
+        webbrowser.open("http://localhost:3000")
     elif args.command == "rebuild":
         rebuild_index()
 

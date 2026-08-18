@@ -29,6 +29,9 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")  # Better concurrency
     conn.execute("PRAGMA synchronous=NORMAL")  # Balance safety/speed
     conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+    # Multiple writer threads (watcher, async cache upserts, request handlers)
+    # collide on writes; wait instead of failing with "database is locked".
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 

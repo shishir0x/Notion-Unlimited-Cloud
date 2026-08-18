@@ -18,11 +18,17 @@ const PDF_EXT = ".pdf";
 const CODE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".sh", ".json", ".yaml", ".md", ".html", ".css", ".txt", ".log"]);
 
 function viewUrlFor(item: DriveItem): string {
-  return `/api/view?id=${item.id}`;
+  const params = new URLSearchParams();
+  if (item.id) params.set("id", item.id);
+  if (item.localPath) params.set("path", item.localPath);
+  return `/api/view?${params.toString()}`;
 }
 
 function downloadUrlFor(item: DriveItem): string {
-  return `/api/download?id=${item.id}&local_path=${encodeURIComponent(item.localPath)}`;
+  const params = new URLSearchParams();
+  if (item.id) params.set("id", item.id);
+  if (item.localPath) params.set("path", item.localPath);
+  return `/api/download?${params.toString()}`;
 }
 
 function PreviewContent({ item }: { item: DriveItem }) {

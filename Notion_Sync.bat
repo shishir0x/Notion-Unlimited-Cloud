@@ -37,17 +37,42 @@ if not exist "%~dp0.env" (
     )
 )
 
-REM Start background Web Drive GUI server if not running
-netstat -ano | findstr ":8765 " >nul 2>&1
+REM Check Node.js for Next.js
+node --version >nul 2>&1
 if errorlevel 1 (
-    echo Starting Notion Web Drive server...
-    start "" /B pythonw "%~dp0notion_server.py"
-    timeout /t 2 /nobreak >nul
+    echo.
+    echo [ERROR] Node.js is not installed or not in PATH.
+    echo Please install Node.js 18+ from https://nodejs.org
+    echo.
+    pause
+    exit /b 1
 )
 
-REM Open Web GUI in default browser
-echo Opening Notion Web Drive in browser...
-start http://127.0.0.1:8765
+REM Install Next.js dependencies if needed
+if not exist "%~dp0notion-drive-app\node_modules" (
+    echo Installing Next.js dependencies...
+    cd /d "%~dp0notion-drive-app"
+    npm install
+    cd /d "%~dp0"
+)
+
+REM Copy .env to Next.js app if not present
+if not exist "%~dp0notion-drive-app\.env.local" (
+    echo Creating .env.local for Next.js app...
+    copy "%~dp0.env" "%~dp0notion-drive-app\.env.local" >nul 2>&1
+)
+
+REM Start Next.js dev server in background
+echo Starting Next.js web app...
+start "Next.js Drive App" /B cmd /c "cd /d \"%~dp0notion-drive-app\" && npm run dev"
+
+REM Wait for Next.js to be ready
+echo Waiting for Next.js to start...
+timeout /t 5 /nobreak >nul
+
+REM Open browser to the web app
+echo Opening Notion Drive in browser...
+start http://localhost:3000
 
 REM Launch terminal sync CLI
 if "%~1"=="" (

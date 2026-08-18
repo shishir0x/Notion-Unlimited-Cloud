@@ -1,13 +1,12 @@
 import { NextResponse } from "next/server";
-import { backendJson } from "@/lib/backend";
-import type { DriveStats } from "@/lib/types";
+import { getStats } from "@/lib/notion";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const data = await backendJson<DriveStats>("/api/stats");
-    return NextResponse.json(data);
+    const stats = await getStats();
+    return NextResponse.json(stats);
   } catch {
     return NextResponse.json({ total_files: 0, total_mb: 0 });
   }
