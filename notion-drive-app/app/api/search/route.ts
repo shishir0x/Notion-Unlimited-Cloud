@@ -1,51 +1,33 @@
 import { NextRequest, NextResponse } from "next/server";
-import { searchItems, type NotionDriveItem } from "@/lib/notion";
+import { searchItems, type DbItem } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 
-function normalizeForClient(item: NotionDriveItem) {
-  return {
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const q = searchParams.get("q")?.trim() ?? "";
+  const fileType = searchParams.get("type") ?? undefined;
+
+  if (!q || q.length < 2) {
+    return NextResponse.json({ items: [] });
+  }
+
+  const raw = searchItems(q, fileType);
+  const items = raw.map((item: DbItem) => ({
     id: item.id,
     name: item.name,
-    type: item.type === "Folder" ? "folder" : "file",
-    file_type: item.fileType,
+    type: item.type,
+    fileType: item.file_type,
     extension: item.extension,
-    size_mb: item.sizeMb,
-    size_bytes: item.sizeBytes,
-    parent_id: item.parentId,
-    starred: item.starred,
-    archived: item.archived,
-    mtime: 0,
-    created_time: item.createdAt,
-    last_edited_time: item.lastEditedAt,
-    local_path: item.localPath,
-    item_count: 0,
-    storage_root: "Notion Cloud",
-  };
-}
+    sizeMb: item.size_mb,
+    parentId: item.parent_id,
+    starred: item.starred === 1,
+    archived: item.archived === 1,
+    createdAt: item.created_at,
+    modifiedAt: item.modified_at,
+    notionUrl: item.notion_url,
+    fileUrl: item.file_url,
+  }));
 
-export async function GET(req: NextRequest) {
-  try {
-    const { searchParams } = new URL(req.url);
-    const q = (searchParams.get("q") ?? "").trim();
-    const category = searchParams.get("cat") ?? "all";
-
-    if (!q || q.length < 2) {
-      return NextResponse.json({ items: [], total: 0 });
-    }
-
-    const results = await searchItems(q, category, 100);
-    const items = [
-      ...results.folders.map(normalizeForClient),
-      ...results.files.map(normalizeForClient),
-    ];
-
-    return NextResponse.json({ items, total: items.length });
-  } catch (err) {
-    const status = (err as { status?: number }).status ?? 500;
-    return NextResponse.json(
-      { error: status === 401 ? "Unauthorized" : `Search unavailable: ${String(err)}` },
-      { status },
-    );
-  }
+  return NextResponse.json({ items });
 }

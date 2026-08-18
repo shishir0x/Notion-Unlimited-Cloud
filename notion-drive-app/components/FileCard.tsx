@@ -2,16 +2,30 @@
 import { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Folder, Image as ImageIcon, Film, FileText, Code2, Music, File,
+  Folder, Image, Film, FileText, Code2, Music, File,
   Star, MoreVertical, ExternalLink, Download, Eye, Trash2
 } from "lucide-react";
-import type { DriveItem } from "@/lib/types";
+
+export interface DriveItem {
+  id: string;
+  name: string;
+  type: "file" | "folder" | string;
+  fileType: string;
+  extension: string;
+  sizeMb: number;
+  parentId: string | null;
+  starred: boolean;
+  archived: boolean;
+  createdAt: string;
+  modifiedAt: string;
+  notionUrl: string;
+  fileUrl?: string | null;
+}
 
 interface FileCardProps {
   item: DriveItem;
   selected: boolean;
   onSelect: (id: string, multi: boolean) => void;
-  onSelectRange?: (id: string) => void;
   onOpen: (item: DriveItem) => void;
   onPreview: (item: DriveItem) => void;
   onAction: (action: string, item: DriveItem) => void;
@@ -25,7 +39,6 @@ const CODE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".
 function Thumbnail({ item }: { item: DriveItem }) {
   const ext = item.extension.toLowerCase();
   const [imgError, setImgError] = useState(false);
-  const viewUrl = `/api/view?id=${item.id}`;
 
   if (item.type === "folder") {
     return (
@@ -36,12 +49,12 @@ function Thumbnail({ item }: { item: DriveItem }) {
   }
 
   // Image thumbnail
-  if (IMAGE_EXTS.has(ext) && !imgError) {
+  if (IMAGE_EXTS.has(ext) && item.fileUrl && !imgError) {
     return (
       <div className="w-full h-full relative overflow-hidden">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
-          src={viewUrl}
+          src={item.fileUrl}
           alt={item.name}
           className="w-full h-full object-cover"
           onError={() => setImgError(true)}
@@ -53,7 +66,7 @@ function Thumbnail({ item }: { item: DriveItem }) {
   if (IMAGE_EXTS.has(ext)) {
     return (
       <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-violet-500/20 to-purple-700/10 gap-2">
-        <ImageIcon size={32} className="text-violet-400" />
+        <Image size={32} className="text-violet-400" />
         <span className="text-[9px] font-bold text-violet-300 uppercase tracking-wider bg-violet-500/20 px-2 py-0.5 rounded">
           {ext.slice(1)}
         </span>
@@ -121,18 +134,16 @@ function Thumbnail({ item }: { item: DriveItem }) {
   );
 }
 
-export default function FileCard({ item, selected, onSelect, onSelectRange, onOpen, onPreview, onAction }: FileCardProps) {
+export default function FileCard({ item, selected, onSelect, onOpen, onPreview, onAction }: FileCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
 
   const handleClick = useCallback((e: React.MouseEvent) => {
-    if (e.shiftKey && onSelectRange) {
-      onSelectRange(item.id);
-    } else if (e.ctrlKey || e.metaKey) {
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
       onSelect(item.id, true);
     } else {
       onSelect(item.id, false);
     }
-  }, [item.id, onSelect, onSelectRange]);
+  }, [item.id, onSelect]);
 
   const handleDoubleClick = useCallback(() => {
     onOpen(item);
@@ -207,16 +218,18 @@ export default function FileCard({ item, selected, onSelect, onSelectRange, onOp
         >
           <ExternalLink size={13} />
         </button>
-        <a
-          href={`/api/download?id=${item.id}&local_path=${encodeURIComponent(item.localPath)}`}
-          target="_blank"
-          rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors"
-          title="Download"
-        >
-          <Download size={13} />
-        </a>
+        {item.fileUrl && (
+          <a
+            href={`/api/view?id=${item.id}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors"
+            title="Download"
+          >
+            <Download size={13} />
+          </a>
+        )}
         <button
           onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
           className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors ml-auto"

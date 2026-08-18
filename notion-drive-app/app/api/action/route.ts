@@ -1,104 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  renameItem,
-  moveItem,
-  starItem,
-  archivePage,
-  unarchivePage,
-  permanentlyDeletePage,
-  createFolder,
-} from "@/lib/notion";
+import { updateItem, moveItem } from "@/lib/notion";
+import { upsertItems } from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 
-interface ActionRequest {
-  action: string;
-  ids: string[];
-  payload?: Record<string, unknown>;
-}
-
 export async function POST(req: NextRequest) {
-  let body: ActionRequest;
   try {
-    body = (await req.json()) as ActionRequest;
-  } catch {
-    return NextResponse.json({ success: false, error: "Invalid JSON body" }, { status: 400 });
-  }
+    const body = await req.json();
+    const { action, ids, payload } = body as {
+      action: string;
+      ids: string[];
+      payload?: Record<string, unknown>;
+    };
 
-  const { action, ids, payload } = body;
-  const id = ids?.[0] ?? "";
-
-  // Create-folder is a single operation
-  if (action === "new-folder") {
-    const name = String(payload?.name ?? "").trim();
-    const parentId = String(payload?.parent_folder_id ?? payload?.parentId ?? "").replace(/-/g, "") || null;
-    if (!name) {
-      return NextResponse.json({ success: false, error: "Folder name is required" }, { status: 400 });
-    }
-    const result = await createFolder(name, parentId);
-    if (result) {
-      return NextResponse.json({ success: true, id: result.id, name: result.name });
-    }
-    return NextResponse.json({ success: false, error: "Failed to create folder" }, { status: 500 });
-  }
-
-  if (!id) {
-    return NextResponse.json({ success: false, error: "No item id provided" }, { status: 400 });
-  }
-
-  const results: Array<{ id: string; ok: boolean; error?: string }> = [];
-
-  for (const itemId of ids) {
-    let ok = false;
-    let error: string | undefined;
-
-    try {
-      switch (action) {
-        case "star":
-          ok = await starItem(itemId, true);
-          break;
-        case "unstar":
-          ok = await starItem(itemId, false);
-          break;
-        case "delete":
-          ok = await archivePage(itemId);
-          break;
-        case "delete-permanent":
-          ok = await permanentlyDeletePage(itemId);
-          break;
-        case "restore":
-          ok = await unarchivePage(itemId);
-          break;
-        case "rename": {
-          const newName = String(payload?.name ?? "").trim();
-          if (!newName) {
-            error = "Name is required";
-          } else {
-            ok = await renameItem(itemId, newName);
-          }
-          break;
-        }
-        case "move": {
-          const newParentId = String(payload?.parent_folder_id ?? payload?.parentId ?? "").replace(/-/g, "") || null;
-          ok = await moveItem(itemId, newParentId);
-          break;
-        }
-        default:
-          error = `Unknown action: ${action}`;
+    for (const id of ids) {
+      if (action === "star") await updateItem(id, { starred: true });
+      else if (action === "unstar") await updateItem(id, { starred: false });
+      else if (action === "delete") await updateItem(id, { archived: true });
+      else if (action === "restore") await updateItem(id, { archived: false });
+      else if (action === "rename" && payload?.name) {
+        await updateItem(id, { name: payload.name as string });
+      } else if (action === "move") {
+        await moveItem(id, (payload?.parentId as string) ?? null);
       }
-    } catch (err) {
-      error = String(err);
     }
-
-    results.push({ id: itemId, ok, error });
+    return NextResponse.json({ success: true });
+  } catch (err) {
+    return NextResponse.json({ success: false, error: String(err) }, { status: 500 });
   }
-
-  const failed = results.find((r) => !r.ok);
-  if (failed) {
-    return NextResponse.json(
-      { success: false, error: failed.error ?? "Operation failed", results },
-      { status: 400 },
-    );
-  }
-  return NextResponse.json({ success: true, results });
 }
