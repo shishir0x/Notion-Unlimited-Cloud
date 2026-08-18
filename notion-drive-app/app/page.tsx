@@ -7,6 +7,7 @@ import FileGrid from "@/components/FileGrid";
 import FileTable from "@/components/FileTable";
 import PreviewModal from "@/components/PreviewModal";
 import UploadDropzone from "@/components/UploadDropzone";
+import SyncView from "@/components/SyncView";
 import type { DriveItem } from "@/components/FileCard";
 
 interface DriveResponse {
@@ -38,7 +39,7 @@ export default function DrivePage() {
       if (data && typeof data.total_files === "number") {
         setStats(data);
       }
-    } catch {}
+    } catch { }
   }, []);
 
   // Fetch folder contents
@@ -79,7 +80,7 @@ export default function DrivePage() {
           fetchItems();
           fetchStats();
         }
-      } catch {}
+      } catch { }
     };
     return () => es.close();
   }, [fetchItems, fetchStats]);
@@ -92,7 +93,7 @@ export default function DrivePage() {
       try {
         const data = await fetch(`/api/search?q=${encodeURIComponent(q)}`).then((r) => r.json());
         setSearchResults(data.items ?? []);
-      } catch {}
+      } catch { }
     }, 250);
   }, []);
 
@@ -139,7 +140,7 @@ export default function DrivePage() {
       });
       fetchItems();
       fetchStats();
-    } catch {}
+    } catch { }
   }, [fetchItems, fetchStats]);
 
   // Sync
@@ -153,7 +154,7 @@ export default function DrivePage() {
       });
       await fetchItems();
       await fetchStats();
-    } catch {}
+    } catch { }
     setSyncing(false);
   }, [fetchItems, fetchStats]);
 
@@ -181,41 +182,47 @@ export default function DrivePage() {
           onSearchOpen={handleOpen}
         />
 
-        {/* Toolbar */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.04] shrink-0">
-          <div className="flex items-center gap-3">
-            <Breadcrumbs crumbs={breadcrumbs} onNavigate={(id) => { setFolderId(id); setView("folder"); }} />
-            {selected.size > 0 && (
-              <span className="text-xs bg-blue-500/20 text-blue-300 px-2.5 py-1 rounded-lg">
-                {selected.size} selected
-              </span>
-            )}
-          </div>
-          <UploadDropzone folderId={folderId} onUploadComplete={() => { fetchItems(); fetchStats(); }} />
-        </div>
+        {/* Toolbar & Content */}
+        {view === "sync" ? (
+          <SyncView onRefreshDrive={() => { fetchItems(); fetchStats(); }} />
+        ) : (
+          <>
+            <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.04] shrink-0">
+              <div className="flex items-center gap-3">
+                <Breadcrumbs crumbs={breadcrumbs} onNavigate={(id) => { setFolderId(id); setView("folder"); }} />
+                {selected.size > 0 && (
+                  <span className="text-xs bg-blue-500/20 text-blue-300 px-2.5 py-1 rounded-lg">
+                    {selected.size} selected
+                  </span>
+                )}
+              </div>
+              <UploadDropzone folderId={folderId} onUploadComplete={() => { fetchItems(); fetchStats(); }} />
+            </div>
 
-        {/* File area */}
-        <div className="flex-1 overflow-y-auto">
-          {viewMode === "grid" ? (
-            <FileGrid
-              items={items}
-              selected={selected}
-              onSelect={handleSelect}
-              onOpen={handleOpen}
-              onPreview={setPreviewItem}
-              onAction={handleAction}
-              loading={loading}
-            />
-          ) : (
-            <FileTable
-              items={items}
-              selected={selected}
-              onSelect={handleSelect}
-              onOpen={handleOpen}
-              onPreview={setPreviewItem}
-            />
-          )}
-        </div>
+            {/* File area */}
+            <div className="flex-1 overflow-y-auto">
+              {viewMode === "grid" ? (
+                <FileGrid
+                  items={items}
+                  selected={selected}
+                  onSelect={handleSelect}
+                  onOpen={handleOpen}
+                  onPreview={setPreviewItem}
+                  onAction={handleAction}
+                  loading={loading}
+                />
+              ) : (
+                <FileTable
+                  items={items}
+                  selected={selected}
+                  onSelect={handleSelect}
+                  onOpen={handleOpen}
+                  onPreview={setPreviewItem}
+                />
+              )}
+            </div>
+          </>
+        )}
       </div>
 
       {/* Preview modal */}

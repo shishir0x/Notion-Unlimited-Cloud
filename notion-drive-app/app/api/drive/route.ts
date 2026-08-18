@@ -27,6 +27,7 @@ function toClient(item: DbItem) {
     modifiedAt: item.modified_at,
     notionUrl: item.notion_url,
     fileUrl: item.file_url,
+    description: item.description || "",
   };
 }
 
@@ -38,13 +39,12 @@ export async function GET(req: NextRequest) {
   const dir = (searchParams.get("dir") ?? "asc") as "asc" | "desc";
   const forceSync = searchParams.get("sync") === "1";
 
-  // If the cache is empty or user requested sync, perform sync before returning
+  // If user explicitly requested sync or database is completely empty, perform sync
   const count = getItemCount();
-  if (count === 0 || forceSync) {
-    await syncFromNotion(true);
-  } else {
-    // Otherwise sync in the background
-    syncFromNotion(false).catch(() => {});
+  if (count === 0 && forceSync) {
+    await syncFromNotion(true).catch(() => {});
+  } else if (forceSync) {
+    syncFromNotion(true).catch(() => {});
   }
 
   if (view === "recent") {

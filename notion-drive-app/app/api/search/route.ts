@@ -27,6 +27,7 @@ export async function GET(req: NextRequest) {
     modifiedAt: item.modified_at,
     notionUrl: item.notion_url,
     fileUrl: item.file_url,
+    description: item.description || "",
   }));
 
   return NextResponse.json({ items });

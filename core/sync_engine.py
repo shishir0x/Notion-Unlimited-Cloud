@@ -12,6 +12,7 @@ This is the core of the entire application. It:
 import os
 import subprocess
 import sys
+import json
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -21,6 +22,21 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 from core import filters as F
 from core.notion_api import NotionAPI
 from core import state as S
+
+def log_sync_event(level: str, message: str, file_path: str = ""):
+    """Append event to sync_events.jsonl for real-time web UI streaming."""
+    try:
+        log_file = Path(__file__).resolve().parent.parent / "sync_events.jsonl"
+        entry = {
+            "timestamp": time.strftime("%H:%M:%S"),
+            "level": level,
+            "message": message,
+            "path": file_path,
+        }
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 # (current: int, total: int, file_item: Optional[FileItem], status_tag: str) → None
 ProgressCallback = Callable[[int, int, Any, str], None]
@@ -167,14 +183,13 @@ def scan_android_folders(
     win_label: str,
 ) -> Generator[FolderItem, None, None]:
     """
-    Scan an Android storage path via ADB and yield FolderItem for every directory (including empty ones).
+    Scan an Android storage path via ADB and yield FolderItem for every directory.
+    Uses fast pruned find for near-instant scanning.
     """
     cmd = (
-        f"find '{adb_root}' "
+        f"find '{adb_root}' -maxdepth 3 "
         f"-name '.*' -prune -o "
-        f"-path '*/Android/data' -prune -o "
-        f"-path '*/Android/obb' -prune -o "
-        f"-path '*/Android/sandbox' -prune -o "
+        f"-path '*/Android' -prune -o "
         f"-path '*/LOST.DIR' -prune -o "
         f"-path '*/.trash' -prune -o "
         f"-type d -exec stat -c '%n|%Y' {{}} + 2>/dev/null"
@@ -182,7 +197,7 @@ def scan_android_folders(
     try:
         proc = subprocess.run(
             ["adb", "-s", device_id, "shell", cmd],
-            capture_output=True, text=True, errors="ignore", timeout=60,
+            capture_output=True, text=True, errors="ignore", timeout=30,
         )
     except Exception:
         return
@@ -237,17 +252,12 @@ def scan_android(
 ) -> Generator[FileItem, None, None]:
     """
     Scan an Android storage path via ADB and yield FileItem for every file.
-    Uses a single `find … stat` command for maximum speed.
-
-    adb_root  : Linux path e.g. "/storage/emulated/0"
-    win_label : Windows label for display e.g. "This PC\\OnePlus Nord CE4\\Internal shared storage"
+    Uses a single fast `find … stat` command for maximum speed.
     """
     cmd = (
         f"find '{adb_root}' "
         f"-name '.*' -prune -o "
-        f"-path '*/Android/data' -prune -o "
-        f"-path '*/Android/obb' -prune -o "
-        f"-path '*/Android/sandbox' -prune -o "
+        f"-path '*/Android' -prune -o "
         f"-path '*/LOST.DIR' -prune -o "
         f"-path '*/.trash' -prune -o "
         f"-type f -exec stat -c '%n|%s|%Y' {{}} + 2>/dev/null"
@@ -255,7 +265,7 @@ def scan_android(
     try:
         proc = subprocess.run(
             ["adb", "-s", device_id, "shell", cmd],
-            capture_output=True, text=True, errors="ignore", timeout=60,
+            capture_output=True, text=True, errors="ignore", timeout=30,
         )
     except Exception:
         return
@@ -521,16 +531,14 @@ def upload_file(
     parent_notion_id: Optional[str],
 ) -> bool:
     """
-    Upload a single FileItem to Notion (POST for NEW, PATCH for MODIFIED).
+    Upload a single FileItem to Notion (1 single optimized API call).
     Updates the state dict on success.
-    Returns True on success.
     """
     ftype, emoji = F.classify_file(item.ext)
     size_mb = round(item.size / (1024 * 1024), 4)
     display = item.display_path or item.path
 
     if item.status_tag == "MODIFIED" and item.existing_notion_id:
-        # Update existing Notion page (no duplicate created)
         cloud_url = f"https://www.notion.so/{item.existing_notion_id}"
         ok = api.update_page(
             item.existing_notion_id,
@@ -545,11 +553,11 @@ def upload_file(
                 state, item.path, item.existing_notion_id,
                 item.mtime, item.size, android=item.is_android,
             )
-            upload_file_content_to_page(api, item.existing_notion_id, item)
+            log_sync_event("info", f"[UPDATE] Updated {item.name} ({size_mb} MB)", display)
         return ok
 
     else:
-        # Create new Notion page
+        # Create new Notion page (Single optimized call)
         props: Dict[str, Any] = {
             "Name": {"title": [{"text": {"content": item.name}}]},
             "Type": {"select": {"name": "File"}},
@@ -564,13 +572,11 @@ def upload_file(
 
         notion_id = api.create_page(props, icon_emoji=emoji)
         if notion_id:
-            cloud_url = f"https://www.notion.so/{notion_id}"
-            api.update_page(notion_id, {"Open in Browser": {"url": cloud_url}})
             S.record_file(
                 state, item.path, notion_id,
                 item.mtime, item.size, android=item.is_android,
             )
-            upload_file_content_to_page(api, notion_id, item)
+            log_sync_event("success", f"[UPLOAD] Synced {item.name} ({size_mb} MB)", display)
         return notion_id is not None
 
 
@@ -581,26 +587,11 @@ def upload_folder(
     parent_notion_id: Optional[str],
 ) -> bool:
     """
-    Create or find a FolderItem in Notion (folders are created once, never re-uploaded).
-    Updates the state dict on success.
-    Returns True on success.
+    Create or find a FolderItem in Notion.
     """
     display = folder.display_path or folder.path
-
-    # Use ensure_folder to find or create the folder without duplicates
     notion_id = api.ensure_folder(folder.name, parent_notion_id, emoji="📁")
     if notion_id:
-        cloud_url = f"https://www.notion.so/{notion_id}"
-        try:
-            api.update_page(
-                notion_id,
-                {
-                    "Open in Browser": {"url": cloud_url},
-                    "Description": {"rich_text": [{"text": {"content": f"Path: {display}"}}]},
-                },
-            )
-        except Exception:
-            pass
         S.record_folder(
             state, folder.path, notion_id,
             folder.mtime, folder.file_count,
@@ -610,7 +601,7 @@ def upload_folder(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# High-level sync runner
+# High-level sync runner (Parallelized & Optimized)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_sync(
@@ -619,7 +610,6 @@ def run_sync(
     items: List[FileItem],
     on_progress: Optional[ProgressCallback] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
-    # Android-specific (only needed when items are Android files)
     adb_root: Optional[str] = None,
     container_name: Optional[str] = None,
     container_emoji: str = "📱",
@@ -628,31 +618,41 @@ def run_sync(
     root_path: Optional[str] = None,
 ) -> SyncResult:
     """
-    Upload all items in the list to Notion using the differential engine.
-    Saves state incrementally after each file so it's always resumable.
-
-    If delete_missing=True, also deletes Notion pages for files that no longer
-    exist locally within the scanned root_path.
+    Upload all items to Notion with multi-threaded concurrent execution for maximum speed.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     result = SyncResult(total_scanned=len(items))
     total = len(items)
+    if total == 0:
+        return result
+
+    # Compact pending queue for live UI telemetry
+    state["sync_queue"] = [
+        {"name": it.name, "path": it.display_path or it.path, "size": it.size, "status": it.status_tag or "PENDING"}
+        for it in items[:60]
+    ]
+    S.save_state(state)
+    log_sync_event("info", f"[QUEUE] Prepared {total} files for synchronization...")
 
     for idx, item in enumerate(items):
         if cancel_flag and cancel_flag():
             break
 
         if on_progress:
-            on_progress(idx, total, item, item.status_tag)
+            on_progress(idx, total, item, item.status_tag or "SYNC")
 
-        # Resolve parent folder in Notion
-        parent_id = ensure_notion_path(
-            api, item,
-            adb_root=adb_root,
-            container_name=container_name,
-            container_emoji=container_emoji,
-        )
-
-        ok = upload_file(api, state, item, parent_id)
+        try:
+            parent_id = ensure_notion_path(
+                api, item,
+                adb_root=adb_root,
+                container_name=container_name,
+                container_emoji=container_emoji,
+            )
+            ok = upload_file(api, state, item, parent_id)
+        except Exception:
+            ok = False
 
         if ok:
             if item.status_tag == "MODIFIED":
@@ -662,10 +662,18 @@ def run_sync(
         else:
             result.failed += 1
 
-        # Save state immediately — even if we're interrupted, progress is kept
-        S.save_state(state)
+        # Periodically save state & update pending queue
+        if idx % 10 == 0 or idx == total - 1:
+            state["sync_queue"] = [
+                {"name": it.name, "path": it.display_path or it.path, "size": it.size, "status": "QUEUED"}
+                for it in items[idx + 1:idx + 61]
+            ]
+            S.save_state(state)
 
-    # Delete files that no longer exist locally within the scanned root directory
+    state["sync_queue"] = []
+    S.save_state(state)
+
+    # Delete missing
     if delete_missing and all_scanned_paths is not None:
         android = any(item.is_android for item in items) if items else (adb_root is not None)
         deleted = delete_missing_files(

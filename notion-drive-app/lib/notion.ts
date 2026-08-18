@@ -226,23 +226,30 @@ export async function retrievePageBlocksText(pageId: string): Promise<string | n
 // ── Get page file URL or blocks ──────────────────────────────────────────
 export async function getFileUrlFromPage(pageId: string): Promise<string | null> {
   try {
-    const page = await fetchNotion(`pages/${pageId}`);
-    const item = pageToItem(page);
-    if (item.fileUrl) return item.fileUrl;
+    const fetchWithTimeout = async () => {
+      const page = await fetchNotion(`pages/${pageId}`);
+      const item = pageToItem(page);
+      if (item.fileUrl) return item.fileUrl;
 
-    const blocks = await fetchNotion(`blocks/${pageId}/children?page_size=50`);
-    for (const block of blocks.results || []) {
-      const btype = String(block.type || "");
-      if (["image", "file", "video", "pdf"].includes(btype)) {
-        const obj = block[btype];
-        const url = obj?.file?.url || obj?.external?.url;
-        if (url) return url;
+      const blocks = await fetchNotion(`blocks/${pageId}/children?page_size=30`);
+      for (const block of blocks?.results || []) {
+        const btype = String(block.type || "");
+        if (["image", "file", "video", "pdf", "audio"].includes(btype)) {
+          const obj = block[btype];
+          const url = obj?.file?.url || obj?.external?.url;
+          if (url) return url;
+        }
       }
-    }
+      return null;
+    };
+
+    return await Promise.race([
+      fetchWithTimeout(),
+      new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+    ]);
   } catch {
-    // ignore
+    return null;
   }
-  return null;
 }
 
 // ── Create folder ──────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 "use client";
 import { useMemo } from "react";
-import { HardDrive, Clock, Star, Trash2, RefreshCw, ChevronRight, Infinity } from "lucide-react";
+import { HardDrive, Clock, Star, Trash2, ChevronRight, Infinity, Activity } from "lucide-react";
 
-export type ViewMode = "folder" | "recent" | "starred" | "trash";
+export type ViewMode = "folder" | "recent" | "starred" | "trash" | "sync";
 
 interface SidebarProps {
   view: ViewMode;
@@ -10,8 +10,8 @@ interface SidebarProps {
   folderId: string | null;
   totalFiles: number;
   totalMb: number;
-  syncing: boolean;
-  onSync: () => void;
+  syncing?: boolean;
+  onSync?: () => void;
 }
 
 const navItems = [
@@ -19,9 +19,10 @@ const navItems = [
   { id: "recent" as ViewMode, label: "Recent", icon: Clock },
   { id: "starred" as ViewMode, label: "Starred", icon: Star },
   { id: "trash" as ViewMode, label: "Trash", icon: Trash2 },
+  { id: "sync" as ViewMode, label: "Sync & Activity", icon: Activity },
 ];
 
-export default function Sidebar({ view, onView, totalFiles, totalMb, syncing, onSync }: SidebarProps) {
+export default function Sidebar({ view, onView, totalFiles, totalMb }: SidebarProps) {
   const gb = useMemo(() => (totalMb / 1024).toFixed(2), [totalMb]);
 
   return (
@@ -40,11 +41,10 @@ export default function Sidebar({ view, onView, totalFiles, totalMb, syncing, on
           <button
             key={id}
             onClick={() => onView(id)}
-            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150 group ${
-              view === id
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150 group ${view === id
                 ? "bg-white/10 text-white"
                 : "text-gray-400 hover:bg-white/5 hover:text-white"
-            }`}
+              }`}
           >
             <Icon size={16} className={view === id ? "text-blue-400" : "text-gray-500 group-hover:text-gray-300"} />
             {label}
@@ -54,17 +54,8 @@ export default function Sidebar({ view, onView, totalFiles, totalMb, syncing, on
       </nav>
 
       {/* Storage footer */}
-      <div className="px-4 py-4 border-t border-white/5 space-y-3">
-        <button
-          onClick={onSync}
-          disabled={syncing}
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-gray-400 hover:bg-white/5 hover:text-white transition-all"
-        >
-          <RefreshCw size={13} className={syncing ? "animate-spin text-blue-400" : ""} />
-          {syncing ? "Syncing..." : "Sync Now"}
-        </button>
-
-        <div className="bg-white/[0.04] rounded-xl p-3 space-y-2">
+      <div className="px-4 py-4 border-t border-white/5">
+        <div className="bg-white/[0.04] rounded-xl p-3.5 space-y-2.5">
           <div className="flex items-center justify-between">
             <span className="text-[11px] text-gray-400 font-medium">Storage</span>
             <span className="text-[11px] text-blue-400 font-semibold flex items-center gap-1">
@@ -74,7 +65,7 @@ export default function Sidebar({ view, onView, totalFiles, totalMb, syncing, on
           <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
             <div className="h-full w-1/3 bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full" />
           </div>
-          <p className="text-[11px] text-gray-500">
+          <p className="text-[11px] text-gray-400 font-medium">
             {gb} GB · {totalFiles.toLocaleString()} files
           </p>
         </div>

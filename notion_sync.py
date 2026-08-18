@@ -36,6 +36,43 @@ from core.storage import StorageDevice
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Next.js Auto-Start & Browser Integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_nextjs_running():
+    """Start Next.js app on port 3000 if not already running and open browser."""
+    import socket
+    import subprocess
+    
+    port = 3000
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.2)
+    is_open = s.connect_ex(("127.0.0.1", port)) == 0
+    s.close()
+
+    if not is_open:
+        app_dir = Path(__file__).resolve().parent / "notion-drive-app"
+        if app_dir.exists():
+            print(f"\n  🚀 Starting Next.js Web App on http://localhost:{port}...")
+            npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
+            try:
+                subprocess.Popen(
+                    [npm_cmd, "run", "dev"],
+                    cwd=str(app_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                print(f"  ⚠️ Could not start Next.js: {e}")
+
+    try:
+        webbrowser.open(f"http://localhost:{port}")
+        print(f"  🌐 Opened browser at http://localhost:{port}\n")
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Guard: first-run setup
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -203,18 +240,22 @@ def sync_android(device: StorageDevice):
     if device.device_type == "android_internal":
         win_label = f"This PC\\{device.device_model}\\Internal shared storage"
         container_emoji = "📱"
+        container_name = "Internal shared storage"
     else:
         win_label = f"This PC\\{device.device_model}\\SD card"
         container_emoji = "💾"
+        container_name = "SD card"
 
     api = NotionAPI(cfg.NOTION_TOKEN, cfg.NOTION_DATABASE_ID)
     state = S.load_state()
 
-    print(f"\n  📱 Scanning {device.label} via ADB…")
-    print(f"  🔗 Preloading Notion folder cache…")
+    print(f"\n  📱 Scanning {device.label} ({device.adb_path}) via ADB…")
+    print(f"  🔗 Preloading Notion folder cache from local index…")
     api.preload_folders()
 
-    # ── Step 1: Scan and sync folders first (including empty ones) ───────────
+    ENGINE.log_sync_event("info", f"[START] Full Storage Sync initiated for {device.label}...")
+
+    # ── Step 1: Fast directory scan ──────────────────────────────────────────
     print(f"  📁 Scanning folders on device…")
     all_folders = list(ENGINE.scan_android_folders(
         device.adb_device_id, device.adb_path, win_label
@@ -225,30 +266,23 @@ def sync_android(device: StorageDevice):
     folders_new = sum(1 for f in folders_to_sync if f.status_tag == "NEW")
 
     if folders_to_sync:
-        print()
-        print(f"  ✅ {folders_skipped:,} folders up-to-date (skipped)")
-        print(f"  🟢 {folders_new:,} new folders to create")
-        print()
-        print(f"  ⚡ Syncing {len(folders_to_sync):,} folders…\n")
+        print(f"  🟢 {folders_new:,} new folders to verify")
         folder_result = ENGINE.run_folder_sync(
             api, state, folders_to_sync,
             on_progress=_progress,
             adb_root=device.adb_path,
-            container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
+            container_name=container_name,
             container_emoji=container_emoji,
         )
-        print(f"\n  ✅ Folder sync complete!")
-        print(f"     Created : {folder_result.uploaded:,}")
-        if folder_result.failed:
-            print(f"     ❌ Failed : {folder_result.failed:,}")
-        print()
+        print(f"  ✅ Folder hierarchy verified in Notion ({folder_result.uploaded:,} created)")
 
-    # ── Step 2: Scan and sync files ──────────────────────────────────────────
+    # ── Step 2: Fast file scan ──────────────────────────────────────────────
     print(f"  🔍 Reading file list from device…")
     all_items = list(ENGINE.scan_android(
         device.adb_device_id, device.adb_path, win_label
     ))
     print(f"  📂 Found {len(all_items):,} files on device")
+    ENGINE.log_sync_event("info", f"[SCAN] Discovered {len(all_items)} files across {len(all_folders)} folders")
 
     to_sync, skipped = ENGINE.compute_diff(all_items, state)
     new_c = sum(1 for i in to_sync if i.status_tag == "NEW")
@@ -474,6 +508,7 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
 def interactive_menu():
     """The main interactive loop shown when user runs `python notion_sync.py`."""
     _ensure_credentials()
+    _ensure_nextjs_running()
     _print_banner()
 
     while True:

@@ -74,10 +74,16 @@ export default function FileTable({ items, selected, onSelect, onOpen, onPreview
                 } else if (item.type === "folder") {
                   onOpen(item);
                 } else {
-                  onSelect(item.id, false);
+                  onPreview(item);
                 }
               }}
-              onDoubleClick={() => onOpen(item)}
+              onDoubleClick={() => {
+                if (item.type === "folder") {
+                  onOpen(item);
+                } else {
+                  onPreview(item);
+                }
+              }}
               className={`group transition-colors cursor-pointer ${
                 selected.has(item.id)
                   ? "bg-blue-500/10"

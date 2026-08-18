@@ -25,6 +25,8 @@ export function getDb() {
         modified_at TEXT,
         notion_url TEXT,
         file_url TEXT,
+        description TEXT DEFAULT '',
+        local_path TEXT DEFAULT '',
         synced_at INTEGER DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_parent ON items(parent_id);
@@ -36,21 +38,37 @@ export function getDb() {
         content=items, content_rowid=rowid
       );
     `);
+
+    // Ensure all columns exist for existing databases
+    const columns = _db.prepare("PRAGMA table_info(items)").all().map((c: any) => c.name);
+    if (!columns.includes("description")) {
+      _db.exec("ALTER TABLE items ADD COLUMN description TEXT DEFAULT ''");
+    }
+    if (!columns.includes("local_path")) {
+      _db.exec("ALTER TABLE items ADD COLUMN local_path TEXT DEFAULT ''");
+    }
   }
   return _db;
+}
+
+function extractPathFromDesc(desc?: string): string {
+  if (!desc) return "";
+  const match = desc.match(/Path:\s*(.+)$/im);
+  return match && match[1] ? match[1].trim() : "";
 }
 
 export function upsertItems(items: DriveItem[]) {
   if (!items || items.length === 0) return;
   const db = getDb();
   const upsert = db.prepare(`
-    INSERT INTO items (id, name, type, file_type, extension, size_mb, parent_id, starred, archived, created_at, modified_at, notion_url, file_url, synced_at)
-    VALUES (@id, @name, @type, @fileType, @extension, @sizeMb, @parentId, @starred, @archived, @createdAt, @modifiedAt, @notionUrl, @fileUrl, @syncedAt)
+    INSERT INTO items (id, name, type, file_type, extension, size_mb, parent_id, starred, archived, created_at, modified_at, notion_url, file_url, description, local_path, synced_at)
+    VALUES (@id, @name, @type, @fileType, @extension, @sizeMb, @parentId, @starred, @archived, @createdAt, @modifiedAt, @notionUrl, @fileUrl, @description, @localPath, @syncedAt)
     ON CONFLICT(id) DO UPDATE SET
       name=excluded.name, type=excluded.type, file_type=excluded.file_type,
       extension=excluded.extension, size_mb=excluded.size_mb, parent_id=excluded.parent_id,
       starred=excluded.starred, archived=excluded.archived, modified_at=excluded.modified_at,
       notion_url=excluded.notion_url, file_url=excluded.file_url,
+      description=excluded.description, local_path=excluded.local_path,
       synced_at=excluded.synced_at
   `);
   const insertFts = db.prepare(`
@@ -59,6 +77,8 @@ export function upsertItems(items: DriveItem[]) {
   `);
   const tx = db.transaction(() => {
     for (const item of items) {
+      const desc = item.description || "";
+      const lPath = extractPathFromDesc(desc);
       upsert.run({
         ...item,
         fileType: item.fileType,
@@ -70,6 +90,8 @@ export function upsertItems(items: DriveItem[]) {
         modifiedAt: item.modifiedAt,
         notionUrl: item.notionUrl,
         fileUrl: item.fileUrl ?? null,
+        description: desc,
+        localPath: lPath,
         syncedAt: Date.now(),
       });
       insertFts.run(item.id, item.name, item.extension, item.fileType);
@@ -116,6 +138,8 @@ export function getDeviceRootItems(): DbItem[] {
       modified_at: now,
       notion_url: "",
       file_url: null,
+      description: "",
+      local_path: "C:\\",
       synced_at: Date.now(),
     },
     {
@@ -132,6 +156,8 @@ export function getDeviceRootItems(): DbItem[] {
       modified_at: now,
       notion_url: "",
       file_url: null,
+      description: "",
+      local_path: "D:\\",
       synced_at: Date.now(),
     },
     {
@@ -148,6 +174,8 @@ export function getDeviceRootItems(): DbItem[] {
       modified_at: now,
       notion_url: "",
       file_url: null,
+      description: "",
+      local_path: "/sdcard",
       synced_at: Date.now(),
     },
     {
@@ -164,6 +192,8 @@ export function getDeviceRootItems(): DbItem[] {
       modified_at: now,
       notion_url: "",
       file_url: null,
+      description: "",
+      local_path: "/storage",
       synced_at: Date.now(),
     },
   ];
@@ -179,7 +209,7 @@ export function getFolderChildren(
   const col = orderMap[sort] || "name";
   const direction = dir.toUpperCase() === "DESC" ? "DESC" : "ASC";
 
-  // Root view: display the 4 storage device drives
+  // Root view: display ONLY the 4 clean storage device drives (Google Drive style)
   if (!parentId) {
     return getDeviceRootItems();
   }
@@ -187,7 +217,7 @@ export function getFolderChildren(
   // 1. Local Disk (C:)
   if (parentId === DEVICE_ROOTS.DISK_C || parentId === KNOWN_CONTAINERS.DISK_C) {
     return db
-      .prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
+      .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.DISK_C}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
       .all(KNOWN_CONTAINERS.DISK_C) as DbItem[];
   }
 
@@ -203,18 +233,18 @@ export function getFolderChildren(
   // 3. Phone (Internal Storage)
   if (parentId === DEVICE_ROOTS.PHONE || parentId === KNOWN_CONTAINERS.PHONE) {
     return db
-      .prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
+      .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.PHONE}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
       .all(KNOWN_CONTAINERS.PHONE) as DbItem[];
   }
 
   // 4. SD Card (External Storage)
   if (parentId === DEVICE_ROOTS.SDCARD || parentId === KNOWN_CONTAINERS.SDCARD) {
     return db
-      .prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
+      .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.SDCARD}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
       .all(KNOWN_CONTAINERS.SDCARD) as DbItem[];
   }
 
-  // Any folder drill-down (DCIM, Camera, WhatsApp, Users, notion-drive-app, etc.)
+  // Subfolder drill-down (DCIM, Camera, Users, Desktop, WhatsApp, etc.)
   return db
     .prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
     .all(parentId) as DbItem[];
@@ -332,6 +362,8 @@ export interface DbItem {
   modified_at: string;
   notion_url: string;
   file_url: string | null;
+  description?: string;
+  local_path?: string;
   synced_at: number;
 }
 

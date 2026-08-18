@@ -20,6 +20,7 @@ export interface DriveItem {
   modifiedAt: string;
   notionUrl: string;
   fileUrl?: string | null;
+  description?: string;
 }
 
 interface FileCardProps {
@@ -182,13 +183,17 @@ export default function FileCard({ item, selected, onSelect, onOpen, onPreview, 
     } else if (item.type === "folder") {
       onOpen(item);
     } else {
-      onSelect(item.id, false);
+      onPreview(item);
     }
-  }, [item, onSelect, onOpen]);
+  }, [item, onSelect, onOpen, onPreview]);
 
   const handleDoubleClick = useCallback(() => {
-    onOpen(item);
-  }, [item, onOpen]);
+    if (item.type === "folder") {
+      onOpen(item);
+    } else {
+      onPreview(item);
+    }
+  }, [item, onOpen, onPreview]);
 
   const dateStr = new Date(item.modifiedAt).toLocaleDateString("en-US", {
     month: "short", day: "numeric"
@@ -223,12 +228,15 @@ export default function FileCard({ item, selected, onSelect, onOpen, onPreview, 
 
       {/* Select checkbox */}
       <div
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect(item.id, true);
+        }}
         className={`absolute top-2 right-2 w-5 h-5 rounded-md border flex items-center justify-center transition-all duration-100 ${
           selected
             ? "bg-blue-500 border-blue-500"
             : "bg-black/40 border-white/20 opacity-0 group-hover:opacity-100"
         }`}
-        onClick={(e) => { e.stopPropagation(); onSelect(item.id, true); }}
       >
         {selected && <span className="text-white text-[10px] font-bold">✓</span>}
       </div>
