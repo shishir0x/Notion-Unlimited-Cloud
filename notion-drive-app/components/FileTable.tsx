@@ -68,7 +68,15 @@ export default function FileTable({ items, selected, onSelect, onOpen, onPreview
           {sorted.map((item) => (
             <tr
               key={item.id}
-              onClick={(e) => onSelect(item.id, e.ctrlKey || e.metaKey || e.shiftKey)}
+              onClick={(e) => {
+                if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                  onSelect(item.id, true);
+                } else if (item.type === "folder") {
+                  onOpen(item);
+                } else {
+                  onSelect(item.id, false);
+                }
+              }}
               onDoubleClick={() => onOpen(item)}
               className={`group transition-colors cursor-pointer ${
                 selected.has(item.id)
@@ -87,7 +95,17 @@ export default function FileTable({ items, selected, onSelect, onOpen, onPreview
               <td className="px-4 py-2.5">
                 <div className="flex items-center gap-2.5">
                   {item.type === "folder" ? (
-                    <Folder size={16} className="text-amber-400 shrink-0" fill="currentColor" />
+                    item.name.includes("(C:)") ? (
+                      <span className="text-base shrink-0">💽</span>
+                    ) : item.name.includes("(D:)") ? (
+                      <span className="text-base shrink-0">💾</span>
+                    ) : item.name.toLowerCase().includes("phone") ? (
+                      <span className="text-base shrink-0">📱</span>
+                    ) : item.name.toLowerCase().includes("sd card") ? (
+                      <span className="text-base shrink-0">🗃️</span>
+                    ) : (
+                      <Folder size={16} className="text-amber-400 shrink-0" fill="currentColor" />
+                    )
                   ) : (
                     <File size={16} className="text-gray-500 shrink-0" />
                   )}

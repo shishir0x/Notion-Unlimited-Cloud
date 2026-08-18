@@ -41,6 +41,45 @@ function Thumbnail({ item }: { item: DriveItem }) {
   const [imgError, setImgError] = useState(false);
 
   if (item.type === "folder") {
+    const nameLower = item.name.toLowerCase();
+    const isDriveC = nameLower.includes("(c:)") || nameLower.includes("local disk (c:)");
+    const isDriveD = nameLower.includes("(d:)") || nameLower.includes("local disk (d:)");
+    const isPhone = nameLower.includes("phone") || nameLower.includes("nord") || nameLower.includes("oneplus") || nameLower.includes("android");
+    const isSDCard = nameLower.includes("sd card") || nameLower.includes("microsd");
+
+    if (isDriveC) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-blue-600/25 to-indigo-700/15 gap-1.5">
+          <span className="text-3xl">💽</span>
+          <span className="text-[10px] font-bold text-blue-300 uppercase tracking-wide">Drive C:</span>
+        </div>
+      );
+    }
+    if (isDriveD) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-indigo-600/25 to-purple-700/15 gap-1.5">
+          <span className="text-3xl">💾</span>
+          <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wide">Drive D:</span>
+        </div>
+      );
+    }
+    if (isPhone) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-emerald-600/25 to-teal-700/15 gap-1.5">
+          <span className="text-3xl">📱</span>
+          <span className="text-[10px] font-bold text-emerald-300 uppercase tracking-wide">Phone</span>
+        </div>
+      );
+    }
+    if (isSDCard) {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-amber-600/25 to-orange-700/15 gap-1.5">
+          <span className="text-3xl">🗃️</span>
+          <span className="text-[10px] font-bold text-amber-300 uppercase tracking-wide">SD Card</span>
+        </div>
+      );
+    }
+
     return (
       <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-amber-500/20 to-orange-600/10">
         <Folder size={36} className="text-amber-400" fill="currentColor" />
@@ -140,10 +179,12 @@ export default function FileCard({ item, selected, onSelect, onOpen, onPreview, 
   const handleClick = useCallback((e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey || e.shiftKey) {
       onSelect(item.id, true);
+    } else if (item.type === "folder") {
+      onOpen(item);
     } else {
       onSelect(item.id, false);
     }
-  }, [item.id, onSelect]);
+  }, [item, onSelect, onOpen]);
 
   const handleDoubleClick = useCallback(() => {
     onOpen(item);

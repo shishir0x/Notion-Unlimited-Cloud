@@ -1,9 +1,9 @@
 services:
   - type: web
     name: notion-cloud-drive
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python notion_server.py
+    env: node
+    buildCommand: cd notion-drive-app && npm install && npm run build
+    startCommand: cd notion-drive-app && npm start
     envVars:
       - key: NOTION_TOKEN
         sync: false

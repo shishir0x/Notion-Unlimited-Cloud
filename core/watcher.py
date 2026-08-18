@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Callable, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-logger = logging.getLogger("notion_server.watcher")
+logger = logging.getLogger("notion_cloud.watcher")
 
 # Event types
 EVENT_CREATED = "created"

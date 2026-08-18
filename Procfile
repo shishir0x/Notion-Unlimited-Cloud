@@ -1,1 +1,1 @@
-web: python notion_server.py
+web: cd notion-drive-app && npm start

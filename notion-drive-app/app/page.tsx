@@ -146,7 +146,11 @@ export default function DrivePage() {
   const handleSync = useCallback(async () => {
     setSyncing(true);
     try {
-      await fetch(`/api/drive?view=folder&sync=1`);
+      await fetch(`/api/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "start", target: "all" }),
+      });
       await fetchItems();
       await fetchStats();
     } catch {}

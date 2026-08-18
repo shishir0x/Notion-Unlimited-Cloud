@@ -1,7 +1,8 @@
-import { Client } from "@notionhq/client";
-
-export const notion = new Client({ auth: process.env.NOTION_TOKEN });
-export const DB_ID = process.env.NOTION_DATABASE_ID!;
+/**
+ * Type-Safe, Throttled Notion REST API Client.
+ * Designed to strictly adhere to Cloudflare and Notion API rate limits (< 3 req/sec),
+ * with exponential backoff, delta querying, and in-depth block content retrieval.
+ */
 
 export interface DriveItem {
   id: string;
@@ -17,85 +18,106 @@ export interface DriveItem {
   modifiedAt: string;
   notionUrl: string;
   fileUrl?: string;
+  description?: string;
 }
 
-// ── Retry helper ───────────────────────────────────────────────────────────
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+const NOTION_VERSION = "2022-06-28";
+
+function getCredentials() {
+  const token = process.env.NOTION_TOKEN || "";
+  const rawDbId = process.env.NOTION_DATABASE_ID || "";
+  const dbId = rawDbId.replace(/-/g, "").trim();
+  return { token, dbId };
+}
+
+// Polite request throttling to protect against Cloudflare 429
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL_MS = 340; // ~3 requests per second max
+
+async function throttle() {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+    await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
+  }
+  lastRequestTime = Date.now();
+}
+
+async function fetchNotion(path: string, options: RequestInit = {}): Promise<any> {
+  const { token } = getCredentials();
+  const url = path.startsWith("http") ? path : `https://api.notion.com/v1/${path.replace(/^\//, "")}`;
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json",
+    ...((options.headers as Record<string, string>) || {}),
+  };
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await throttle();
     try {
-      return await fn();
-    } catch (err: unknown) {
-      const status = (err as { status?: number }).status;
-      if (status === 429 && attempt < maxRetries - 1) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-      } else {
-        throw err;
+      const res = await fetch(url, {
+        ...options,
+        headers,
+        cache: "no-store",
+      });
+
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get("Retry-After") || (attempt + 1) * 2);
+        console.warn(`[Notion API] 429 Rate limited. Cooling down for ${retryAfter}s...`);
+        await new Promise((r) => setTimeout(r, retryAfter * 1000 + 500));
+        continue;
       }
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(`Notion API HTTP ${res.status}: ${errBody}`);
+      }
+
+      return await res.json();
+    } catch (err: unknown) {
+      if (attempt === 3) throw err;
+      const backoff = (attempt + 1) * 1500;
+      await new Promise((r) => setTimeout(r, backoff));
     }
   }
-  throw new Error("Max retries exceeded");
 }
 
-// ── Page → DriveItem ───────────────────────────────────────────────────────
-export function pageToItem(page: Record<string, unknown>): DriveItem {
-  const props = (page.properties || {}) as Record<string, unknown>;
+// ── Page → DriveItem Transformer ───────────────────────────────────────────
+export function pageToItem(page: Record<string, any>): DriveItem {
+  const props = page.properties || {};
 
-  const title =
-    (props["Name"] as { title?: Array<{ plain_text?: string }> })?.title?.[0]
-      ?.plain_text ?? "Untitled";
+  const title = props["Name"]?.title?.[0]?.plain_text || "Untitled";
 
-  const typeVal = (
-    props["Type"] as { select?: { name?: string } | null }
-  )?.select?.name?.toLowerCase();
-  const type: "file" | "folder" =
-    typeVal === "folder" ? "folder" : "file";
+  const typeVal = props["Type"]?.select?.name?.toLowerCase();
+  const type: "file" | "folder" = typeVal === "folder" ? "folder" : "file";
 
-  const fileType =
-    (props["File Type"] as { select?: { name?: string } | null })?.select
-      ?.name ?? "Other";
+  const fileType = props["File Type"]?.select?.name || "Other";
 
-  // Prefer the canonical "File Extension" property (written by the Python
-  // sync engine); fall back to the legacy "Extension" name used by older uploads.
   const extension =
-    (
-      (props["File Extension"] ??
-        props["Extension"]) as {
-        rich_text?: Array<{ plain_text?: string }>;
-      }
-    )?.rich_text?.[0]?.plain_text ?? "";
+    props["File Extension"]?.rich_text?.[0]?.plain_text ||
+    props["Extension"]?.rich_text?.[0]?.plain_text ||
+    "";
 
-  const sizeMb =
-    (props["File Size"] as { number?: number | null })?.number ?? 0;
+  const sizeMb = props["File Size"]?.number || 0;
 
-  const parentRelation = (
-    props["Parent Folder"] as {
-      relation?: Array<{ id?: string }>;
-    }
-  )?.relation;
+  const parentRelation = props["Parent Folder"]?.relation;
   const parentId =
-    parentRelation && parentRelation.length > 0 && parentRelation[0].id
+    parentRelation && parentRelation.length > 0 && parentRelation[0]?.id
       ? parentRelation[0].id.replace(/-/g, "")
       : null;
 
-  const starred =
-    (props["Favorite"] as { checkbox?: boolean })?.checkbox ?? false;
-  const archived =
-    (props["Archived"] as { checkbox?: boolean })?.checkbox ?? false;
+  const starred = props["Favorite"]?.checkbox ?? false;
+  const archived = props["Archived"]?.checkbox ?? false;
 
-  const filesArr = (
-    props["Files"] as {
-      files?: Array<{
-        type: string;
-        file?: { url: string };
-        external?: { url: string };
-      }>;
-    }
-  )?.files;
+  const filesArr = props["Files"]?.files;
   let fileUrl: string | undefined;
   if (filesArr && filesArr.length > 0) {
-    const f = filesArr[0];
-    fileUrl = f.file?.url ?? f.external?.url;
+    fileUrl = filesArr[0].file?.url || filesArr[0].external?.url;
   }
+
+  const description = props["Description"]?.rich_text?.[0]?.plain_text || "";
 
   const pageId = String(page.id || "").replace(/-/g, "");
 
@@ -113,17 +135,23 @@ export function pageToItem(page: Record<string, unknown>): DriveItem {
     modifiedAt: String(page.last_edited_time || new Date().toISOString()),
     notionUrl: `https://www.notion.so/${pageId}`,
     fileUrl,
+    description,
   };
 }
 
-// ── Query database via REST / SDK request ─────────────────────────────────
-export async function queryDatabase(
+// ── Stream database queries in batches ────────────────────────────────────
+export async function queryDatabaseStream(
+  onBatch: (items: DriveItem[], isFirst: boolean, hasMore: boolean) => void | Promise<void>,
   filter?: Record<string, unknown>,
   sorts?: Array<Record<string, unknown>>,
   pageSize = 100
-): Promise<DriveItem[]> {
-  const items: DriveItem[] = [];
+): Promise<number> {
+  const { dbId } = getCredentials();
+  if (!dbId) return 0;
+
   let cursor: string | undefined;
+  let total = 0;
+  let isFirst = true;
 
   do {
     const body: Record<string, unknown> = {
@@ -133,47 +161,81 @@ export async function queryDatabase(
       ...(cursor ? { start_cursor: cursor } : {}),
     };
 
-    const resp = (await withRetry(() =>
-      notion.request({
-        path: `databases/${DB_ID}/query`,
-        method: "post",
-        body,
-      })
-    )) as { results: Array<Record<string, unknown>>; has_more: boolean; next_cursor?: string | null };
+    const resp = await fetchNotion(`databases/${dbId}/query`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
 
+    const batch: DriveItem[] = [];
     for (const page of resp.results || []) {
       if (page.object === "page") {
-        items.push(pageToItem(page));
+        batch.push(pageToItem(page));
       }
     }
-    cursor = resp.has_more ? (resp.next_cursor ?? undefined) : undefined;
+    total += batch.length;
+    cursor = resp.has_more ? resp.next_cursor : undefined;
+    await onBatch(batch, isFirst, !!cursor);
+    isFirst = false;
   } while (cursor);
 
+  return total;
+}
+
+// ── Query database via REST ───────────────────────────────────────────────
+export async function queryDatabase(
+  filter?: Record<string, unknown>,
+  sorts?: Array<Record<string, unknown>>,
+  pageSize = 100
+): Promise<DriveItem[]> {
+  const items: DriveItem[] = [];
+  await queryDatabaseStream(
+    (batch) => {
+      items.push(...batch);
+    },
+    filter,
+    sorts,
+    pageSize
+  );
   return items;
 }
 
-// ── Get page blocks to find file URL ──────────────────────────────────────
+// ── Retrieve text/code content from Notion page blocks ────────────────────
+export async function retrievePageBlocksText(pageId: string): Promise<string | null> {
+  try {
+    const blocks = await fetchNotion(`blocks/${pageId}/children?page_size=100`);
+    const texts: string[] = [];
+    for (const block of blocks.results || []) {
+      const btype = String(block.type || "");
+      if (btype === "code") {
+        const snippet = block.code?.rich_text?.[0]?.plain_text;
+        if (snippet) texts.push(snippet);
+      } else if (btype === "paragraph") {
+        const pText = block.paragraph?.rich_text?.map((t: any) => t.plain_text).join("") || "";
+        if (pText) texts.push(pText);
+      }
+    }
+    if (texts.length > 0) {
+      return texts.join("\n");
+    }
+  } catch (err) {
+    console.warn(`[retrievePageBlocksText] Error fetching blocks for ${pageId}:`, err);
+  }
+  return null;
+}
+
+// ── Get page file URL or blocks ──────────────────────────────────────────
 export async function getFileUrlFromPage(pageId: string): Promise<string | null> {
   try {
-    const page = (await withRetry(() =>
-      notion.pages.retrieve({ page_id: pageId })
-    )) as Record<string, unknown>;
+    const page = await fetchNotion(`pages/${pageId}`);
     const item = pageToItem(page);
     if (item.fileUrl) return item.fileUrl;
 
-    const blocks = (await withRetry(() =>
-      notion.blocks.children.list({ block_id: pageId, page_size: 50 })
-    )) as { results: Array<Record<string, unknown>> };
-
+    const blocks = await fetchNotion(`blocks/${pageId}/children?page_size=50`);
     for (const block of blocks.results || []) {
       const btype = String(block.type || "");
       if (["image", "file", "video", "pdf"].includes(btype)) {
-        const obj = block[btype] as {
-          type?: string;
-          file?: { url: string };
-          external?: { url: string };
-        };
-        const url = obj?.file?.url ?? obj?.external?.url;
+        const obj = block[btype];
+        const url = obj?.file?.url || obj?.external?.url;
         if (url) return url;
       }
     }
@@ -185,22 +247,46 @@ export async function getFileUrlFromPage(pageId: string): Promise<string | null>
 
 // ── Create folder ──────────────────────────────────────────────────────────
 export async function createFolder(name: string, parentId?: string) {
-  return withRetry(() =>
-    notion.pages.create({
-      parent: { database_id: DB_ID },
-      properties: {
-        Name: { title: [{ text: { content: name } }] },
-        Type: { select: { name: "Folder" } },
-        ...(parentId
-          ? {
-              "Parent Folder": {
-                relation: [{ id: parentId }],
-              },
-            }
-          : {}),
-      } as never,
-    })
-  );
+  const { dbId } = getCredentials();
+  const properties: Record<string, any> = {
+    Name: { title: [{ text: { content: name } }] },
+    Type: { select: { name: "Folder" } },
+  };
+  if (parentId) {
+    properties["Parent Folder"] = { relation: [{ id: parentId }] };
+  }
+
+  return fetchNotion("pages", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: dbId },
+      icon: { type: "emoji", emoji: "📁" },
+      properties,
+    }),
+  });
+}
+
+// ── Create file ────────────────────────────────────────────────────────────
+export async function createFile(name: string, ext: string, sizeMb: number, folderId?: string | null) {
+  const { dbId } = getCredentials();
+  const properties: Record<string, any> = {
+    Name: { title: [{ text: { content: name } }] },
+    Type: { select: { name: "File" } },
+    "File Extension": { rich_text: [{ text: { content: ext } }] },
+    "File Size": { number: sizeMb },
+  };
+  if (folderId) {
+    properties["Parent Folder"] = { relation: [{ id: folderId }] };
+  }
+
+  return fetchNotion("pages", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: dbId },
+      icon: { type: "emoji", emoji: "📄" },
+      properties,
+    }),
+  });
 }
 
 // ── Star / Archive / Rename ────────────────────────────────────────────────
@@ -208,31 +294,28 @@ export async function updateItem(
   pageId: string,
   updates: { starred?: boolean; archived?: boolean; name?: string }
 ) {
-  const props: Record<string, unknown> = {};
-  if (updates.starred !== undefined)
-    props["Favorite"] = { checkbox: updates.starred };
-  if (updates.archived !== undefined)
-    props["Archived"] = { checkbox: updates.archived };
-  if (updates.name !== undefined)
-    props["Name"] = { title: [{ text: { content: updates.name } }] };
+  const properties: Record<string, any> = {};
+  if (updates.starred !== undefined) properties["Favorite"] = { checkbox: updates.starred };
+  if (updates.archived !== undefined) properties["Archived"] = { checkbox: updates.archived };
+  if (updates.name !== undefined) properties["Name"] = { title: [{ text: { content: updates.name } }] };
 
-  return withRetry(() =>
-    notion.pages.update({ page_id: pageId, properties: props as never })
-  );
+  return fetchNotion(`pages/${pageId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ properties }),
+  });
 }
 
 // ── Move (update parent relation) ──────────────────────────────────────────
 export async function moveItem(pageId: string, newParentId: string | null) {
-  return withRetry(() =>
-    notion.pages.update({
-      page_id: pageId,
-      properties: {
-        "Parent Folder": {
-          relation: newParentId ? [{ id: newParentId }] : [],
-        },
-      } as never,
-    })
-  );
+  const properties: Record<string, any> = {
+    "Parent Folder": {
+      relation: newParentId ? [{ id: newParentId }] : [],
+    },
+  };
+  return fetchNotion(`pages/${pageId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ properties }),
+  });
 }
 
 // ── Get recently modified files ────────────────────────────────────────────

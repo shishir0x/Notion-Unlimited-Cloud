@@ -453,7 +453,6 @@ def ensure_notion_path(
     adb_root: Optional[str] = None,
     container_name: Optional[str] = None,
     container_emoji: str = "📱",
-    server_port: int = 8765,
 ) -> Optional[str]:
     """
     Ensure all parent folders exist in Notion for the given file or folder item.
@@ -520,7 +519,6 @@ def upload_file(
     state: Dict[str, Any],
     item: FileItem,
     parent_notion_id: Optional[str],
-    server_port: int = 8765,
 ) -> bool:
     """
     Upload a single FileItem to Notion (POST for NEW, PATCH for MODIFIED).
@@ -573,15 +571,6 @@ def upload_file(
                 item.mtime, item.size, android=item.is_android,
             )
             upload_file_content_to_page(api, notion_id, item)
-            try:
-                import notion_server
-                notion_server.register_drive_cache_item(
-                    notion_id, item.name, "File", item.ext,
-                    size_mb, int(item.size), parent_notion_id,
-                    item.path, item.mtime
-                )
-            except Exception:
-                pass
         return notion_id is not None
 
 
@@ -617,15 +606,6 @@ def upload_folder(
             folder.mtime, folder.file_count,
             android=folder.is_android,
         )
-        try:
-            import notion_server
-            notion_server.register_drive_cache_item(
-                notion_id, folder.name, "Folder", "",
-                0, 0, parent_notion_id,
-                folder.path, folder.mtime
-            )
-        except Exception:
-            pass
     return notion_id is not None
 
 
@@ -639,7 +619,6 @@ def run_sync(
     items: List[FileItem],
     on_progress: Optional[ProgressCallback] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
-    server_port: int = 8765,
     # Android-specific (only needed when items are Android files)
     adb_root: Optional[str] = None,
     container_name: Optional[str] = None,
@@ -671,10 +650,9 @@ def run_sync(
             adb_root=adb_root,
             container_name=container_name,
             container_emoji=container_emoji,
-            server_port=server_port,
         )
 
-        ok = upload_file(api, state, item, parent_id, server_port=server_port)
+        ok = upload_file(api, state, item, parent_id)
 
         if ok:
             if item.status_tag == "MODIFIED":
@@ -738,7 +716,6 @@ def run_folder_sync(
             adb_root=adb_root,
             container_name=container_name,
             container_emoji=container_emoji,
-            server_port=8765,
         )
 
         ok = upload_folder(api, state, folder, parent_id)

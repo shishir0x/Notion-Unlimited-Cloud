@@ -43,7 +43,7 @@ load_env()
 NOTION_TOKEN: str = os.getenv("NOTION_TOKEN", "")
 NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "").replace("-", "")
 DRIVE_PASSWORD: str = os.getenv("DRIVE_PASSWORD", "")
-LOCAL_SERVER_PORT: int = int(os.getenv("LOCAL_SERVER_PORT", "8765"))
+APP_PORT: int = int(os.getenv("PORT", "3000"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL_SECONDS", "4"))
 NOTION_VERSION: str = "2022-06-28"
 
@@ -68,8 +68,8 @@ def save_credentials(token: str, db_id: str, password: str = ""):
         f"# Security (Optional web password for cloud deployment)\n"
         f"DRIVE_PASSWORD={password}\n"
         f"\n"
-        f"# Local Sync Settings\n"
-        f"LOCAL_SERVER_PORT={LOCAL_SERVER_PORT}\n"
+        f"# Next.js App Port\n"
+        f"PORT={APP_PORT}\n"
         f"POLL_INTERVAL_SECONDS={POLL_INTERVAL}\n"
     )
     ENV_FILE.write_text(content, encoding="utf-8")

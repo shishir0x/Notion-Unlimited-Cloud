@@ -1,13 +1,14 @@
-FROM python:3.11-slim
+FROM node:20-alpine
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY notion-drive-app/package*.json ./
+RUN npm ci
 
-COPY . .
+COPY notion-drive-app/ ./
+RUN npm run build
 
-ENV PORT=8765
-EXPOSE 8765
+ENV PORT=3000
+EXPOSE 3000
 
-CMD ["python", "notion_server.py"]
+CMD ["npm", "start"]

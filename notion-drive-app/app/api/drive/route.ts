@@ -1,5 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getFolderChildren, getBreadcrumbs, getRecent, getStarred, getTrash, syncFromNotion, type DbItem } from "@/lib/cache";
+import {
+  getFolderChildren,
+  getBreadcrumbs,
+  getRecent,
+  getStarred,
+  getTrash,
+  syncFromNotion,
+  getItemCount,
+  type DbItem,
+} from "@/lib/cache";
 
 export const dynamic = "force-dynamic";
 
@@ -27,9 +36,16 @@ export async function GET(req: NextRequest) {
   const folderId = searchParams.get("folder") ?? null;
   const sort = (searchParams.get("sort") ?? "name") as "name" | "size" | "date";
   const dir = (searchParams.get("dir") ?? "asc") as "asc" | "desc";
+  const forceSync = searchParams.get("sync") === "1";
 
-  // Trigger background sync (non-blocking)
-  syncFromNotion().catch(() => {});
+  // If the cache is empty or user requested sync, perform sync before returning
+  const count = getItemCount();
+  if (count === 0 || forceSync) {
+    await syncFromNotion(true);
+  } else {
+    // Otherwise sync in the background
+    syncFromNotion(false).catch(() => {});
+  }
 
   if (view === "recent") {
     const items = getRecent(30).map(toClient);

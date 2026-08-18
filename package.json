@@ -1,0 +1,12 @@
+{
+  "name": "notion-unlimited-cloud",
+  "version": "1.0.0",
+  "description": "Notion Unlimited Cloud — Unlimited Cloud Storage Powered by Notion",
+  "private": true,
+  "scripts": {
+    "start": "python launcher.py",
+    "dev": "cd notion-drive-app && npm run dev",
+    "dev:all": "python launcher.py",
+    "build": "cd notion-drive-app && npm run build"
+  }
+}
