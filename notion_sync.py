@@ -1,30 +1,26 @@
 """
-notion_sync.py — Main entry point for Notion Unlimited Cloud.
+notion_sync.py — Main CLI entry point for Notion Unlimited Cloud.
 
 Run this script to:
-  - Auto-discover all connected storage devices
-  - Select which folders/devices to sync to Notion
-  - Run a Git-style incremental sync (only new/changed files uploaded)
-  - Monitor sync status live
-  - Launch the Next.js web app
+  - Auto-discover all connected storage devices (Local drives, Android USB ADB)
+  - Run Git-style incremental sync (only new/changed files uploaded)
+  - Monitor live CLI progress in the terminal
+  - Check status, watch folders, or rebuild local state index
 
 Usage:
-    python notion_sync.py                  # Interactive menu (recommended)
-    python notion_sync.py status           # Show git-status of all sources
+    python notion_sync.py                  # Interactive device selector menu
+    python notion_sync.py status           # Show git-style status of source
     python notion_sync.py sync --path C:\\Users\\nitro\\Documents
+    python notion_sync.py sync-all --path C:\\Users\\nitro\\Documents
     python notion_sync.py watch --path C:\\Users\\nitro
-    python notion_sync.py gui              # Open web browser at http://localhost:3000
     python notion_sync.py rebuild          # Rebuild local index from Notion
 """
 
 import argparse
-import json
 import os
 import sys
 import time
-import threading
 import webbrowser
-import urllib.request
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -36,7 +32,7 @@ from core import state as S
 from core import storage as STOR
 from core import sync_engine as ENGINE
 from core.notion_api import NotionAPI, is_page_archived
-from core.storage import StorageDevice, get_user_subfolders
+from core.storage import StorageDevice
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,89 +54,11 @@ def _ensure_credentials():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Local web server (background)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_server_instance = None
-
-def start_web_server(port: int = None) -> bool:
-    """Start notion_server.py API backend as a background daemon thread. Returns True if running."""
-    port = port or cfg.LOCAL_SERVER_PORT
-    # Already running?
-    try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=1)
-        return True
-    except Exception:
-        pass
-
-    try:
-        import notion_server
-        from http.server import ThreadingHTTPServer
-        # Initialize API-only backend
-        if hasattr(notion_server, "load_disk_cache"):
-            notion_server.load_disk_cache()
-        if hasattr(notion_server, "_load_recent_files"):
-            notion_server._load_recent_files()
-        if hasattr(notion_server, "_build_allowed_roots"):
-            notion_server._build_allowed_roots()
-        if hasattr(notion_server, "start_notion_watcher"):
-            notion_server.start_notion_watcher()
-        
-        handler_cls = getattr(
-            notion_server,
-            "NotionServerHandler",        # current name
-            getattr(notion_server, "NotionFileServerHandler", None),  # legacy fallback
-        )
-        if handler_cls is None:
-            raise AttributeError("Cannot find request handler class in notion_server.py")
-        srv = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
-        srv.daemon_threads = True
-        t = threading.Thread(target=srv.serve_forever, daemon=True, name="WebDriveServer")
-        t.start()
-        global _server_instance
-        _server_instance = srv
-        time.sleep(0.5)
-        print(f"  🚀 API backend started → http://127.0.0.1:{port}")
-        return True
-    except Exception as e:
-        print(f"  ⚠️  Could not start API backend: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Progress bar (CLI)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Progress bar (CLI & Web Live Bridge)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SYNC_START_TIME = None
 _BYTES_TRANSFERRED = 0
-
-def notify_server(payload: dict):
-    """Notify the local Web Drive server so browser GUI updates in real time."""
-    try:
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/sync/update",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=0.5) as res:
-            pass
-    except Exception as e:
-        # Fallback print if server error occurs
-        pass
-
-
-def refresh_server_cache_once() -> None:
-    """Ask the Web Drive server to refresh cache so synced files appear immediately."""
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{cfg.LOCAL_SERVER_PORT}/api/refresh", timeout=2.5):
-            pass
-    except Exception:
-        pass
 
 
 def _progress(current: int, total: int, item: Any, tag: str):
@@ -166,38 +84,6 @@ def _progress(current: int, total: int, item: Any, tag: str):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    elapsed = max(0.1, time.time() - _SYNC_START_TIME)
-    if item and hasattr(item, "size"):
-        _BYTES_TRANSFERRED += item.size
-
-    speed_files_per_min = round((current / elapsed) * 60, 1) if current > 0 else 0
-    speed_mb_s = round((_BYTES_TRANSFERRED / elapsed) / 1e6, 2)
-    speed_str = f"{speed_files_per_min} files/min ({speed_mb_s} MB/s)"
-
-    size_str = f"{item.size / 1e6:.2f} MB" if (item and hasattr(item, "size")) else "-"
-    disp_path = item.display_path if (item and hasattr(item, "display_path")) else (item.path if (item and hasattr(item, "path")) else "")
-
-    notify_server({
-        "is_running": current < total,
-        "percent": int(pct * 100),
-        "synced_files": current,
-        "total_files": total,
-        "remaining_files": max(0, total - current),
-        "current_file": fname if current < total else "Completed",
-        "current_path": disp_path,
-        "current_size_str": size_str,
-        "speed_str": speed_str,
-        "status_message": f"Syncing {current+1}/{total} changes via Terminal..." if current < total else f"All {total} files synchronized from Terminal!",
-        "log_message": f"Synced: {fname} [{tag}]" if fname and current < total else None,
-        "history_item": {
-            "name": fname,
-            "path": disp_path,
-            "size_str": size_str,
-            "time": time.strftime("%H:%M:%S"),
-            "status": "success"
-        } if (fname and current > 0) else None
-    })
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYNC — local directory
@@ -209,16 +95,6 @@ def sync_local(path: str, force: bool = False):
     api = NotionAPI(cfg.NOTION_TOKEN, cfg.NOTION_DATABASE_ID)
     state = S.load_state()
 
-    notify_server({
-        "is_running": True,
-        "current_target": f"Local: {path}",
-        "status_message": f"Scanning {path}...",
-        "percent": 0,
-        "synced_files": 0,
-        "total_files": 0,
-        "current_file": "Scanning filesystem..."
-    })
-
     print(f"\n  🔍 Scanning: {path}")
     print(f"  🔗 Preloading Notion folder cache…")
     api.preload_folders()
@@ -229,7 +105,6 @@ def sync_local(path: str, force: bool = False):
     print(f"  📂 Found {len(all_folders):,} folders")
 
     if force:
-        # Mark everything as new for force-upload
         for folder in all_folders:
             folder.status_tag = "NEW"
         folders_to_sync = all_folders
@@ -244,7 +119,6 @@ def sync_local(path: str, force: bool = False):
     print(f"  🟢 {folders_new:,} new folders to create")
     print()
 
-    # Sync folders first (so hierarchy exists before files are uploaded)
     if folders_to_sync:
         print(f"  ⚡ Syncing {len(folders_to_sync):,} folders…\n")
         folder_result = ENGINE.run_folder_sync(
@@ -262,7 +136,6 @@ def sync_local(path: str, force: bool = False):
     print(f"  📂 Found {len(all_items):,} files")
 
     if force:
-        # Mark everything as new for force-upload
         for item in all_items:
             item.status_tag = "NEW"
         to_sync = all_items
@@ -272,25 +145,6 @@ def sync_local(path: str, force: bool = False):
 
     new_c = sum(1 for i in to_sync if i.status_tag == "NEW")
     mod_c = sum(1 for i in to_sync if i.status_tag == "MODIFIED")
-
-    queue_items = [{
-        "name": it.name,
-        "path": it.display_path or it.path,
-        "size_str": f"{it.size / 1e6:.2f} MB",
-        "tag": it.status_tag,
-        "status": "pending"
-    } for it in to_sync[:80]]
-
-    notify_server({
-        "is_running": len(to_sync) > 0,
-        "current_target": f"Local: {path}",
-        "total_files": len(to_sync),
-        "remaining_files": len(to_sync),
-        "synced_files": 0,
-        "percent": 0,
-        "queue": queue_items,
-        "status_message": f"Found {len(to_sync)} changes to sync" if to_sync else "Everything up to date!"
-    })
 
     print()
     print(f"  ✅ {skipped:,} files up-to-date (skipped)")
@@ -307,12 +161,6 @@ def sync_local(path: str, force: bool = False):
 
     if not to_sync and not folders_to_sync and missing_count == 0:
         print("  ✨ Everything is already in sync! Nothing to upload.")
-        notify_server({
-            "is_running": False,
-            "percent": 100,
-            "status_message": "Everything is already in sync!",
-            "log_message": f"Scan completed for {path}: 0 changes needed."
-        })
         return
 
     global _SYNC_START_TIME
@@ -327,22 +175,10 @@ def sync_local(path: str, force: bool = False):
         result = ENGINE.run_sync(
             api, state, to_sync,
             on_progress=_progress,
-            server_port=cfg.LOCAL_SERVER_PORT,
             delete_missing=True,
             all_scanned_paths=all_scanned_paths,
             root_path=path,
         )
-
-        notify_server({
-            "is_running": False,
-            "percent": 100,
-            "synced_files": len(to_sync),
-            "remaining_files": 0,
-            "current_file": "Sync Complete",
-            "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted.",
-            "log_message": f"Sync completed for {path}: {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted."
-        })
-        refresh_server_cache_once()
 
         print(f"\n  ✅ Sync complete!")
         print(f"     Uploaded : {result.uploaded:,}")
@@ -373,16 +209,6 @@ def sync_android(device: StorageDevice):
 
     api = NotionAPI(cfg.NOTION_TOKEN, cfg.NOTION_DATABASE_ID)
     state = S.load_state()
-
-    notify_server({
-        "is_running": True,
-        "current_target": device.label,
-        "status_message": f"Scanning {device.label} via ADB…",
-        "percent": 0,
-        "synced_files": 0,
-        "total_files": 0,
-        "current_file": "Scanning device via ADB..."
-    })
 
     print(f"\n  📱 Scanning {device.label} via ADB…")
     print(f"  🔗 Preloading Notion folder cache…")
@@ -428,25 +254,6 @@ def sync_android(device: StorageDevice):
     new_c = sum(1 for i in to_sync if i.status_tag == "NEW")
     mod_c = sum(1 for i in to_sync if i.status_tag == "MODIFIED")
 
-    queue_items = [{
-        "name": it.name,
-        "path": it.display_path or it.path,
-        "size_str": f"{it.size / 1e6:.2f} MB",
-        "tag": it.status_tag,
-        "status": "pending"
-    } for it in to_sync[:80]]
-
-    notify_server({
-        "is_running": len(to_sync) > 0,
-        "current_target": device.label,
-        "total_files": len(to_sync),
-        "remaining_files": len(to_sync),
-        "synced_files": 0,
-        "percent": 0,
-        "queue": queue_items,
-        "status_message": f"Found {len(to_sync)} changes to sync" if to_sync else "Everything up to date!"
-    })
-
     print()
     print(f"  ✅ {skipped:,} files up-to-date (skipped)")
     print(f"  🟢 {new_c:,} new files to upload")
@@ -462,12 +269,6 @@ def sync_android(device: StorageDevice):
 
     if not to_sync and not folders_to_sync and missing_count == 0:
         print("  ✨ Everything is already in sync! Nothing to upload.")
-        notify_server({
-            "is_running": False,
-            "percent": 100,
-            "status_message": "Everything is already in sync!",
-            "log_message": f"Scan completed for {device.label}: 0 changes needed."
-        })
         return
 
     global _SYNC_START_TIME
@@ -481,7 +282,6 @@ def sync_android(device: StorageDevice):
     result = ENGINE.run_sync(
         api, state, to_sync,
         on_progress=_progress,
-        server_port=cfg.LOCAL_SERVER_PORT,
         adb_root=device.adb_path,
         container_name="Internal shared storage" if device.device_type == "android_internal" else "SD card",
         container_emoji=container_emoji,
@@ -489,17 +289,6 @@ def sync_android(device: StorageDevice):
         all_scanned_paths=all_scanned_paths,
         root_path=device.adb_path,
     )
-
-    notify_server({
-        "is_running": False,
-        "percent": 100,
-        "synced_files": len(to_sync),
-        "remaining_files": 0,
-        "current_file": "Sync Complete",
-        "status_message": f"Sync finished! {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted.",
-        "log_message": f"Sync completed for {device.label}: {result.uploaded} uploaded, {result.updated} updated, {result.deleted} deleted."
-    })
-    refresh_server_cache_once()
 
     print(f"\n  ✅ Android sync complete!")
     print(f"     Uploaded : {result.uploaded:,}")
@@ -624,8 +413,8 @@ def watch(path: str, interval: int = None):
 def _print_banner():
     print()
     print("╔" + "═" * 63 + "╗")
-    print("║  ☁️   NOTION UNLIMITED CLOUD & WEB DRIVE                      ║")
-    print("║  Your personal unlimited cloud — powered by Notion API        ║")
+    print("║  ☁️   NOTION UNLIMITED CLOUD — TERMINAL SYNC ENGINE           ║")
+    print("║  Fast Git-style incremental sync to your Notion database      ║")
     print("╚" + "═" * 63 + "╝")
     print()
 
@@ -638,7 +427,7 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
     android_devices = [d for d in devices if d.is_android]
 
     idx = 1
-    device_map = {}  # str(idx) → StorageDevice or action string
+    device_map = {}
 
     if local_devices:
         print("  ── LOCAL DRIVES ─────────────────────────────────────────")
@@ -665,7 +454,6 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
     print("  ── ACTIONS & TOOLS ──────────────────────────────────────────")
     print(f"    [c] 📁  Sync Custom Folder Path")
     print(f"    [w] 👀  Watch Folder (Real-time Auto-Sync)")
-    print(f"    [g] 🌐  Open Web Drive (http://localhost:3000)")
     print(f"    [s] 📊  Show Git-Style Sync Status")
     print(f"    [r] 🔄  Rebuild Local Index from Notion")
     print(f"    [n] 📝  Open Notion Database in Browser")
@@ -674,7 +462,6 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
 
     device_map["c"] = "custom"
     device_map["w"] = "watch"
-    device_map["g"] = "gui"
     device_map["s"] = "status"
     device_map["r"] = "rebuild"
     device_map["n"] = "notion"
@@ -687,7 +474,6 @@ def _menu_devices(devices: List[StorageDevice]) -> Optional[str]:
 def interactive_menu():
     """The main interactive loop shown when user runs `python notion_sync.py`."""
     _ensure_credentials()
-    start_web_server()
     _print_banner()
 
     while True:
@@ -704,11 +490,6 @@ def interactive_menu():
         elif action == "quit":
             print("\n  👋 Goodbye!\n")
             break
-
-        elif action == "gui":
-            start_web_server()
-            webbrowser.open("http://localhost:3000")
-            print(f"\n  🌐 Web Drive opened in browser.\n")
 
         elif action == "custom":
             custom_path = input("\n  Enter full directory path to sync: ").strip().strip('"').strip("'")
@@ -781,13 +562,12 @@ Commands:
   sync         Sync a specific path to Notion (incremental)
   sync-all     Force re-upload all files in a path
   watch        Auto-sync a path in real time
-  gui          Open the Next.js web app in browser
   rebuild      Rebuild local index from Notion
         """,
     )
     parser.add_argument(
         "command", nargs="?", default="menu",
-        choices=["menu", "status", "sync", "sync-all", "watch", "gui", "rebuild"],
+        choices=["menu", "status", "sync", "sync-all", "watch", "rebuild"],
     )
     parser.add_argument("--path", default=str(Path.home()), help="Path to sync")
     parser.add_argument("--interval", type=int, default=None, help="Watch interval in seconds")
@@ -803,9 +583,6 @@ Commands:
         sync_local(args.path, force=True)
     elif args.command == "watch":
         watch(args.path, args.interval)
-    elif args.command == "gui":
-        start_web_server()
-        webbrowser.open("http://localhost:3000")
     elif args.command == "rebuild":
         rebuild_index()
 
