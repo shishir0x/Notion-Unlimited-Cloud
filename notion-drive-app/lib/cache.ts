@@ -1,15 +1,15 @@
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import path from "path";
 import { queryDatabaseStream, type DriveItem } from "./notion";
 
 const DB_PATH = path.join(process.cwd(), "notion_drive.db");
 
-let _db: ReturnType<typeof Database> | null = null;
+let _db: DatabaseSync | null = null;
 
-export function getDb() {
+export function getDb(): DatabaseSync {
   if (!_db) {
-    _db = new Database(DB_PATH);
-    _db.pragma("journal_mode = WAL");
+    _db = new DatabaseSync(DB_PATH);
+    _db.exec("PRAGMA journal_mode = WAL;");
     _db.exec(`
       CREATE TABLE IF NOT EXISTS items (
         id TEXT PRIMARY KEY,
@@ -40,7 +40,7 @@ export function getDb() {
     `);
 
     // Ensure all columns exist for existing databases
-    const columns = _db.prepare("PRAGMA table_info(items)").all().map((c: any) => c.name);
+    const columns = (_db.prepare("PRAGMA table_info(items)").all() as any[]).map((c: any) => c.name);
     if (!columns.includes("description")) {
       _db.exec("ALTER TABLE items ADD COLUMN description TEXT DEFAULT ''");
     }
@@ -62,7 +62,7 @@ export function upsertItems(items: DriveItem[]) {
   const db = getDb();
   const upsert = db.prepare(`
     INSERT INTO items (id, name, type, file_type, extension, size_mb, parent_id, starred, archived, created_at, modified_at, notion_url, file_url, description, local_path, synced_at)
-    VALUES (@id, @name, @type, @fileType, @extension, @sizeMb, @parentId, @starred, @archived, @createdAt, @modifiedAt, @notionUrl, @fileUrl, @description, @localPath, @syncedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name=excluded.name, type=excluded.type, file_type=excluded.file_type,
       extension=excluded.extension, size_mb=excluded.size_mb, parent_id=excluded.parent_id,
@@ -75,29 +75,37 @@ export function upsertItems(items: DriveItem[]) {
     INSERT OR REPLACE INTO items_fts (id, name, extension, file_type)
     VALUES (?, ?, ?, ?)
   `);
-  const tx = db.transaction(() => {
+
+  db.exec("BEGIN");
+  try {
     for (const item of items) {
       const desc = item.description || "";
       const lPath = extractPathFromDesc(desc);
-      upsert.run({
-        ...item,
-        fileType: item.fileType,
-        sizeMb: item.sizeMb,
-        parentId: item.parentId || null,
-        starred: item.starred ? 1 : 0,
-        archived: item.archived ? 1 : 0,
-        createdAt: item.createdAt,
-        modifiedAt: item.modifiedAt,
-        notionUrl: item.notionUrl,
-        fileUrl: item.fileUrl ?? null,
-        description: desc,
-        localPath: lPath,
-        syncedAt: Date.now(),
-      });
+      upsert.run(
+        item.id,
+        item.name,
+        item.type,
+        item.fileType,
+        item.extension,
+        item.sizeMb,
+        item.parentId || null,
+        item.starred ? 1 : 0,
+        item.archived ? 1 : 0,
+        item.createdAt,
+        item.modifiedAt,
+        item.notionUrl,
+        item.fileUrl ?? null,
+        desc,
+        lPath,
+        Date.now()
+      );
       insertFts.run(item.id, item.name, item.extension, item.fileType);
     }
-  });
-  tx();
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 export function getItemCount(): number {
@@ -218,14 +226,14 @@ export function getFolderChildren(
   if (parentId === DEVICE_ROOTS.DISK_C || parentId === KNOWN_CONTAINERS.DISK_C) {
     return db
       .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.DISK_C}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
-      .all(KNOWN_CONTAINERS.DISK_C) as DbItem[];
+      .all(KNOWN_CONTAINERS.DISK_C) as unknown as DbItem[];
   }
 
   // 2. Local Disk (D:)
   if (parentId === DEVICE_ROOTS.DISK_D) {
-    const diskDRow = db.prepare("SELECT id FROM items WHERE name LIKE '%Local Disk (D:)%' AND type='folder' LIMIT 1").get() as { id: string } | undefined;
+    const diskDRow = db.prepare("SELECT id FROM items WHERE name LIKE '%Local Disk (D:)%' AND type='folder' LIMIT 1").get() as unknown as { id: string } | undefined;
     if (diskDRow?.id) {
-      return db.prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`).all(diskDRow.id) as DbItem[];
+      return db.prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`).all(diskDRow.id) as unknown as DbItem[];
     }
     return [];
   }
@@ -234,20 +242,20 @@ export function getFolderChildren(
   if (parentId === DEVICE_ROOTS.PHONE || parentId === KNOWN_CONTAINERS.PHONE) {
     return db
       .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.PHONE}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
-      .all(KNOWN_CONTAINERS.PHONE) as DbItem[];
+      .all(KNOWN_CONTAINERS.PHONE) as unknown as DbItem[];
   }
 
   // 4. SD Card (External Storage)
   if (parentId === DEVICE_ROOTS.SDCARD || parentId === KNOWN_CONTAINERS.SDCARD) {
     return db
       .prepare(`SELECT * FROM items WHERE (parent_id=? OR parent_id='${DEVICE_ROOTS.SDCARD}') AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
-      .all(KNOWN_CONTAINERS.SDCARD) as DbItem[];
+      .all(KNOWN_CONTAINERS.SDCARD) as unknown as DbItem[];
   }
 
   // Subfolder drill-down (DCIM, Camera, Users, Desktop, WhatsApp, etc.)
   return db
     .prepare(`SELECT * FROM items WHERE parent_id=? AND archived=0 ORDER BY type DESC, ${col} ${direction}`)
-    .all(parentId) as DbItem[];
+    .all(parentId) as unknown as DbItem[];
 }
 
 export function searchItems(query: string, fileType?: string): DbItem[] {
@@ -259,13 +267,13 @@ export function searchItems(query: string, fileType?: string): DbItem[] {
       SELECT i.* FROM items i
       WHERE (i.name LIKE ? OR i.extension LIKE ?) AND i.archived=0
     `;
-    const params: unknown[] = [`%${cleanQ}%`, `%${cleanQ}%`];
+    const params: (string | number)[] = [`%${cleanQ}%`, `%${cleanQ}%`];
     if (fileType) {
       sql += " AND i.file_type=?";
       params.push(fileType);
     }
     sql += " ORDER BY i.type DESC, i.name ASC LIMIT 100";
-    return db.prepare(sql).all(...params) as DbItem[];
+    return db.prepare(sql).all(...params) as unknown as DbItem[];
   } catch (err) {
     console.error("Search error:", err);
     return [];
@@ -278,7 +286,7 @@ export function getStats() {
     .prepare(
       "SELECT COUNT(*) as total_files, COALESCE(SUM(size_mb),0) as total_mb FROM items WHERE archived=0"
     )
-    .get() as { total_files: number; total_mb: number };
+    .get() as unknown as { total_files: number; total_mb: number } | undefined;
   return row || { total_files: 0, total_mb: 0 };
 }
 
@@ -287,19 +295,19 @@ export function getRecent(limit = 20): DbItem[] {
     .prepare(
       "SELECT * FROM items WHERE type='file' AND archived=0 ORDER BY modified_at DESC LIMIT ?"
     )
-    .all(limit) as DbItem[];
+    .all(limit) as unknown as DbItem[];
 }
 
 export function getStarred(): DbItem[] {
   return getDb()
     .prepare("SELECT * FROM items WHERE starred=1 AND archived=0 ORDER BY name ASC")
-    .all() as DbItem[];
+    .all() as unknown as DbItem[];
 }
 
 export function getTrash(): DbItem[] {
   return getDb()
     .prepare("SELECT * FROM items WHERE archived=1 ORDER BY modified_at DESC")
-    .all() as DbItem[];
+    .all() as unknown as DbItem[];
 }
 
 export function getBreadcrumbs(leafId: string): DbItem[] {
@@ -313,7 +321,7 @@ export function getBreadcrumbs(leafId: string): DbItem[] {
     }
   }
 
-  let current: DbItem | undefined = db.prepare("SELECT * FROM items WHERE id=?").get(leafId) as DbItem;
+  let current: DbItem | undefined = db.prepare("SELECT * FROM items WHERE id=?").get(leafId) as unknown as DbItem | undefined;
   let depth = 0;
   while (current && depth < 20) {
     trail.unshift(current);
@@ -337,7 +345,7 @@ export function getBreadcrumbs(leafId: string): DbItem[] {
       break;
     }
 
-    current = db.prepare("SELECT * FROM items WHERE id=?").get(pId) as DbItem;
+    current = db.prepare("SELECT * FROM items WHERE id=?").get(pId) as unknown as DbItem | undefined;
     depth++;
   }
   return trail;
@@ -345,7 +353,7 @@ export function getBreadcrumbs(leafId: string): DbItem[] {
 
 export function getItemById(id: string): DbItem | null {
   const db = getDb();
-  return (db.prepare("SELECT * FROM items WHERE id=?").get(id) as DbItem) || null;
+  return (db.prepare("SELECT * FROM items WHERE id=?").get(id) as unknown as DbItem | null) || null;
 }
 
 export interface DbItem {
